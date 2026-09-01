@@ -66,6 +66,9 @@ MAX_RUN_ARTIFACT_BYTES = 50 * 1024 * 1024
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _METRIC_KEY_RE = re.compile(r"[^0-9A-Za-z_\-./ ]")
 _SOURCE_PREFIXES = ("hf:", "path:", "dvc:", "mlflow:", "s3:", "http:", "https:")
+# Where an output can live and still be there next month. path: is absent on
+# purpose -- it names a directory on whichever machine happened to run.
+_DURABLE_URI = ("hf:", "s3:", "mlflow:", "http:", "https:")
 
 
 # -- context ---------------------------------------------------------------
@@ -186,7 +189,16 @@ def upload_run_dir(
                     path_in_repo=f"{path_in_repo}/{leaf}", path_or_fileobj=str(path)
                 )
             )
-        info = HfApi().create_commit(
+        if not operations:
+            print("[ml_platform] nothing to upload -- the run directory is empty",
+                  file=sys.stderr)
+            return None
+        # Pass the token explicitly. Relying on ambient auth means a machine
+        # where nobody ran `hf auth login` degrades to a local-only run that
+        # still looks recorded.
+        api = HfApi(token=_hf_token() or None)
+        api.create_repo(repo_id=repo, repo_type="dataset", private=True, exist_ok=True)
+        info = api.create_commit(
             repo_id=repo,
             repo_type="dataset",
             operations=operations,
@@ -194,6 +206,9 @@ def upload_run_dir(
         )
         return getattr(info, "oid", None)
     except Exception as exc:
+        # Returning None is not enough on its own: the caller must record that
+        # this happened, or the run claims a local path as its archive and
+        # passes its own rules. See Run.check().
         print(f"[ml_platform] upload failed, outputs stay local: {exc}", file=sys.stderr)
         return None
 
@@ -336,9 +351,21 @@ class Run:
             problems.append("eval runs need a 'score' metric")
         if self.run_type == "infer" and not self._tags.get("output_uri"):
             problems.append("infer runs need an output_uri -- otherwise nothing was produced")
+        # A local path is not an archive. When the upload fails the caller falls
+        # back to path:<dir>, and treating that as satisfied hands back a PASS
+        # for a run whose outputs exist on exactly one machine's disk -- the
+        # failure this check exists to catch, reported as success.
+        output = self._tags.get("output_uri", "")
+        if self.run_type in ("eval", "infer") and output and not output.startswith(_DURABLE_URI):
+            problems.append(
+                f"output_uri is not somewhere the outputs survive this machine: {output}"
+            )
         if self.run_type == "train" and not (self._metrics & {"val_loss", "train_loss", "loss"}):
             problems.append("train runs need val_loss / train_loss / loss")
-        if not self._tags.get("conditioning_source"):
+        # Only meaningful where something was conditioned on something: a
+        # training run has no conditioning source, and demanding one failed
+        # every train run on a field that does not apply to it.
+        if self.run_type in ("eval", "infer") and not self._tags.get("conditioning_source"):
             problems.append("conditioning_source missing -- runs cannot be compared without it")
         for coord in dict.fromkeys(self.unresolved):
             problems.append(f"unresolved revision (not a 40-char sha): {coord}")
@@ -389,8 +416,21 @@ def _run(
         try:
             yield run
         finally:
-            run.tag("duration_sec", str(int(time.time() - started)))
-            problems = run.check()
+            # Everything in here talks to the server. If the run is unwinding
+            # because the tailnet dropped, an exception raised here replaces the
+            # real traceback with a connection error and the cause is lost.
+            problems: list[str] = []
+            try:
+                run.tag("duration_sec", str(int(time.time() - started)))
+                problems = run.check()
+                # The verdict has to outlive the terminal. Printed only, there
+                # is no way to look at a run six months later and tell whether
+                # it satisfied the rules or which coordinate it was missing.
+                run.tag("rules_check", "PASS" if not problems else "FAIL")
+                if problems:
+                    run.tag("rules_problems", "; ".join(problems)[:4000])
+            except Exception as exc:  # noqa: BLE001 -- never mask the real error
+                print(f"[ml_platform] could not finish recording: {exc}", file=sys.stderr)
             print(f"\n[ml_platform] run_id={run.run_id}  experiment={experiment}")
             if problems:
                 print("[ml_platform] FAIL -- fix the script, not the run:")
