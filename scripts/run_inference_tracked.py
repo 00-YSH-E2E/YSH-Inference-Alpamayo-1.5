@@ -151,24 +151,33 @@ def render_sample(result: dict, data: dict, path: Path) -> bool:
         from alpamayo1_5 import viz_utils
 
         fig, axes = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={"height_ratios": [1, 1.3]})
-        axes[0].imshow(viz_utils.make_camera_grid(data["image_frames"], data["camera_indices"]))
-        axes[0].axis("off")
-        viz_utils.plot_condition(axes[1], result["pred_xy"], color="tab:blue", label="prediction")
-        if result.get("gt_xy") is not None:
-            gt = result["gt_xy"]
-            axes[1].plot(gt[:, 0], gt[:, 1], "k--", linewidth=2, label="logged future")
-        axes[1].set_aspect("equal", adjustable="datalim")
-        axes[1].set_xlabel("x [m]")
-        axes[1].set_ylabel("y [m]")
-        axes[1].legend(loc="best", fontsize=8)
-        title = result["clip_id"]
-        if result.get("min_ade") is not None:
-            title += f"  |  minADE {result['min_ade']:.2f} m"
-        axes[1].set_title(title, fontsize=10)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fig.tight_layout()
-        fig.savefig(path, dpi=110)
-        plt.close(fig)
+        try:
+            axes[0].imshow(
+                viz_utils.make_camera_grid(data["image_frames"], data["camera_indices"])
+            )
+            axes[0].axis("off")
+            viz_utils.plot_condition(
+                axes[1], result["pred_xy"], color="tab:blue", label="prediction"
+            )
+            if result.get("gt_xy") is not None:
+                gt = result["gt_xy"]
+                axes[1].plot(gt[:, 0], gt[:, 1], "k--", linewidth=2, label="logged future")
+            axes[1].set_aspect("equal", adjustable="datalim")
+            axes[1].set_xlabel("x [m]")
+            axes[1].set_ylabel("y [m]")
+            axes[1].legend(loc="best", fontsize=8)
+            title = result["clip_id"]
+            if result.get("min_ade") is not None:
+                title += f"  |  minADE {result['min_ade']:.2f} m"
+            axes[1].set_title(title, fontsize=10)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(path, dpi=110)
+        finally:
+            # pyplot keeps a global reference to every open figure. Closing only
+            # on success leaks one decoded camera grid per failure, and the
+            # failures come in runs -- a full disk fails all of them.
+            plt.close(fig)
         return True
     except Exception as exc:  # a figure is never worth failing a run over
         print(f"[samples] {result['clip_id']}: {exc}", file=sys.stderr)
@@ -307,31 +316,38 @@ def main() -> None:
             args.variant, date, run_id, data=args.data_spec
         )
         rows, per_clip, gt_rows = [], [], []
-        # Sampled between clips: throttling moves latency without moving anything
-        # else, and after the run there is no way to tell that from a regression.
+        # Throttling moves latency without moving anything else, and after the
+        # run there is no way to tell that from a regression.
+        #
+        # Sampled in the background rather than between clips. Between-clip
+        # readings are fine for temperature, which moves over seconds, but every
+        # one of them lands after inference finished and after the figure was
+        # drawn -- so the power averages described an idle GPU, which is a
+        # different quantity rather than a low estimate.
         thermal = TH.ThermalLog()
         thermal.sample()
-        for i, clip_id in enumerate(clips):
-            started = time.perf_counter()
-            clip_rows, extras = run_clip(model, processor, avdi, clip_id, args, out_dir)
-            rows.extend(clip_rows)
-            per_clip.append(extras)
-            if extras.get("gt_xy") is not None:
-                gt_rows.append({"clip_id": clip_id, "t0_us": args.t0_us, "gt_xy": extras["gt_xy"]})
-            if not args.no_samples and i < MAX_SAMPLE_IMAGES:
-                render_sample(
-                    {**extras, "pred_xy": extras["pred_xy"]},
-                    extras["data"],
-                    out_dir / "samples" / f"{clip_id}.png",
+        with thermal.sampling():
+            for i, clip_id in enumerate(clips):
+                started = time.perf_counter()
+                clip_rows, extras = run_clip(model, processor, avdi, clip_id, args, out_dir)
+                rows.extend(clip_rows)
+                per_clip.append(extras)
+                if extras.get("gt_xy") is not None:
+                    gt_rows.append({"clip_id": clip_id, "t0_us": args.t0_us, "gt_xy": extras["gt_xy"]})
+                if not args.no_samples and i < MAX_SAMPLE_IMAGES:
+                    render_sample(
+                        {**extras, "pred_xy": extras["pred_xy"]},
+                        extras["data"],
+                        out_dir / "samples" / f"{clip_id}.png",
+                    )
+                extras.pop("data", None)  # frames are large; do not hold them for the whole run
+                reading = thermal.sample()
+                print(
+                    f"[{i + 1}/{len(clips)}] {clip_id[:8]} "
+                    f"minADE {extras.get('min_ade', float('nan')):.3f} "
+                    f"scene {extras['scene']} {time.perf_counter() - started:.1f}s "
+                    f"tj {reading.get('tj-thermal', float('nan')):.0f}C"
                 )
-            extras.pop("data", None)  # frames are large; do not hold them for the whole run
-            reading = thermal.sample()
-            print(
-                f"[{i + 1}/{len(clips)}] {clip_id[:8]} "
-                f"minADE {extras.get('min_ade', float('nan')):.3f} "
-                f"scene {extras['scene']} {time.perf_counter() - started:.1f}s "
-                f"tj {reading.get('tj-thermal', float('nan')):.0f}C"
-            )
 
         config = {
             "run_id": run_id,
