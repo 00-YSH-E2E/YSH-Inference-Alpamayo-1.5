@@ -378,17 +378,57 @@ def main() -> None:
                     vals.append(q[key])
             if vals:
                 run.metric(key, float(np.mean(vals)))
-        run.metric(
-            "n_generated_tokens_mean",
-            float(np.mean([r.get("n_generated_tokens", 0) for r in rows])),
-        )
-        decode = np.mean([r.get("t_decode_ms", 0.0) for r in rows])
-        tokens = np.mean([r.get("n_generated_tokens", 0) for r in rows])
-        if tokens:
-            run.metric("ms_per_token", float(decode / tokens))
+        def mean_present(key: str) -> float | None:
+            """Mean over rows that actually carry the key.
+
+            Defaulting a missing measurement to 0.0 records "took no time" as
+            though it were an observation. A metric that was never taken must
+            be absent, not zero.
+            """
+            vals = [r[key] for r in rows if r.get(key) is not None]
+            return float(np.mean(vals)) if vals else None
+
+        for key in ("n_generated_tokens", "n_cot_tokens"):
+            value = mean_present(key)
+            if value is not None:
+                run.metric(f"{key}_mean", value)
+
+        # Latency. One decode span covers a whole clip's K samples, so the rows
+        # of one clip share it -- averaging it against a single row's token
+        # count divides a batch total by a per-row denominator and lands ~K
+        # times off. Group by clip and use denominators that match the span.
+        by_clip: dict[str, list[dict]] = {}
+        for r in rows:
+            by_clip.setdefault(r.get("clip_id"), []).append(r)
+        per_step, per_token = [], []
+        for group in by_clip.values():
+            head = group[0]
+            if not head.get("timing_measured") or head.get("t_decode_ms") is None:
+                continue
+            decode_ms = float(head["t_decode_ms"])
+            steps = head.get("n_decode_steps") or 0
+            tokens = sum(int(r.get("n_generated_tokens") or 0) for r in group)
+            if steps:
+                per_step.append(decode_ms / steps)
+            if tokens:
+                per_token.append(decode_ms / tokens)
+        # Deliberately not named ms_per_token: runs before schema 2 recorded a
+        # key by that name whose value was off by roughly K, and two identical
+        # runs disagreed by 46%. Reusing the name would mix the two silently on
+        # one axis. A series that visibly stops is easier to trust.
+        if per_step:
+            run.metric("ms_per_decode_step", float(np.mean(per_step)))
+        if per_token:
+            run.metric("ms_per_generated_token", float(np.mean(per_token)))
+
         for key in ("t_vision_ms", "t_prefill_ms", "t_decode_ms", "t_postgen_ms",
-                    "t_expert_ms", "t_total_ms"):
-            run.metric(key, float(np.mean([r.get(key, 0.0) for r in rows])))
+                    "t_expert_ms", "t_other_ms", "t_total_ms"):
+            value = mean_present(key)
+            if value is not None:
+                run.metric(key, value)
+        # How many clips the timings above actually rest on. Without it a mean
+        # over 3 measured clips out of 100 looks like a mean over 100.
+        run.metric("n_timed_clips", float(len(per_step)))
         scenes = [c["scene"] for c in per_clip if c.get("scene")]
         for scene in set(scenes):
             run.metric(f"scenario.{scene}.count", scenes.count(scene))
