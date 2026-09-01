@@ -77,6 +77,9 @@ MODEL_REPO = "nvidia/Alpamayo-1.5-10B"
 DATASET_REPO = "nvidia/PhysicalAI-Autonomous-Vehicles"
 EVALS_REPO = "YSHRobotics/Alpamayo-Evals"
 DATA_CACHE = "/home/thor/Documents/Alpamayo/Data/Alpamayo-1.5_Cam-4_Vanilla"
+# Outputs live beside the data rather than inside the code repo, and share its
+# naming: {model}_{data}_{variant}_{date}_{run_id}.
+OUT_ROOT = "/home/thor/Documents/Alpamayo/Inference"
 DEFAULT_CLIP = "030c760c-ae38-49aa-9ad8-f5650a545d26"
 MAX_SAMPLE_IMAGES = 20  # representative figures per run, per the recording rules
 
@@ -181,7 +184,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--allow-stream", action="store_true",
                    help="Permit streaming when a clip is not cached. Off by default so a "
                         "missing cache fails loudly instead of running 10x slower.")
-    p.add_argument("--out-root", default="out")
+    p.add_argument("--out-root", default=OUT_ROOT)
     p.add_argument("--evals-repo", default=EVALS_REPO)
     p.add_argument("--include-gt", action="store_true",
                    help="Also keep the logged future locally. It is recoverable from "
