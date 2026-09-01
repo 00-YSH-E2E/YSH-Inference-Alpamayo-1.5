@@ -97,7 +97,18 @@ _CLIP_METRICS = (
     "accel_violation_rate", "within_bounds_ratio", "speed_mean",
     "net_heading_deg", "net_heading_abs_deg",
     "lateral_offset_m", "lateral_offset_abs_m",
+    "diversity_mean_m", "diversity_final_m", "diversity_max_m", "sample_gain",
 )
+
+# What each situation bucket reports, beyond its clip count. Short on purpose:
+# every entry here is multiplied by the number of buckets, and the per-clip
+# table in the run directory already carries everything for offline pivots.
+#
+# min_ade is renamed to `score` in the output so the bucket's headline matches
+# the run's. The rest are there to answer "why": mean_ade against min_ade shows
+# how much the K samples disagreed, sample_gain is that difference directly, and
+# diversity says whether the model was hedging or committing.
+_BUCKET_METRICS = ("min_ade", "mean_ade", "min_fde", "sample_gain", "diversity_final_m")
 
 
 def parse_args() -> argparse.Namespace:
@@ -277,6 +288,14 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
         )
     )
     extras.update(M.heading(pred_xyz[0, 0], pred_rot[0, 0]))
+    # How far apart the K samples are. minADE improves either because the model
+    # got better or because it spread wider and one sample landed; without this
+    # the two are indistinguishable.
+    extras.update(M.diversity(pred_xy))
+    if extras.get("mean_ade") is not None and extras.get("min_ade") is not None:
+        # What drawing K samples actually bought. Large next to a wide spread
+        # means the model is hedging rather than committing.
+        extras["sample_gain"] = float(extras["mean_ade"] - extras["min_ade"])
     # The situation the clip presented, read from the logged future. Not from
     # the prediction: a variant that predicts straighter would otherwise get
     # more clips labelled "straight", and the per-situation comparison would be
@@ -429,7 +448,8 @@ def main() -> None:
         meta["thermal"] = thermal.summary()
         meta["power_mode"] = thermal.mode
         print(f"\n{thermal.verdict()}")
-        W.write_run(out_dir, rows, config, meta, gt=gt_rows if args.include_gt else None)
+        W.write_run(out_dir, rows, config, meta,
+                    gt=gt_rows if args.include_gt else None, per_clip=per_clip)
         print(f"\nrun directory: {out_dir}")
 
         # Archive before the tracking short-circuit below. --no-track means "do
@@ -553,15 +573,32 @@ def main() -> None:
         # sums back to n_scored. A clip that is both cornering and braking is
         # counted in "curve" and in "decel" -- the axes overlap by design, which
         # is what lets you read them as two tables rather than nine thin cells.
-        buckets: dict[str, list[float]] = {}
+        buckets: dict[str, list[dict]] = {}
         for c in per_clip:
             if c.get("min_ade") is None:
                 continue
             for key in ("scene", "speed_profile"):
                 label = c.get(key)
                 if label:
-                    buckets.setdefault(label, []).append(float(c["min_ade"]))
-        run.by_scenario({s: (float(np.mean(v)), len(v)) for s, v in buckets.items()})
+                    buckets.setdefault(label, []).append(c)
+
+        def bucket_stats(clips: list[dict]) -> dict[str, float]:
+            """The few numbers that say *how* a bucket went, not just how badly.
+
+            score alone cannot separate "the model is worse here" from "the
+            model hedged and one sample landed here" -- mean_ade against
+            min_ade, and the spread between samples, are what tell them apart.
+            Deliberately short: this set multiplies by the number of buckets.
+            """
+            out: dict[str, float] = {"count": len(clips)}
+            for name in _BUCKET_METRICS:
+                values = [c[name] for c in clips if isinstance(c.get(name), (int, float))]
+                if values:
+                    out[name] = float(np.mean(values))
+            out["score"] = out.pop("min_ade", float("nan"))
+            return {k: v for k, v in out.items() if v == v}   # drop NaN
+
+        run.by_scenario({s: bucket_stats(v) for s, v in buckets.items()})
         # How often the model read the situation differently from the data. Not
         # an accuracy number in itself, but a variant whose agreement drops is
         # misjudging what it is looking at before it misplaces a trajectory.

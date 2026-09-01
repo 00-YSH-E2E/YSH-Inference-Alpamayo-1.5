@@ -207,6 +207,43 @@ def heading(pred_xyz: torch.Tensor, pred_rot: torch.Tensor) -> dict[str, float]:
     }
 
 
+def diversity(pred_xy: np.ndarray) -> dict[str, float]:
+    """How far apart the sampled trajectories are, in metres.
+
+    The model draws K trajectories per clip and is scored on the best one, so
+    minADE improves for two entirely different reasons: the model got better,
+    or it spread its samples wider and one of them landed. Those want opposite
+    responses, and the headline number cannot tell them apart.
+
+    This is the missing half. Read next to ``mean_ade - min_ade``: wide spread
+    with a large gap means the model is hedging and one sample got lucky; tight
+    spread with a small gap means it is committing to an answer. A compressed
+    variant that quietly collapses to a single mode shows up here first, while
+    its minADE still looks respectable.
+
+    Args:
+        pred_xy: Sampled trajectories, ``[K, T, 2]``.
+
+    Returns:
+        Mean pairwise distance between samples, averaged over the horizon and
+        at the endpoint. Empty for a single sample, where spread is undefined
+        rather than zero.
+    """
+    pred = np.asarray(pred_xy, dtype=np.float64)
+    if pred.ndim != 3 or pred.shape[0] < 2:
+        return {}
+    # [K, K, T] pairwise distances at each waypoint.
+    gaps = np.linalg.norm(pred[:, None, :, :] - pred[None, :, :, :], axis=-1)
+    k = pred.shape[0]
+    upper = np.triu_indices(k, k=1)          # each pair once, no self-distances
+    per_step = gaps[upper]                   # [pairs, T]
+    return {
+        "diversity_mean_m": float(per_step.mean()),
+        "diversity_final_m": float(per_step[:, -1].mean()),
+        "diversity_max_m": float(per_step[:, -1].max()),
+    }
+
+
 def classify_scene(net_heading_abs_deg: float, lateral_offset_abs_m: float) -> str:
     """Label a maneuver from egomotion alone.
 

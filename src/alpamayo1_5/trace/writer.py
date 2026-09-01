@@ -204,14 +204,45 @@ def build_rows(samples: Iterable[dict], config: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+#: Per-clip values that are *not* raw model output and so are excluded from
+#: per_clip.parquet: the trajectory arrays, the ground truth, and the frames.
+_PER_CLIP_DROP = frozenset({"pred_xy", "gt_xy", "data"})
+
+
+def write_per_clip(out_dir: Path, per_clip: list[dict]) -> Path | None:
+    """One row per clip: its situation label and every metric computed for it.
+
+    This is what makes a breakdown possible at all. ``predictions.parquet``
+    holds raw model output by design, so min_ade, the scene label and the rest
+    are nowhere in it -- without this file the only way to ask "how did the
+    straight clips do" is to re-fetch the gated dataset and recompute.
+
+    Deliberately derived rather than raw, which contradicts the rule the
+    parquet follows. The justification is different: these are cheap to
+    recompute *if you still have the inputs*, and the inputs are gated. A few
+    kilobytes here buys every pivot anyone will want later, and the file names
+    its schema_version so a stale definition is visible rather than silent.
+    """
+    rows = [{k: v for k, v in c.items() if k not in _PER_CLIP_DROP} for c in per_clip]
+    rows = [r for r in rows if r.get("clip_id")]
+    if not rows:
+        return None
+    frame = pd.DataFrame(rows)
+    frame.insert(0, "schema_version", SCHEMA_VERSION)
+    path = Path(out_dir) / "per_clip.parquet"
+    frame.to_parquet(path, index=False, compression="zstd")
+    return path
+
+
 def write_run(
     out_dir: Path,
     samples: list[dict],
     config: dict,
     meta: dict,
     gt: list[dict] | None = None,
+    per_clip: list[dict] | None = None,
 ) -> Path:
-    """Write predictions.parquet, run.json and (locally) gt.parquet.
+    """Write predictions.parquet, per_clip.parquet, run.json and (locally) gt.parquet.
 
     ``meta`` carries what an offline reader needs and cannot derive:
     action-space normalization constants (they differ per checkpoint, and using
@@ -224,6 +255,8 @@ def write_run(
 
     frame = build_rows(samples, config)
     frame.to_parquet(out_dir / "predictions.parquet", index=False, compression="zstd")
+    if per_clip:
+        write_per_clip(out_dir, per_clip)
 
     payload = dict(meta)
     payload["schema_version"] = SCHEMA_VERSION
@@ -245,7 +278,8 @@ def write_run(
 def upload_paths(out_dir: Path) -> list[Path]:
     """Files that go to Hugging Face. ``gt.parquet`` is deliberately absent."""
     out_dir = Path(out_dir)
-    paths = [out_dir / "predictions.parquet", out_dir / "run.json"]
+    paths = [out_dir / "predictions.parquet", out_dir / "per_clip.parquet",
+             out_dir / "run.json"]
     samples = out_dir / "samples"
     if samples.is_dir():
         paths.extend(sorted(samples.glob("*.png")))

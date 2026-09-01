@@ -401,10 +401,20 @@ class Run:
         metric namespace into a primary-key index: it cannot be grouped or
         sorted, and the key set differs between runs so the experiment's union
         grows without bound. Per-item values belong in the run's parquet.
+
+        Each bucket takes a scalar, a ``(score, count)`` pair, or a mapping of
+        several numbers -- ``{"score": .., "count": .., "mean_ade": ..}`` -- for
+        when one number per bucket is not enough to say what happened there.
+        Keep the mapping small: it multiplies by the number of buckets.
         """
         batch: dict[str, float] = {}
         for name, value in scores.items():
             key = _METRIC_KEY_RE.sub("_", str(name))
+            if isinstance(value, Mapping):
+                for sub, number in value.items():
+                    if number is not None:
+                        batch[f"scenario.{key}.{_METRIC_KEY_RE.sub('_', str(sub))}"] = number
+                continue
             # (score, count) is the useful form -- a mean without its sample
             # size cannot be weighted or trusted. Anything else of length != 2
             # would previously reach float(list) and raise inside the run.
