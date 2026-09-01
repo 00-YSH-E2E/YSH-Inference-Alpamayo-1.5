@@ -219,7 +219,12 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
 
     extras = {"clip_id": clip_id, "gt_xy": gt_xy, "data": data}
     if gt_xy is not None:
-        extras.update(M.displacement(pred_xy, gt_xy))
+        # Pass the checkpoint's own dt rather than letting the 0.1 default
+        # stand. The horizon labels (ade_1.0s and friends) are derived from it,
+        # so a checkpoint with a different step would mislabel every one of
+        # them -- which is the failure displacement()'s docstring claims to
+        # have avoided by not hardcoding the indices.
+        extras.update(M.displacement(pred_xy, gt_xy, dt=float(model.action_space.dt)))
     extras.update(
         M.kinematics(
             model.action_space,
