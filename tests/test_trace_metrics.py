@@ -140,6 +140,65 @@ def test_classify_scene(M, heading_deg, offset_m, expected):
     assert M.classify_scene(heading_deg, offset_m) == expected
 
 
+# -- the situation the data presented ---------------------------------------
+def _traj(v0, accel, curve_deg=0.0, lateral_m=0.0, steps=64, dt=0.1):
+    """A logged future in the ego frame at t0."""
+    t = np.arange(steps) * dt
+    distance = v0 * t + 0.5 * accel * t**2
+    heading = np.deg2rad(curve_deg) * (t / t[-1])
+    x = distance * np.cos(heading)
+    y = distance * np.sin(heading) + lateral_m * (t / t[-1])
+    return np.stack([x, y], axis=-1)
+
+
+@pytest.mark.parametrize(
+    "traj_kwargs, lateral, longitudinal",
+    [
+        (dict(v0=15, accel=0.0), "straight", "cruise"),
+        (dict(v0=15, accel=-1.6), "straight", "decel"),
+        (dict(v0=10, accel=+1.6), "straight", "accel"),
+        (dict(v0=15, accel=0.0, curve_deg=30), "curve", "cruise"),
+        (dict(v0=15, accel=-1.6, curve_deg=30), "curve", "decel"),
+        (dict(v0=15, accel=0.0, lateral_m=3.5), "lane_change", "cruise"),
+        (dict(v0=15, accel=-1.6, lateral_m=3.5), "lane_change", "decel"),
+    ],
+)
+def test_classify_maneuver_reads_both_axes(M, traj_kwargs, lateral, longitudinal):
+    """Cornering and braking happen at once; one label cannot hold both."""
+    out = M.classify_maneuver(_traj(**traj_kwargs))
+    assert out == {"lateral": lateral, "longitudinal": longitudinal}
+
+
+def test_classify_maneuver_without_ground_truth_is_unknown(M):
+    """Absent, not guessed.
+
+    The label describes what the vehicle did. With no logged future there is
+    nothing to describe, and inventing "straight" would put the clip in a
+    bucket it was never observed to belong to.
+    """
+    assert M.classify_maneuver(np.zeros((0, 2))) == {
+        "lateral": "unknown", "longitudinal": "unknown"}
+    assert M.classify_maneuver(np.zeros((2, 2)))["lateral"] == "unknown"
+
+
+def test_gentle_speed_drift_is_still_cruise(M):
+    """The threshold separates driver intent from noise on a steady speed."""
+    assert M.classify_maneuver(_traj(v0=15, accel=-0.2))["longitudinal"] == "cruise"
+
+
+def test_classification_does_not_depend_on_the_prediction(M):
+    """The axis the whole breakdown rests on.
+
+    Two variants must see the same clip in the same bucket, or a per-situation
+    comparison is comparing different clip sets. Nothing but the logged future
+    reaches this function -- there is no prediction argument to pass.
+    """
+    import inspect
+
+    params = list(inspect.signature(M.classify_maneuver).parameters)
+    assert params == ["gt_xy", "dt"]
+
+
 # -- token quality ---------------------------------------------------------
 def test_token_quality_perplexity_is_exp_of_negative_mean_logprob(M):
     logprob = np.full(10, -np.log(4.0))

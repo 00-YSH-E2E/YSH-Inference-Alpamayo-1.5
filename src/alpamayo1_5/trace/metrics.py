@@ -222,6 +222,72 @@ def classify_scene(net_heading_abs_deg: float, lateral_offset_abs_m: float) -> s
     return "other"
 
 
+#: Longitudinal thresholds, in m/s^2 averaged over the horizon. 0.5 is well
+#: below the ~1.5 of a comfortable stop, so it separates "the driver was doing
+#: something" from sensor noise on a nominally constant speed.
+LONGITUDINAL_ACCEL_MS2 = 0.5
+
+
+def classify_maneuver(gt_xy: np.ndarray, dt: float = 0.1) -> dict[str, str]:
+    """What the vehicle actually did, from the logged future.
+
+    Two independent axes rather than one label, because a clip is usually doing
+    something in both at once and collapsing them either loses the longitudinal
+    half or explodes into nine sparse buckets:
+
+        lateral       straight | curve | lane_change | other
+        longitudinal  cruise   | accel | decel
+
+    **Read from the ground truth, never from the prediction.** The situation is
+    a property of the data. Classifying it from the model's own output means a
+    variant that predicts straighter trajectories gets more clips labelled
+    "straight" -- and then two variants are being compared on different clip
+    sets, which is exactly the comparison this breakdown exists to support.
+
+    Args:
+        gt_xy: Logged future positions in the ego frame at t0, ``[T, 2]``.
+        dt: Seconds per waypoint, from the checkpoint's action space.
+
+    Returns:
+        ``{"lateral": ..., "longitudinal": ...}``. Both are ``"unknown"`` when
+        the clip has no logged future -- absent, not guessed.
+    """
+    gt = np.asarray(gt_xy, dtype=np.float64)
+    if gt.ndim != 2 or gt.shape[0] < 3:
+        return {"lateral": "unknown", "longitudinal": "unknown"}
+
+    steps = np.diff(gt, axis=0)                       # [T-1, 2]
+    speed = np.linalg.norm(steps, axis=-1) / dt       # [T-1] m/s
+
+    # Lateral: heading of the last step against the first, plus where the path
+    # ended up sideways. Same thresholds as the prediction-side classifier so
+    # the two are comparable when both are recorded.
+    def angle(v: np.ndarray) -> float:
+        return float(np.arctan2(v[1], v[0]))
+
+    delta = angle(steps[-1]) - angle(steps[0])
+    delta = float(np.arctan2(np.sin(delta), np.cos(delta)))   # wrap to (-pi, pi]
+    heading_deg = abs(np.rad2deg(delta))
+    lateral_offset = abs(float(gt[-1, 1]))
+    lateral = classify_scene(heading_deg, lateral_offset)
+
+    # Longitudinal: mean speed over the first second against the last second,
+    # as an average acceleration. Endpoints alone are too noisy at 10 Hz.
+    window = max(1, min(int(round(1.0 / dt)), speed.size // 2))
+    v0 = float(speed[:window].mean())
+    v1 = float(speed[-window:].mean())
+    span = (speed.size - window) * dt
+    accel = (v1 - v0) / span if span > 0 else 0.0
+    if accel <= -LONGITUDINAL_ACCEL_MS2:
+        longitudinal = "decel"
+    elif accel >= LONGITUDINAL_ACCEL_MS2:
+        longitudinal = "accel"
+    else:
+        longitudinal = "cruise"
+
+    return {"lateral": lateral, "longitudinal": longitudinal}
+
+
 def token_quality(
     logprob: np.ndarray, entropy: np.ndarray, n_valid: int, low_conf_threshold: float = -3.0
 ) -> dict[str, float]:

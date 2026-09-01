@@ -277,7 +277,18 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
         )
     )
     extras.update(M.heading(pred_xyz[0, 0], pred_rot[0, 0]))
-    extras["scene"] = M.classify_scene(
+    # The situation the clip presented, read from the logged future. Not from
+    # the prediction: a variant that predicts straighter would otherwise get
+    # more clips labelled "straight", and the per-situation comparison would be
+    # over different clip sets for each variant.
+    maneuver = M.classify_maneuver(
+        gt_xy, dt=float(model.action_space.dt)
+    ) if gt_xy is not None else {"lateral": "unknown", "longitudinal": "unknown"}
+    extras["scene"] = maneuver["lateral"]
+    extras["speed_profile"] = maneuver["longitudinal"]
+    # What the model *thought* the situation was, from its own trajectory. Kept
+    # alongside because a disagreement with `scene` is itself a finding.
+    extras["scene_predicted"] = M.classify_scene(
         extras.get("net_heading_abs_deg", 0.0), extras.get("lateral_offset_abs_m", 0.0)
     )
     extras["pred_xy"] = pred_xy
@@ -537,11 +548,28 @@ def main() -> None:
         # experiment's union grows without bound, and each one cost its own HTTP
         # round trip to a single-worker server. Per-clip values are already in
         # predictions.parquet, where metrics.py argues they belong.
-        by_scene: dict[str, list[float]] = {}
+        # Two axes, each a partition of the scored clips: every clip lands in
+        # exactly one lateral bucket and one longitudinal bucket, so each axis
+        # sums back to n_scored. A clip that is both cornering and braking is
+        # counted in "curve" and in "decel" -- the axes overlap by design, which
+        # is what lets you read them as two tables rather than nine thin cells.
+        buckets: dict[str, list[float]] = {}
         for c in per_clip:
-            if c.get("scene") and c.get("min_ade") is not None:
-                by_scene.setdefault(c["scene"], []).append(float(c["min_ade"]))
-        run.by_scenario({s: (float(np.mean(v)), len(v)) for s, v in by_scene.items()})
+            if c.get("min_ade") is None:
+                continue
+            for key in ("scene", "speed_profile"):
+                label = c.get(key)
+                if label:
+                    buckets.setdefault(label, []).append(float(c["min_ade"]))
+        run.by_scenario({s: (float(np.mean(v)), len(v)) for s, v in buckets.items()})
+        # How often the model read the situation differently from the data. Not
+        # an accuracy number in itself, but a variant whose agreement drops is
+        # misjudging what it is looking at before it misplaces a trajectory.
+        judged = [c for c in per_clip
+                  if c.get("scene") not in (None, "unknown") and c.get("scene_predicted")]
+        if judged:
+            agree = sum(1 for c in judged if c["scene"] == c["scene_predicted"])
+            run.metric("scene_agreement", agree / len(judged))
         # The clips a person would actually open. Bounded, and readable in the
         # UI as one tag instead of hunting through a metric list.
         worst = sorted(
