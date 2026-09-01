@@ -43,7 +43,15 @@ jobs:
 
       - name: Lint the files this fork owns
         # Upstream's tree is not held to this; these paths are ours.
-        run: pipx run ruff check --line-length 100 src/alpamayo1_5/trace/ scripts/ tests/
+        #
+        # Pinned, and it has to stay pinned: an unpinned `pipx run ruff` picks
+        # up whatever released today, and a linter's default rule set grows.
+        # The first run of this workflow failed on rules that did not exist in
+        # the version the code was checked against -- "lint is clean" means
+        # nothing if the checker can change underneath it. Same version as
+        # .pre-commit-config.yaml and pyproject, so all three agree; bump them
+        # together and deliberately.
+        run: pipx run --spec 'ruff==0.14.5' ruff check --line-length 100 src/alpamayo1_5/trace/ scripts/ tests/
 
       - name: Every file parses
         run: |
