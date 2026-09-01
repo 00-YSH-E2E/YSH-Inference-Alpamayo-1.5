@@ -89,6 +89,21 @@ def test_absent_optional_values_become_null_not_zero():
     assert frame["prompt_len"].isna().all()
 
 
+def test_call_counts_reach_the_parquet():
+    """n_expert_calls is the executed diffusion step count.
+
+    --inference-step records None when unset and the sampler then uses the
+    checkpoint's own default, so this column is the only place the number that
+    actually ran is visible. All three were being produced by the tracer and
+    dropped for want of a column.
+    """
+    row = sample(n_decode_steps=120, n_vision_calls=1, n_expert_calls=10)
+    frame = W.build_rows([row], {"run_id": "r"})
+    assert frame["n_decode_steps"].iloc[0] == 120
+    assert frame["n_vision_calls"].iloc[0] == 1
+    assert frame["n_expert_calls"].iloc[0] == 10
+
+
 def test_config_columns_repeat_on_every_row():
     """Repetition is what makes cross-run concatenation work."""
     rows = [sample(k) for k in range(3)]

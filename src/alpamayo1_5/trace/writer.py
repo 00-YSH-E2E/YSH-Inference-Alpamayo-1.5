@@ -190,6 +190,12 @@ def build_rows(samples: Iterable[dict], config: dict) -> pd.DataFrame:
             # Decode's own denominator. Per-row token counts are not it: the
             # batch decodes until the last row finishes.
             "n_decode_steps": s.get("n_decode_steps"),
+            "n_vision_calls": s.get("n_vision_calls"),
+            # The number of diffusion Euler steps that actually executed. The
+            # --inference-step parameter records None when unset, and the
+            # sampler then silently uses the checkpoint's own default, so this
+            # is the only place the executed count is visible.
+            "n_expert_calls": s.get("n_expert_calls"),
             # False -> the t_* values above are absent, not zero.
             "timing_measured": s.get("timing_measured"),
         }

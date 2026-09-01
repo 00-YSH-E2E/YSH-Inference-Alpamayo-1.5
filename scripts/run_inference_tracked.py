@@ -54,6 +54,13 @@ import torch  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# The repo holding the code being run, found from this file rather than from the
+# working directory. Launched from one directory up -- which is not a git repo --
+# every git coordinate would come back empty and the run would carry no record of
+# what produced it. Launched from a *different* repo, it would record that repo's
+# commit as though it described this code.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 import ml_platform_track as mlp  # noqa: E402
 
 import physical_ai_av  # noqa: E402
@@ -357,7 +364,7 @@ def main() -> None:
         config = {
             "run_id": run_id,
             "variant": args.variant,
-            "git_commit": mlp.git_tags().get("git_commit"),
+            "git_commit": mlp.git_tags(REPO_ROOT).get("git_commit"),
             "columns": {
                 "model": args.model,
                 "data_spec": args.data_spec,
@@ -387,7 +394,19 @@ def main() -> None:
             "curvature_std": float(space.curvature_std),
             "dt": float(space.dt),
             "n_waypoints": int(space.n_waypoints),
-            "prompt_len": int(rows[0].get("prompt_len", 0)) if rows else 0,
+            # None, never 0, when the tracer did not run. Zero is a plausible
+            # length and a reader slicing on it walks into the padding -- which
+            # is how this field came to be wrong in every run before schema 2.
+            # Fixing sample() closed the common path; this closes the one where
+            # the tracer itself failed and the rows never carried the key.
+            "prompt_len": next(
+                (int(r["prompt_len"]) for r in rows if r.get("prompt_len") is not None), None
+            ),
+            # How many rows the token tracer actually reached. It swallows its
+            # own failures so a bad hook cannot kill a run, which means a silent
+            # zero here would otherwise be the only sign it never ran.
+            "n_traced_rows": sum(1 for r in rows if r.get("token_ids") is not None),
+            "n_rows_total": len(rows),
             # Archived so a reader can find the reasoning and meta-action spans
             # inside token_ids without knowing this checkpoint. Several of these
             # ids are used nowhere in this repo, which is the point -- the
@@ -558,6 +577,7 @@ def main() -> None:
         variant=args.variant,
         split=f"clips:{len(clips)}",
         conditioning_source="generated",
+        root=REPO_ROOT,
         seed=args.seed,
         notes=args.notes,
     ) as run:
