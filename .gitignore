@@ -214,3 +214,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# README-recommended venv name (uv sync --active)
+a1_5_venv/
+
+# ML_Platform run outputs
+out/
+mlruns/
+gt.parquet
