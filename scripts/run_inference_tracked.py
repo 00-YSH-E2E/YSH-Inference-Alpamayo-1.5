@@ -63,7 +63,7 @@ from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5  # noqa: E402
 from alpamayo1_5.trace import metrics as M  # noqa: E402
 from alpamayo1_5.trace import thermal as TH  # noqa: E402
 from alpamayo1_5.trace import writer as W  # noqa: E402
-from alpamayo1_5.trace.token_trace import trace_inference  # noqa: E402
+from alpamayo1_5.trace.token_trace import DEFAULT_SPECIAL_IDS, trace_inference  # noqa: E402
 
 MODEL_REPO = "nvidia/Alpamayo-1.5-10B"
 DATASET_REPO = "nvidia/PhysicalAI-Autonomous-Vehicles"
@@ -227,6 +227,10 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
     gt = data.get("ego_future_xyz")
     gt_xy = gt.cpu()[0, 0, :, :2].numpy() if gt is not None else None
     cot_texts = [str(c) for c in np.asarray(extra["cot"]).reshape(-1)]
+    # extract_text_tokens already decodes this next to the reasoning trace; the
+    # parquet has had a meta_action column since the first run and nothing was
+    # ever putting anything in it.
+    meta_actions = [str(m) for m in np.asarray(extra.get("meta_action", [])).reshape(-1)]
 
     hist_xy = data["ego_history_xyz"][0, 0, :, :2].cpu().numpy()
     hist_rot = data["ego_history_rot"][0, 0].cpu().numpy()
@@ -241,6 +245,7 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
             "hist_xy": hist_xy,
             "hist_rot": hist_rot,
             "cot": cot_texts[k] if k < len(cot_texts) else "",
+            "meta_action": meta_actions[k] if k < len(meta_actions) else None,
             **timing,
         }
         if trace is not None and k < trace.token_ids.shape[0]:
@@ -383,9 +388,11 @@ def main() -> None:
             "dt": float(space.dt),
             "n_waypoints": int(space.n_waypoints),
             "prompt_len": int(rows[0].get("prompt_len", 0)) if rows else 0,
-            "special_token_ids": __import__(
-                "alpamayo1_5.trace.token_trace", fromlist=["DEFAULT_SPECIAL_IDS"]
-            ).DEFAULT_SPECIAL_IDS,
+            # Archived so a reader can find the reasoning and meta-action spans
+            # inside token_ids without knowing this checkpoint. Several of these
+            # ids are used nowhere in this repo, which is the point -- the
+            # parquet is meant to outlive the code that wrote it.
+            "special_token_ids": DEFAULT_SPECIAL_IDS,
             "params_billions": sum(p.numel() for p in model.parameters()) / 1e9,
         }
         meta.update(M.model_size(model))
