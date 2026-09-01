@@ -358,6 +358,16 @@ def main() -> None:
         W.write_run(out_dir, rows, config, meta, gt=gt_rows if args.include_gt else None)
         print(f"\nrun directory: {out_dir}")
 
+        # Archive before the tracking short-circuit below. --no-track means "do
+        # not record this run", not "do not keep its outputs" -- and --no-upload
+        # already exists for the latter. Coupling them left every --no-track run
+        # as a single copy on this machine's disk with nothing pointing at it.
+        sha = None
+        if not args.no_upload:
+            sha = mlp.upload_run_dir(
+                W.upload_paths(out_dir), args.evals_repo, f"runs/{out_dir.name}"
+            )
+
         if run is None:
             return
 
@@ -443,13 +453,16 @@ def main() -> None:
         run.metrics(thermal.summary())
         run.artifact(out_dir / "run.json", name="eval")
 
-        if args.no_upload:
+        if sha:
+            run.result_path(f"hf:{args.evals_repo}@{sha}#runs/{out_dir.name}/")
+        else:
+            # Either the upload was skipped or it failed. Both leave the files
+            # on this machine only, so record the path honestly -- and when it
+            # was a failure, say so, because a local path standing in for an
+            # archive is exactly what makes a lost run look like a good one.
             run.result_path(f"path:{out_dir}")
-            return
-        sha = mlp.upload_run_dir(W.upload_paths(out_dir), args.evals_repo, f"runs/{out_dir.name}")
-        run.result_path(
-            f"hf:{args.evals_repo}@{sha}#runs/{out_dir.name}/" if sha else f"path:{out_dir}"
-        )
+            if not args.no_upload:
+                run.tag("upload_failed", "true")
 
     if args.no_track:
         execute(None)
