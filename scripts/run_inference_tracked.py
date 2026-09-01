@@ -39,6 +39,7 @@ and therefore the latency, so runs on either side of that are not comparable.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -70,6 +71,26 @@ EVALS_REPO = "YSHRobotics/Alpamayo-Evals"
 DATA_CACHE = "/home/thor/Documents/Alpamayo/Data/Alpamayo-1.5_Cam-4_Vanilla"
 DEFAULT_CLIP = "030c760c-ae38-49aa-9ad8-f5650a545d26"
 MAX_SAMPLE_IMAGES = 20  # representative figures per run, per the recording rules
+
+# Per-clip values that become run-level means. Spelled out rather than swept
+# off whatever per_clip happens to contain: with a sweep, the metric namespace
+# of every future run is decided by whatever metrics.py last returned, and a
+# column can appear or vanish between runs without anyone choosing that.
+# Anything computed but absent here is printed at the end of the run.
+#
+# ade_6.4s is min_ade by construction (the full horizon of the best sample).
+# Kept as a free consistency check; if the two ever disagree, the horizon
+# indexing is wrong.
+_CLIP_METRICS = (
+    "min_ade", "min_fde", "mean_ade", "mean_fde",
+    "ade_1.0s", "ade_2.0s", "ade_3.0s", "ade_4.0s", "ade_5.0s", "ade_6.4s",
+    "de_1.0s", "de_2.0s", "de_3.0s", "de_4.0s", "de_5.0s", "de_6.4s",
+    "jerk_mean", "jerk_p95",
+    "lat_accel_mean", "lat_accel_p95", "lat_accel_over_4_ratio",
+    "accel_violation_rate", "within_bounds_ratio", "speed_mean",
+    "net_heading_deg", "net_heading_abs_deg",
+    "lateral_offset_m", "lateral_offset_abs_m",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -372,15 +393,37 @@ def main() -> None:
             return
 
         scored = [c["min_ade"] for c in per_clip if c.get("min_ade") is not None]
-        if scored:
-            run.score(float(np.mean(scored)))
         run.metric("n_clips", len(clips))
+        if scored:
+            values = np.asarray(scored, dtype=float)
+            run.score(float(values.mean()))
+            # The denominator. score is a mean over clips that had ground
+            # truth, which is not the same as n_clips, and reading the two side
+            # by side without this makes it look like it was.
+            run.metric("n_scored", float(values.size))
+            # The shape of the distribution, not just its middle. A mean that
+            # holds while the tail doubles is the regression this misses.
+            for pct in (50, 90, 95):
+                run.metric(f"min_ade_p{pct}", float(np.percentile(values, pct)))
+            run.metric("min_ade_max", float(values.max()))
+            run.metric("frac_over_2m", float((values > 2.0).mean()))
+
         # Averages over per-clip values. Per-sample rows stay in the parquet.
-        keys = sorted({k for c in per_clip for k, v in c.items() if isinstance(v, (int, float))})
-        for key in keys:
+        #
+        # Declared, not swept. Collecting whatever keys per_clip happens to hold
+        # means the run's metric namespace is decided by whatever metrics.py
+        # last returned: add a key there and every future run silently grows a
+        # column, drop one and old runs have a column new ones lack.
+        for key in _CLIP_METRICS:
             values = [c[key] for c in per_clip if isinstance(c.get(key), (int, float))]
             if values:
                 run.metric(key, float(np.mean(values)))
+        unrecorded = sorted(
+            {k for c in per_clip for k, v in c.items() if isinstance(v, (int, float))}
+            - set(_CLIP_METRICS)
+        )
+        if unrecorded:
+            print(f"[trace] not recorded (add to _CLIP_METRICS): {', '.join(unrecorded)}")
         for key in ("logprob_mean", "perplexity", "entropy_mean", "entropy_p95",
                     "low_confidence_ratio"):
             vals = []
@@ -444,12 +487,28 @@ def main() -> None:
         # How many clips the timings above actually rest on. Without it a mean
         # over 3 measured clips out of 100 looks like a mean over 100.
         run.metric("n_timed_clips", float(len(per_step)))
-        scenes = [c["scene"] for c in per_clip if c.get("scene")]
-        for scene in set(scenes):
-            run.metric(f"scenario.{scene}.count", scenes.count(scene))
-        run.by_scenario(
-            {c["clip_id"]: c["min_ade"] for c in per_clip if c.get("min_ade") is not None}
-        )
+        # Breakdown by scene: fixed cardinality, and it answers the question
+        # actually being asked -- does the model give up on curves? The previous
+        # code wrote a metric key per clip UUID, which put 100 keys in a 148-key
+        # run. A UUID is a primary key, not an axis: it cannot be sorted,
+        # grouped or plotted, the key set differs between runs so the
+        # experiment's union grows without bound, and each one cost its own HTTP
+        # round trip to a single-worker server. Per-clip values are already in
+        # predictions.parquet, where metrics.py argues they belong.
+        by_scene: dict[str, list[float]] = {}
+        for c in per_clip:
+            if c.get("scene") and c.get("min_ade") is not None:
+                by_scene.setdefault(c["scene"], []).append(float(c["min_ade"]))
+        run.by_scenario({s: (float(np.mean(v)), len(v)) for s, v in by_scene.items()})
+        # The clips a person would actually open. Bounded, and readable in the
+        # UI as one tag instead of hunting through a metric list.
+        worst = sorted(
+            ((c["clip_id"], float(c["min_ade"])) for c in per_clip
+             if c.get("min_ade") is not None),
+            key=lambda kv: -kv[1],
+        )[:10]
+        if worst:
+            run.tag("worst_clips", json.dumps([[k, round(v, 4)] for k, v in worst]))
         run.metrics(thermal.summary())
         run.artifact(out_dir / "run.json", name="eval")
 
