@@ -41,7 +41,7 @@ dev = [
   "pre-commit>=4.5.1",
   "pytest>=8.0.0",
   # [tool.ruff] below configures a linter that was not installed anywhere.
-  "ruff>=0.14",
+  "ruff==0.14.5",   # same version as CI and .pre-commit-config.yaml
 ]
 
 [tool.pytest.ini_options]
