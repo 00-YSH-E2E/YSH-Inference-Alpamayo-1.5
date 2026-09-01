@@ -3,7 +3,6 @@ name: Bug report
 about: Create a bug report to help us improve Alpamayo
 title: "[BUG]"
 labels: "? - Needs Triage, bug"
-assignees: 'yesfandiari'
 
 ---
 
