@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 YSH-research
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,14 +15,18 @@
 
 """The run directory: what a finished inference run leaves behind.
 
-Layout, one directory per run::
+Layout, one directory per run (see :func:`run_dir_name`)::
 
-    out/<YYYY-MM-DD>_<name>_<run_id[:8]>/
+    out/Alpamayo-1.5_Cam-4_Vanilla_26.09.01_39581f9b/
     ├── predictions.parquet   one row per (clip_id, t0_us, sample_k)
     ├── run.json              run-level metadata and the constants needed to
     │                         recompute anything offline
     ├── gt.parquet            logged future -- local only, never uploaded
     └── samples/<clip_id>.png
+
+The trailing eight characters are the MLflow run id, which is what makes the
+link bidirectional: a directory names its run, and a run's ``output_uri``
+names its directory.
 
 Two decisions drive the whole schema.
 
@@ -42,8 +46,15 @@ authoritative.
 
 The logged future is the one deliberate exception: it is recoverable from
 ``(clip_id, t0_us)``, so it goes to ``gt.parquet`` for local convenience and is
-excluded from upload, which also keeps gated dataset content out of a shared
-repo.
+excluded from upload.
+
+That exclusion is about size and recoverability, not licensing. It would be
+convenient to also call it "gated content stays out of the shared repo", but
+that is not true of what does get uploaded: every ``samples/*.png`` embeds the
+source dataset's camera frames, and they are the bulk of the upload. The evals
+repo is therefore private, and has to stay private for as long as the source
+dataset is gated -- turning it public is one click and cannot be undone for
+anything already cloned.
 """
 
 from __future__ import annotations

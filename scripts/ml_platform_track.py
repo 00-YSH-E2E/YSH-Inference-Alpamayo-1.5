@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 YSH-research
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +32,33 @@ attempted, and the bulk goes to Hugging Face regardless.
 On exit the run is checked against the recording rules and prints PASS or FAIL
 with what is missing. A FAIL is a bug in the caller, not in the run -- fix the
 script, because the next run will trip on the same thing.
+
+Three entry points, one per kind of run::
+
+    with track("my-project", params="params.yaml",
+               hf_datasets=["YSHRobotics/CoC-Nusc@main"],
+               project="my-project") as run:          # makes a model
+        run.metric("val_loss", loss, step=epoch)
+
+    with evaluate("my-project", model="hf:owner/name@main",
+                  split="val14") as ev:                # scores against labels
+        ev.score(0.9258)
+        ev.by_scenario({"curve": (0.93, 25)})
+
+    with infer("my-project", model="hf:owner/name@main") as ev:  # no labels
+        ev.result_path("hf:owner/name-evals@<sha>#runs/<dir>/")
+
+An eval that cannot score is an infer. Inventing a score to satisfy the eval
+rules is worse than recording honestly that there was nothing to score against.
+
+This file is the canonical copy in the ML_Platform repository under
+``examples/``; every training and inference repo holds a byte-identical copy so
+that a fix reaches all of them. It carries an Apache-2.0 header for the repos
+that require one, and the two copies are meant to compare equal -- if they
+differ, the one in ML_Platform wins.
+
+Requires ``mlflow>=3`` at record time (import works without it) and PyYAML only
+if params is given as a YAML path.
 """
 
 from __future__ import annotations
@@ -56,7 +83,12 @@ try:
 except ImportError:  # only needed when a run is actually recorded
     mlflow = None
 
-DEFAULT_TRACKING_URI = "http://ysh-jetson-orin-nano.tail4570ef.ts.net:5000"
+# The hub is on a private tailnet with no route from the internet and no
+# authentication -- the bind address is the whole boundary. Point this at your
+# own server with ML_PLATFORM_HOST (or MLFLOW_TRACKING_URI for the full URL);
+# the default is only a convenience for the machines already on that tailnet.
+DEFAULT_HOST = os.environ.get("ML_PLATFORM_HOST", "ysh-jetson-orin-nano.tail4570ef.ts.net")
+DEFAULT_TRACKING_URI = f"http://{DEFAULT_HOST}:5000"
 
 # From the recording rules: anything larger goes to Hugging Face and MLflow
 # gets only the coordinate.
@@ -73,24 +105,43 @@ _DURABLE_URI = ("hf:", "s3:", "mlflow:", "http:", "https:")
 
 # -- context ---------------------------------------------------------------
 def env_tags(seed: int | None = None, notes: str | None = None) -> dict[str, str]:
-    """Machine and invocation. Collection failures are never fatal."""
-    tags = {
-        "env.host": socket.gethostname(),
-        "env.python": platform.python_version(),
-        "entrypoint": sys.argv[0],
-        "cmd": " ".join(shlex.quote(a) for a in sys.argv),
-    }
+    """Machine and invocation. Collection failures are never fatal.
+
+    None of this can be filled in afterwards: a run that never looked at its
+    own GPU cannot be told later which one it had. Half of it is worth more
+    than none, which is why each item is collected separately -- one
+    try/except around the whole torch block loses the device count and the
+    compute capability because the device *name* raised.
+    """
+    tags: dict[str, str] = {}
+
+    def put(key: str, fn) -> None:
+        try:
+            value = fn()
+        except Exception:
+            return
+        if value:
+            tags[key] = str(value)
+
+    put("env.host", socket.gethostname)
+    put("env.python", platform.python_version)
+    put("env.platform", lambda: f"{platform.system()} {platform.machine()}")
+    put("entrypoint", lambda: sys.argv[0])
+    put("cmd", lambda: " ".join(shlex.quote(a) for a in sys.argv))
     try:
         import torch
-
-        tags["env.torch"] = torch.__version__
-        tags["env.cuda"] = torch.version.cuda or ""
-        if torch.cuda.is_available():
-            tags["env.gpu"] = torch.cuda.get_device_name(0)
-            tags["env.gpu_count"] = str(torch.cuda.device_count())
-            tags["env.compute_capability"] = "sm_%d%d" % torch.cuda.get_device_capability(0)
     except Exception:
-        pass
+        torch = None  # type: ignore[assignment]
+    if torch is not None:
+        put("env.torch", lambda: torch.__version__)
+        put("env.cuda", lambda: torch.version.cuda or "")
+        if torch.cuda.is_available():
+            put("env.gpu", lambda: torch.cuda.get_device_name(0))
+            put("env.gpu_count", lambda: str(torch.cuda.device_count()))
+            # What kernels actually differ on across a Thor / Orin / Pro 6000
+            # fleet. The GPU name alone does not separate them reliably.
+            put("env.compute_capability",
+                lambda: "sm_%d%d" % torch.cuda.get_device_capability(0))
     if seed is not None:
         tags["seed"] = str(seed)
     if notes is not None:
@@ -98,23 +149,50 @@ def env_tags(seed: int | None = None, notes: str | None = None) -> dict[str, str
     return {k: v for k, v in tags.items() if v}
 
 
-def git_tags() -> dict[str, str]:
-    """Code coordinates read from the working directory. Never raises."""
+def _strip_credentials(url: str) -> str:
+    """Remove any userinfo from a git remote before it becomes a tag.
+
+    A remote cloned with a token looks like
+    ``https://x-access-token:ghp_xxx@github.com/owner/repo``. The tracking
+    server has no authentication -- its bind address is the whole boundary --
+    so writing that verbatim publishes a live credential to everyone who can
+    reach the tailnet, and MLflow tags cannot be edited afterwards.
+    """
+    if "@" in url and "://" in url:
+        scheme, rest = url.split("://", 1)
+        return f"{scheme}://{rest.rsplit('@', 1)[-1]}"
+    return url
+
+
+def git_tags(root: str | Path = ".") -> dict[str, str]:
+    """Code coordinates for the repo at ``root``. Never raises.
+
+    ``-C`` matters: without it this reports on whatever directory the process
+    was launched from, which is not necessarily the repo holding the code
+    being run.
+    """
 
     def run(*args: str) -> str:
         try:
-            done = subprocess.run(args, capture_output=True, text=True, timeout=10, check=False)
+            done = subprocess.run(
+                ("git", "-C", str(root)) + args,
+                capture_output=True, text=True, timeout=10, check=False,
+            )
             return done.stdout.strip() if done.returncode == 0 else ""
         except Exception:
+            # A timeout is the interesting case: git can block forever on a
+            # credential prompt or a dead network mount.
             return ""
 
     tags = {
-        "git_commit": run("git", "rev-parse", "HEAD"),
-        "git_branch": run("git", "rev-parse", "--abbrev-ref", "HEAD"),
-        "git_remote": run("git", "config", "--get", "remote.origin.url"),
+        "git_commit": run("rev-parse", "HEAD"),
+        "git_branch": run("rev-parse", "--abbrev-ref", "HEAD"),
+        "git_remote": _strip_credentials(run("config", "--get", "remote.origin.url")),
     }
     if tags["git_commit"]:
-        tags["git_dirty"] = "true" if run("git", "status", "--porcelain") else "false"
+        # --porcelain counts untracked files too, which is right: a new file
+        # the run depends on makes it just as unreproducible as an edit.
+        tags["git_dirty"] = "true" if run("status", "--porcelain") else "false"
     return {k: v for k, v in tags.items() if v}
 
 
@@ -127,6 +205,37 @@ def _hf_token() -> str | None:
         return Path.home().joinpath(".cache/huggingface/token").read_text().strip() or None
     except OSError:
         return None
+
+
+def flatten(data: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Nested config to dotted keys: ``{"opt": {"lr": 1e-4}}`` -> ``opt.lr``.
+
+    MLflow params are flat. Logging a nested dict as one JSON blob makes it
+    impossible to sort or filter runs by a setting inside it, which is most of
+    the point of recording settings at all.
+    """
+    out: dict[str, Any] = {}
+    for key, value in data.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, Mapping):
+            out.update(flatten(value, f"{name}."))
+        else:
+            out[name] = value
+    return out
+
+
+def _read_config(path: Path) -> dict[str, Any]:
+    """Load a YAML or JSON config. Returns {} rather than raising."""
+    try:
+        text = path.read_text()
+        if path.suffix.lower() in (".yaml", ".yml"):
+            import yaml  # imported here so the module works without PyYAML
+
+            return yaml.safe_load(text) or {}
+        return json.loads(text)
+    except Exception as exc:
+        print(f"[ml_platform] could not read {path}: {exc}", file=sys.stderr)
+        return {}
 
 
 def parse_coord(coord: str) -> tuple[str, str, str]:
@@ -229,14 +338,33 @@ class Run:
         self._tags[key] = str(value)
         mlflow.set_tag(key, str(value))
 
-    def params(self, params: Mapping[str, Any] | None) -> None:
-        """Everything needed to reproduce. Params are cheap; omissions are not."""
+    def params(self, params: Mapping[str, Any] | str | Path | None) -> None:
+        """Everything needed to reproduce. Params are cheap; omissions are not.
+
+        Accepts a mapping or a path to a YAML/JSON config. Given a path, the
+        file is also attached to the run: a flattened key list answers "what
+        was the setting", the file answers "what did the config look like",
+        and the second question is the one asked when reproducing a run months
+        later.
+        """
+        if params is None:
+            return
+        source: Path | None = None
+        if isinstance(params, (str, Path)):
+            source = Path(params)
+            if not source.is_file():
+                print(f"[ml_platform] no config at {source} -- no params recorded",
+                      file=sys.stderr)
+                return
+            params = _read_config(source)
         if not params:
             return
         flat = {}
-        for key, value in params.items():
+        for key, value in flatten(dict(params)).items():
             flat[key] = json.dumps(value) if isinstance(value, (list, tuple, dict)) else str(value)
         mlflow.log_params(flat)
+        if source is not None:
+            self.artifact(source, name="config")
 
     def metric(self, key: str, value: float, step: int | None = None) -> None:
         key = _METRIC_KEY_RE.sub("_", key)  # MLflow rejects anything outside this alphabet
@@ -245,23 +373,53 @@ class Run:
         self._metrics.add(key)
         mlflow.log_metric(key, float(value), step=step)
 
-    def metrics(self, values: Mapping[str, float]) -> None:
+    def metrics(self, values: Mapping[str, float], step: int | None = None) -> None:
+        """Several metrics in one request.
+
+        One POST per key is what this avoids. The tracking server runs a single
+        worker on a Jetson, so a dict of thirty keys logged one at a time is
+        thirty serial round trips at the end of a run.
+        """
+        clean: dict[str, float] = {}
         for key, value in values.items():
-            self.metric(key, value)
+            if value is None or (isinstance(value, float) and value != value):
+                continue  # NaN and None are not measurements
+            safe = _METRIC_KEY_RE.sub("_", str(key))
+            clean[safe] = float(value)
+            self._metrics.add(safe)
+        if clean:
+            mlflow.log_metrics(clean, step=step)
 
     def score(self, value: float) -> None:
         """The one representative number this run is ranked by."""
         self.metric("score", value)
 
     def by_scenario(self, scores: Mapping[str, Any]) -> None:
-        """Scene breakdown -- a comparison axis, so it belongs here and not only in parquet."""
+        """Scene breakdown -- a comparison axis, so it belongs here and not only in parquet.
+
+        Keys must name a *category*, not an item. One key per clip id turns the
+        metric namespace into a primary-key index: it cannot be grouped or
+        sorted, and the key set differs between runs so the experiment's union
+        grows without bound. Per-item values belong in the run's parquet.
+        """
+        batch: dict[str, float] = {}
         for name, value in scores.items():
             key = _METRIC_KEY_RE.sub("_", str(name))
-            if isinstance(value, (tuple, list)) and len(value) == 2:
-                self.metric(f"scenario.{key}.score", value[0])
-                self.metric(f"scenario.{key}.count", value[1])
-            else:
-                self.metric(f"scenario.{key}.score", value)
+            # (score, count) is the useful form -- a mean without its sample
+            # size cannot be weighted or trusted. Anything else of length != 2
+            # would previously reach float(list) and raise inside the run.
+            if isinstance(value, (tuple, list)):
+                if len(value) != 2:
+                    print(f"[ml_platform] SKIP scenario {name!r}: expected (score, count), "
+                          f"got {len(value)} values", file=sys.stderr)
+                    continue
+                if value[0] is not None:
+                    batch[f"scenario.{key}.score"] = value[0]
+                if value[1] is not None:
+                    batch[f"scenario.{key}.count"] = value[1]
+            elif value is not None:
+                batch[f"scenario.{key}.score"] = value
+        self.metrics(batch)
 
     def result_path(self, uri: str) -> None:
         self.tag("output_uri", uri)
@@ -362,11 +520,11 @@ class Run:
             )
         if self.run_type == "train" and not (self._metrics & {"val_loss", "train_loss", "loss"}):
             problems.append("train runs need val_loss / train_loss / loss")
-        # Only meaningful where something was conditioned on something: a
-        # training run has no conditioning source, and demanding one failed
-        # every train run on a field that does not apply to it.
-        if self.run_type in ("eval", "infer") and not self._tags.get("conditioning_source"):
-            problems.append("conditioning_source missing -- runs cannot be compared without it")
+        # conditioning_source is deliberately not required here. It is a useful
+        # tag and a real comparison axis for trajectory models, but it is not
+        # one of the recording rules' required coordinates, and a helper that
+        # every project copies cannot fail a run over a field that project does
+        # not have the concept of. Pass it where it means something.
         for coord in dict.fromkeys(self.unresolved):
             problems.append(f"unresolved revision (not a 40-char sha): {coord}")
         return problems
@@ -377,13 +535,17 @@ def _run(
     experiment: str,
     run_type: str,
     run_name: str | None = None,
-    params: Mapping[str, Any] | None = None,
+    params: Mapping[str, Any] | str | Path | None = None,
     hf_datasets: Iterable[str] = (),
     hf_models: Iterable[str] = (),
     model: str | None = None,
     split: str | None = None,
+    challenge: str | None = None,
     variant: str | None = None,
-    conditioning_source: str = "generated",
+    conditioning_source: str | None = None,
+    project: str | None = None,
+    parent_run: str | None = None,
+    root: str | Path = ".",
     seed: int | None = None,
     notes: str | None = None,
     tracking_uri: str | None = None,
@@ -398,15 +560,27 @@ def _run(
     with mlflow.start_run(run_name=run_name):
         run = Run(run_type)
         run.tag("run_type", run_type)
-        run.tag("conditioning_source", conditioning_source)
-        for key, value in git_tags().items():
+        if conditioning_source:
+            run.tag("conditioning_source", conditioning_source)
+        for key, value in git_tags(root).items():
             run.tag(key, value)
         for key, value in env_tags(seed=seed, notes=notes).items():
             run.tag(key, value)
+        # The project this belongs to. The hub can also infer it from the
+        # experiment name or a repo coordinate, but both are guesses that break
+        # when something is renamed; an explicit tag outranks them.
+        if project:
+            run.tag("project", project)
+        # A sweep's runs are siblings. Without this the parent is just another
+        # row and the relationship is only in the run names.
+        if parent_run:
+            run.tag("mlflow.parentRunId", parent_run)
         if variant:
             run.tag("variant", variant)
         if split:
             run.tag("eval_split", split)
+        if challenge:
+            run.tag("eval_challenge", challenge)
         if model:
             run.model_source(model)
         run.hf_datasets(hf_datasets)
