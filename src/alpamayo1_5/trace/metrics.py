@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 YSH-research
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -128,6 +128,19 @@ def kinematics(
     ``within_bounds_ratio`` is reported alongside as a hard-failure canary only.
     Its gates sit around 10 sigma and it folds every waypoint into one boolean,
     so it answers "did anything explode", never "is this comfortable to ride in".
+    Note that only its acceleration half can ever fire: ``traj_to_action``
+    clamps curvature to ``curvature_bounds`` before returning, so the curvature
+    half is satisfied by construction. A ``curvature_violation_rate`` used to be
+    reported here and was necessarily 0.0 on every run -- a metric that cannot
+    take a second value looks like a passing check.
+
+    A caveat that applies to everything below. These read the action recovered
+    by inverting the trajectory through ``traj_to_action``, which is a
+    regularized least-squares fit, not the action the model emitted. The fit is
+    biased toward smoothness, so jerk and the violation gates are, if anything,
+    flattering. The emitted action is available -- ``token_trace`` already
+    intercepts the diffusion head's return value -- and routing it here would
+    make these numbers exact.
 
     Args:
         space: The model's action space, holding this checkpoint's normalization
@@ -151,7 +164,6 @@ def kinematics(
     lateral = speed**2 * kappa
 
     accel_lo, accel_hi = space.accel_bounds
-    kappa_lo, kappa_hi = space.curvature_bounds
 
     def stat(tensor: torch.Tensor) -> tuple[float, float]:
         flat = tensor.abs().flatten().float()
@@ -167,8 +179,10 @@ def kinematics(
         "lat_accel_over_4_ratio": float(
             (lateral.abs() > LATERAL_ACCEL_COMFORT_MS2).float().mean()
         ),
+        # +-9.8 m/s^2 is a 1 g gate: this fires when the fit produced something
+        # physically absurd, not when the ride is uncomfortable. Use
+        # lat_accel_over_4_ratio for that.
         "accel_violation_rate": float(((accel < accel_lo) | (accel > accel_hi)).float().mean()),
-        "curvature_violation_rate": float(((kappa < kappa_lo) | (kappa > kappa_hi)).float().mean()),
         "within_bounds_ratio": float(space.is_within_bounds(action).float().mean()),
         "speed_mean": float(speed.abs().mean()),
     }

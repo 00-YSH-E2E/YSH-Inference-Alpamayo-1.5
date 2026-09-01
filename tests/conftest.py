@@ -13,16 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Instrumentation for recording inference runs.
+"""Make ``scripts/`` importable.
 
-Purely additive: nothing here modifies upstream files, so the fork diff against
-NVlabs/alpamayo1.5 stays readable. Three pieces:
-
-* ``metrics``     -- pure functions over arrays. Never stored, always recomputed.
-* ``token_trace`` -- captures per-token logprob/entropy and exact token counts.
-* ``writer``      -- the run directory: predictions.parquet, run.json, samples/.
-
-The organizing rule is that inference is expensive and analysis is cheap, so a
-run stores only what cannot be recomputed without the model. Metric definitions
-will change; the raw data must outlive them.
+``scripts/ml_platform_track.py`` is a standalone file copied between repos
+rather than a package module, so it is not on the path by default.
 """
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+for extra in (ROOT / "scripts", ROOT / "src"):
+    if str(extra) not in sys.path:
+        sys.path.insert(0, str(extra))

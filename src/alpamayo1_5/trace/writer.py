@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 YSH-research
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,14 +15,18 @@
 
 """The run directory: what a finished inference run leaves behind.
 
-Layout, one directory per run::
+Layout, one directory per run (see :func:`run_dir_name`)::
 
-    out/<YYYY-MM-DD>_<name>_<run_id[:8]>/
+    out/Alpamayo-1.5_Cam-4_Vanilla_26.09.01_39581f9b/
     ├── predictions.parquet   one row per (clip_id, t0_us, sample_k)
     ├── run.json              run-level metadata and the constants needed to
     │                         recompute anything offline
     ├── gt.parquet            logged future -- local only, never uploaded
     └── samples/<clip_id>.png
+
+The trailing eight characters are the MLflow run id, which is what makes the
+link bidirectional: a directory names its run, and a run's ``output_uri``
+names its directory.
 
 Two decisions drive the whole schema.
 
@@ -42,8 +46,15 @@ authoritative.
 
 The logged future is the one deliberate exception: it is recoverable from
 ``(clip_id, t0_us)``, so it goes to ``gt.parquet`` for local convenience and is
-excluded from upload, which also keeps gated dataset content out of a shared
-repo.
+excluded from upload.
+
+That exclusion is about size and recoverability, not licensing. It would be
+convenient to also call it "gated content stays out of the shared repo", but
+that is not true of what does get uploaded: every ``samples/*.png`` embeds the
+source dataset's camera frames, and they are the bulk of the upload. The evals
+repo is therefore private, and has to stay private for as long as the source
+dataset is gated -- turning it public is one click and cannot be undone for
+anything already cloned.
 """
 
 from __future__ import annotations
@@ -57,7 +68,13 @@ import pandas as pd
 
 # Bump when a column is added, removed or changes meaning. Concatenating runs
 # with different schema versions is the failure this exists to make visible.
-SCHEMA_VERSION = 1
+#
+# 2: prompt_len, t_other_ms, n_decode_steps, timing_measured.
+#    Version 1 runs are not merely missing these columns -- their prompt_len was
+#    written as 0 into run.json by a reader that asked the row for a key the row
+#    never carried, so refusing to concatenate v1 with v2 is the right outcome
+#    rather than an inconvenience.
+SCHEMA_VERSION = 2
 
 # Columns whose values are flat float32 arrays. Stored as lists; the trailing
 # shape is recorded in run.json so a reader can reshape without guessing.
@@ -160,13 +177,21 @@ def build_rows(samples: Iterable[dict], config: dict) -> pd.DataFrame:
             "n_generated_tokens": s.get("n_generated_tokens"),
             "n_cot_tokens": s.get("n_cot_tokens"),
             "eos_missing": s.get("eos_missing"),
-            # timing
+            "prompt_len": s.get("prompt_len"),
+            # timing. The six t_* values sum to t_total_ms; t_other_ms is what
+            # the named segments leave over, so the sum is checkable.
             "t_vision_ms": s.get("t_vision_ms"),
             "t_prefill_ms": s.get("t_prefill_ms"),
             "t_decode_ms": s.get("t_decode_ms"),
             "t_postgen_ms": s.get("t_postgen_ms"),
             "t_expert_ms": s.get("t_expert_ms"),
+            "t_other_ms": s.get("t_other_ms"),
             "t_total_ms": s.get("t_total_ms"),
+            # Decode's own denominator. Per-row token counts are not it: the
+            # batch decodes until the last row finishes.
+            "n_decode_steps": s.get("n_decode_steps"),
+            # False -> the t_* values above are absent, not zero.
+            "timing_measured": s.get("timing_measured"),
         }
         row.update(config.get("columns", {}))
         rows.append(row)

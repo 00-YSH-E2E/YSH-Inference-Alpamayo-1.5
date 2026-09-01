@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 YSH-research
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,10 +33,13 @@ on its own. The point is to know, later, whether a timing can be trusted.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import glob
 import os
 import pathlib
 import subprocess
+import threading
 from dataclasses import dataclass, field
 
 # The first fan step. Below this, nothing has begun to intervene.
@@ -55,8 +58,13 @@ def read_temps() -> dict[str, float]:
     out: dict[str, float] = {}
     for type_path in _ZONE_TYPES:
         try:
-            name = open(type_path).read().strip()
-            out[name] = int(open(type_path.replace("/type", "/temp")).read()) / 1000.0
+            # Read through pathlib so the handles close deterministically. Now
+            # that a background thread calls this several times a second, an
+            # open handle per zone per sample adds up before the refcount
+            # collector gets to it.
+            name = pathlib.Path(type_path).read_text().strip()
+            raw = pathlib.Path(type_path.replace("/type", "/temp")).read_text()
+            out[name] = int(raw) / 1000.0
         except (OSError, ValueError):
             continue
     return out
@@ -80,8 +88,13 @@ def read_power_w() -> dict[str, float]:
     return out
 
 
+@functools.lru_cache(maxsize=1)
 def power_mode() -> str:
-    """The nvpmodel profile, which caps clocks and therefore latency."""
+    """The nvpmodel profile, which caps clocks and therefore latency.
+
+    Cached: it does not change mid-run, and it was being read by a subprocess
+    twice per run -- once for the params and once per ThermalLog.
+    """
     try:
         done = subprocess.run(
             ["nvpmodel", "-q"], capture_output=True, text=True, timeout=5, check=False
@@ -101,12 +114,51 @@ class ThermalLog:
     samples: list[dict[str, float]] = field(default_factory=list)
     mode: str = field(default_factory=power_mode)
 
+    #: Set while a background sampler is running; cleared to stop it.
+    _stop: threading.Event | None = None
+    _thread: threading.Thread | None = None
+
     def sample(self) -> dict[str, float]:
         """Take one reading. Cheap enough to call between clips."""
         reading = read_temps()
         reading.update({f"power.{k}": v for k, v in read_power_w().items()})
         self.samples.append(reading)
         return reading
+
+    @contextlib.contextmanager
+    def sampling(self, period_s: float = 0.5):
+        """Sample in the background for the duration of the block.
+
+        Between-clip sampling is fine for temperature, which moves on a
+        timescale of seconds, but it is the wrong instrument for power: every
+        reading lands after inference finished and after the sample figure was
+        drawn, so ``power.*_mean_w`` describes an idle GPU. That is not an
+        underestimate, it is a different quantity.
+
+        A daemon thread rather than a signal timer, so this works off the main
+        thread; reads are a few sysfs files and cost well under a millisecond,
+        so a 0.5 s period is free next to a multi-second clip.
+        """
+        stop = threading.Event()
+
+        def loop() -> None:
+            while not stop.is_set():
+                try:
+                    self.sample()
+                except Exception:
+                    # A sampler must never be the reason a run dies.
+                    pass
+                stop.wait(period_s)
+
+        thread = threading.Thread(target=loop, name="thermal-sampler", daemon=True)
+        self._stop, self._thread = stop, thread
+        thread.start()
+        try:
+            yield self
+        finally:
+            stop.set()
+            thread.join(timeout=period_s * 4)
+            self._stop = self._thread = None
 
     def _series(self, key: str) -> list[float]:
         return [s[key] for s in self.samples if key in s]

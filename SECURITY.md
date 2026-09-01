@@ -1,4 +1,20 @@
-# Report a Security Vulnerability
+# Reporting a vulnerability
+
+**This repository is a fork, and the process below is NVIDIA's.** Route reports
+by what the issue is in:
+
+- **This fork's own code** — the tracing package under `src/alpamayo1_5/trace/`
+  and the scripts that record runs: open a private security advisory on this
+  repository (Security → Report a vulnerability). NVIDIA PSIRT does not maintain
+  this code and cannot act on it.
+- **Upstream Alpamayo 1.5, the released model, or any other NVIDIA product**:
+  use NVIDIA's process, below. Anything that reproduces on
+  [NVlabs/alpamayo1.5](https://github.com/NVlabs/alpamayo1.5) without this
+  fork's scripts belongs there.
+
+---
+
+## NVIDIA: Report a Security Vulnerability
 
 To report a potential security vulnerability in any NVIDIA product, please use either:
 

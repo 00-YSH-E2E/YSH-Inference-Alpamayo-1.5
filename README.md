@@ -9,6 +9,12 @@
 
 </div>
 
+> **This is a fork of [NVlabs/alpamayo1.5](https://github.com/NVlabs/alpamayo1.5)**
+> that adds instrumented, recorded inference on Jetson AGX Thor. Everything below
+> is upstream's documentation; what this fork adds — and where to start on a
+> Jetson, because the first command upstream suggests does not work there — is in
+> [Running tracked inference](#running-tracked-inference) at the end.
+
 ## Updates
 
 - [May 2026] SFT and RL post-training scripts are available in [Alpamayo Recipes](https://github.com/NVlabs/alpamayo-recipes): [Alpamayo 1.5 SFT](https://github.com/NVlabs/alpamayo-recipes/tree/main/recipes/alpamayo1_5_sft) and [Alpamayo 1.x RL post-training](https://github.com/NVlabs/alpamayo-recipes/tree/main/recipes/alpamayo1_x_rl).
@@ -87,6 +93,13 @@ For reference, it takes around 2.5 minutes on a 100 MB/s wired connection.
 ```bash
 python src/alpamayo1_5/test_inference.py
 ```
+
+> **On Jetson (Thor, Orin), run `python scripts/smoke_inference.py` instead.**
+> `test_inference.py` loads the model without naming an attention
+> implementation, which defaults to flash-attn — and flash-attn has no aarch64
+> wheel, so the command above fails on the hardware this fork targets.
+> `scripts/smoke_inference.py` is the same pipeline with SDPA and a device
+> report. See [Running tracked inference](#running-tracked-inference).
 
 In case you would like to obtain more trajectories and reasoning traces, please feel free to increase
 the `num_traj_samples` argument in the script.
@@ -280,4 +293,122 @@ If you use Alpamayo 1.5 in your research, please cite:
       journal={arXiv preprint arXiv:2511.00088},
 }
 ```
-# YSH-Inference-Alpamayo-1.5
+---
+
+# Running tracked inference
+
+*Everything from here down is this fork, not upstream NVIDIA.*
+
+Upstream gives you a model and a script that prints trajectories. This fork adds
+the part that makes a run mean something a month later: it records what code,
+what data and what machine produced each number, writes the predictions to a
+file, and pushes both to somewhere they survive the machine that made them.
+
+The motivation is narrow. Comparing a pruned or quantized variant against the
+baseline on a Jetson means comparing latency, and latency on a Jetson depends on
+how hot the board was. After the fact there is no way to tell a real regression
+from a warm heatsink — unless the temperature was recorded alongside the number.
+
+## Where things go
+
+```
+MLflow  ──  numbers you sort and graph: minADE, latency, temperature, power
+HF      ──  the files behind them: predictions.parquet, run.json, samples/*.png
+            a coordinate on the run points from one to the other
+```
+
+Neither half stands alone. Metrics with no artifacts cannot be inspected;
+artifacts with no metrics cannot be ranked.
+
+## Start here
+
+```bash
+# 1. does the model load and run at all on this board?
+python scripts/smoke_inference.py
+
+# 2. a real, recorded run
+export MLFLOW_TRACKING_URI=http://<your-hub>:5000     # or ML_PLATFORM_HOST
+export HF_TOKEN=hf_...                                # to pin revisions to shas
+git commit -am "..."                                  # BEFORE the run, see below
+python scripts/run_inference_tracked.py --limit 3 --variant Vanilla
+```
+
+The run prints `PASS` or `FAIL` against the recording rules when it finishes. A
+`FAIL` is a bug in the script, not in the run — the next run trips on the same
+thing, so fix it there.
+
+Useful flags: `--clip-list clips.parquet` / `--limit N` to choose clips,
+`--variant` to name what makes this run different (it becomes a comparison
+axis), `--num-traj-samples`, `--temperature`, `--seed`, `--no-upload` to keep
+outputs local, `--no-track` to skip MLflow entirely.
+
+## What a run leaves behind
+
+```
+out/Alpamayo-1.5_Cam-4_Vanilla_26.09.01_39581f9b/
+├── predictions.parquet   one row per (clip, t0, trajectory sample)
+├── run.json              params, normalization constants, parquet schema
+├── gt.parquet            logged future — local only, never uploaded
+└── samples/<clip_id>.png camera grid + predicted vs logged trajectory
+```
+
+The last eight characters of the directory name are the MLflow run id. That is
+what makes the link bidirectional: a directory names its run, and a run's
+`output_uri` names its directory. Re-running the same configuration on the same
+day is routine, so the date alone would collide.
+
+Everything except `gt.parquet` is pushed to the evals repo
+(`--evals-repo`, default `YSHRobotics/Alpamayo-Evals`). **That repo has to stay
+private:** the sample images embed frames from
+`nvidia/PhysicalAI-Autonomous-Vehicles`, which is gated. Making it public is one
+click and cannot be undone for anything already cloned.
+
+## What gets recorded
+
+| | |
+|---|---|
+| Code | `git_commit`, `git_branch`, `git_dirty` |
+| Data & model | `hf_datasets`, `hf_models`, `model_source` — revisions pinned to 40-character shas, not branch names |
+| Machine | `env.host`, `env.gpu`, `env.compute_capability`, `env.torch`, `env.cuda`, `power_mode` |
+| Result | `score` (mean minADE, metres, lower is better), percentiles, per-scene breakdown |
+| Latency | `t_vision_ms`, `t_prefill_ms`, `t_decode_ms`, `t_postgen_ms`, `t_expert_ms`, `t_other_ms` — the six sum to `t_total_ms` |
+| Thermal | `temp.tj_max_c`, `temp.peak_c`, `power.<rail>_mean_w`, `temp.throttle_risk` |
+| Where the outputs went | `output_uri` — must be durable; a local path fails the check |
+
+Per-clip values are **not** metrics. They live in `predictions.parquet`. A clip
+id is a primary key, not an axis: keyed as metrics they cannot be grouped or
+sorted, and the key set differs between runs.
+
+## Two things the code cannot do for you
+
+**Commit before running.** `git status --porcelain` is recorded as `git_dirty`,
+and a dirty run is not reproducible. This is not hypothetical — half the runs
+recorded so far are dirty, because the instrumentation was being written while
+it was being used.
+
+**Run from inside this repository.** MLflow reads the working directory to fill
+in `mlflow.source.git.commit`, and that takes precedence over the tag set here.
+Launched from a different repo, a run records that repo's commit instead.
+
+## The modules
+
+| | |
+|---|---|
+| `scripts/run_inference_tracked.py` | The CLI. Loads clips, runs the model, computes metrics, writes the run directory, records it |
+| `scripts/smoke_inference.py` | Does the model load and produce a trajectory on this board? No recording |
+| `scripts/ml_platform_track.py` | The recording helper. A byte-identical copy of `examples/ml_platform_track.py` in the ML_Platform repo — that one is canonical |
+| `src/alpamayo1_5/trace/token_trace.py` | Per-token logprob and entropy, CUDA-event timing split |
+| `src/alpamayo1_5/trace/metrics.py` | ADE/FDE, kinematic feasibility, scene classification, token quality |
+| `src/alpamayo1_5/trace/thermal.py` | Jetson temperature and rail power, read from sysfs |
+| `src/alpamayo1_5/trace/writer.py` | The run directory: schema, versioning, what may be uploaded |
+
+## Tests
+
+```bash
+pytest                    # 52 tests, no GPU required
+```
+
+They cover the displacement arithmetic, the run-directory schema and the
+recording rules — the parts that fail silently rather than loudly. CI runs the
+same set. **Green in CI does not mean green on Thor:** nothing there exercises
+the model, the CUDA-event timing, or thermal reading on real hardware.

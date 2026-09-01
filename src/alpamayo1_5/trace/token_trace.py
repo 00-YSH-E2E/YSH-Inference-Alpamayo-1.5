@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 YSH-research
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,7 +52,7 @@ checkpoint:
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -93,6 +93,12 @@ class TokenTrace:
             "n_generated_tokens": n,
             "n_cot_tokens": int(self.n_cot[k]),
             "eos_missing": bool(self.eos_missing[k]),
+            # Same for every row of a batch, but it has to travel on the row:
+            # the writer reads it back off row 0 to record how far into the
+            # padded sequence generation started. Leaving it off meant every
+            # run.json written so far carries prompt_len 0, which reads as a
+            # real measurement and slices an offline reader into the padding.
+            "prompt_len": int(self.prompt_len),
         }
 
 
@@ -106,9 +112,19 @@ class SegmentTiming:
     postgen_ms: float = 0.0
     expert_ms: float = 0.0
     total_ms: float = 0.0
+    #: ``total_ms`` minus the five named segments. Vision, prefill and decode all
+    #: run inside the generate span, so the named parts never summed to the total
+    #: and nothing said by how much. Recording the remainder makes the split
+    #: self-checking: the six add up, or the instrumentation is wrong.
+    other_ms: float = 0.0
     n_vision_calls: int = 0
     n_decode_steps: int = 0
     n_expert_calls: int = 0
+    #: False means no timing was taken at all (no CUDA, or no events recorded).
+    #: Without this, an unmeasured run reports 0.0 ms and reads as "took no
+    #: time" rather than "never measured" -- a plausible number is worse than
+    #: a missing one, because it gets averaged into a comparison.
+    measured: bool = False
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -118,6 +134,14 @@ class SegmentTiming:
             "t_postgen_ms": self.postgen_ms,
             "t_expert_ms": self.expert_ms,
             "t_total_ms": self.total_ms,
+            "t_other_ms": self.other_ms,
+            # Decode is batched over K rows and runs until the *last* row stops,
+            # so a per-row token count is the wrong denominator for it. This is
+            # the right one, and it was being computed and thrown away.
+            "n_decode_steps": self.n_decode_steps,
+            "n_vision_calls": self.n_vision_calls,
+            "n_expert_calls": self.n_expert_calls,
+            "timing_measured": self.measured,
         }
 
 
@@ -367,6 +391,14 @@ class InferenceTracer:
             timing.postgen_ms = float(max(gap, 0.0))
         if generate:
             timing.total_ms = total(generate) + timing.postgen_ms + timing.expert_ms
+            # What the named segments do not account for: logits processors,
+            # sampling, stopping criteria, KV-cache management. Clamped at zero
+            # because a negative remainder means the spans overlap, which is a
+            # bug in the marks rather than negative time spent.
+            named = (timing.vision_ms + timing.prefill_ms + timing.decode_ms
+                     + timing.postgen_ms + timing.expert_ms)
+            timing.other_ms = float(max(timing.total_ms - named, 0.0))
+        timing.measured = True
         self.timing = timing
         return timing
 
