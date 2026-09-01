@@ -3,7 +3,6 @@ name: Feature request
 about: Suggest an idea for Alpamayo
 title: "[FEA]"
 labels: "? - Needs Triage, feature request"
-assignees: 'yesfandiari'
 
 ---
 

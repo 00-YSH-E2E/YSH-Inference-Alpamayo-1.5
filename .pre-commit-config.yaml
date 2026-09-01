@@ -1,0 +1,29 @@
+# CONTRIBUTING.md tells contributors to run `pre-commit`, and until now there
+# was no config for it to read, so the documented command could not work.
+#
+# Scoped to the paths this fork owns. Upstream's tree is not held to these
+# rules -- reformatting it would bury the fork's own changes in noise and make
+# every future merge from NVlabs a conflict.
+
+files: ^(src/alpamayo1_5/trace/|scripts/|tests/)
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.5
+    hooks:
+      - id: ruff          # same check CI runs
+        args: [--line-length, "100"]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-merge-conflict
+      # A run records git_dirty from `git status --porcelain`, which counts
+      # large stray files too. Catching them here keeps them out of the repo
+      # and out of the reproducibility record.
+      - id: check-added-large-files
+        args: [--maxkb=1024]

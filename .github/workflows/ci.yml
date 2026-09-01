@@ -1,0 +1,78 @@
+# Checks that mean something on a runner with no GPU.
+#
+# The model needs an Orin/Thor-class device and a 10B checkpoint, so nothing
+# here exercises inference. What it does cover is the part that was getting
+# silently wrong: the displacement arithmetic, the run-directory schema, and
+# the recording rules. Those are plain numpy and plain dicts, and a single
+# test would have caught prompt_len being written as 0 into every uploaded
+# run.json for months.
+#
+# Deliberately no torch install. It would take minutes, pull a CUDA stack the
+# runner cannot use, and buy one more skipped test -- test_diffusion_expert
+# needs an actual GPU either way. Green here is not green on Thor, and the
+# README says so.
+
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push supersedes the first; there is no reason to finish the old run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # pyproject pins ==3.12.*
+
+      # Not `uv sync`: the lockfile resolves aarch64 CUDA wheels for the
+      # Jetson and will not install here. These four are what the testable
+      # half actually imports.
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check numpy pandas pyarrow pytest
+
+      - name: Lint the files this fork owns
+        # Upstream's tree is not held to this; these paths are ours.
+        run: pipx run ruff check --line-length 100 src/alpamayo1_5/trace/ scripts/ tests/
+
+      - name: Every file parses
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          bad = []
+          for path in pathlib.Path().rglob("*.py"):
+              if ".git" in path.parts:
+                  continue
+              try:
+                  ast.parse(path.read_text(), str(path))
+              except SyntaxError as exc:
+                  bad.append(f"{path}:{exc.lineno}: {exc.msg}")
+          print("\n".join(bad) or f"parsed {len(list(pathlib.Path().rglob('*.py')))} files")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Tests
+        env:
+          PYTHONPATH: src:scripts
+        # -ra prints why anything skipped, so a suite that quietly stops
+        # testing is visible rather than green.
+        run: python -m pytest tests/ -q -ra
+
+      - name: The tracker copies have not drifted
+        # scripts/ml_platform_track.py is a copy of the canonical file in the
+        # ML_Platform repo. This cannot compare against that repo from here,
+        # but it can refuse the version that used to hardcode a private
+        # hostname, which is the drift that mattered.
+        run: |
+          grep -q 'ML_PLATFORM_HOST' scripts/ml_platform_track.py
+          ! grep -qE 'DEFAULT_TRACKING_URI *= *"http' scripts/ml_platform_track.py

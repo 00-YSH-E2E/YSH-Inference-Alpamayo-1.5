@@ -10,11 +10,17 @@ from typing import Any
 from weakref import ref
 
 import pytest
-import torch
-from transformers.cache_utils import Cache, DynamicLayer
-from transformers.modeling_outputs import BaseModelOutputWithPast
 
-from alpamayo1_5.models.diffusion_expert_cuda_graph import (
+# importorskip, not a bare import: a plain `import torch` raises during
+# collection on a machine without it, which fails the whole suite instead of
+# skipping this module. The skipif below never got a chance to run.
+torch = pytest.importorskip("torch", reason="CUDA graph capture needs torch")
+pytest.importorskip("transformers", reason="needs transformers")
+
+from transformers.cache_utils import Cache, DynamicLayer  # noqa: E402
+from transformers.modeling_outputs import BaseModelOutputWithPast  # noqa: E402
+
+from alpamayo1_5.models.diffusion_expert_cuda_graph import (  # noqa: E402
     enable_diffusion_expert_cuda_graph,
 )
 

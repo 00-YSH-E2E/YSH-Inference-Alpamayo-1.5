@@ -10,7 +10,15 @@
 blank_issues_enabled: false
 
 contact_links:
-  - name: 💬 Submit a question (usage, how-to)
+  - name: 💬 Questions about upstream Alpamayo 1.5 itself
     url: https://forums.developer.nvidia.com/c/autonomous-vehicles/alpamayo/766
     about: >
-      For usage questions and discussion, post on the Alpamayo NV Developer Forum category. GitHub Issues is reserved for code-level bugs, documentation fixes, and feature requests.
+      Model behaviour, the released checkpoints and the action space belong on
+      NVIDIA's forum. Issues here are for this fork -- the tracing package
+      under src/alpamayo1_5/trace/ and the scripts that record runs.
+
+  - name: 🐞 Bugs in upstream Alpamayo 1.5
+    url: https://github.com/NVlabs/alpamayo1.5/issues
+    about: >
+      If it reproduces on NVlabs/alpamayo1.5 without this fork's scripts, it
+      belongs there. Nobody watching this repo can fix it.

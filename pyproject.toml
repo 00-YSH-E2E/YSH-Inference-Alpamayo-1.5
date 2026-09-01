@@ -11,12 +11,22 @@ dependencies = [
   "pandas>=2.3.3",
   "physical-ai-av==0.2.0",
   "pillow>=12.0.0",
-  "torch>=2.11",
+  # Pinned, not floored. This repo exists to compare latency between model
+  # variants; `uv lock --upgrade` moving torch would change the CUDA stack and
+  # the numbers underneath a comparison without anything saying so. The lock
+  # already holds 2.13.0 -- this makes that deliberate.
+  "torch==2.13.0",
   "torchvision>=0.23.0",
   "transformers==4.57.1",
   "matplotlib>=3.10.7",
   "seaborn>=0.13.2",
   "mlflow>=3",
+  # Both were reaching the code as transitive dependencies of mlflow/pandas.
+  # writer.py cannot write a run without pyarrow, and the upload path cannot
+  # run without huggingface_hub; neither should depend on another package
+  # continuing to pull them in.
+  "pyarrow>=14",
+  "huggingface_hub>=0.26",
 ]
 
 [build-system]
@@ -30,7 +40,16 @@ dev = [
   "ipywidgets>=8.1.8",
   "pre-commit>=4.5.1",
   "pytest>=8.0.0",
+  # [tool.ruff] below configures a linter that was not installed anywhere.
+  "ruff>=0.14",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# src/ for the package, scripts/ for ml_platform_track.py, which is a
+# standalone file copied between repos rather than a package module.
+pythonpath = ["src", "scripts"]
+addopts = "-ra"   # say why anything skipped; a quietly shrinking suite looks green
 
 
 [tool.ruff]
