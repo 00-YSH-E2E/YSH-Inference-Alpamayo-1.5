@@ -60,6 +60,7 @@ from alpamayo1_5 import helper  # noqa: E402
 from alpamayo1_5.load_physical_aiavdataset import load_physical_aiavdataset  # noqa: E402
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5  # noqa: E402
 from alpamayo1_5.trace import metrics as M  # noqa: E402
+from alpamayo1_5.trace import thermal as TH  # noqa: E402
 from alpamayo1_5.trace import writer as W  # noqa: E402
 from alpamayo1_5.trace.token_trace import trace_inference  # noqa: E402
 
@@ -263,6 +264,7 @@ def main() -> None:
         "torch_disable_native_jit": os.environ.get("TORCH_DISABLE_NATIVE_JIT"),
         "torch_version": torch.__version__,
         "data_cache": args.data_cache,
+        "power_mode": TH.power_mode(),
     }
 
     def execute(run: mlp.Run | None) -> None:
@@ -279,6 +281,10 @@ def main() -> None:
             args.variant, date, run_id, data=args.data_spec
         )
         rows, per_clip, gt_rows = [], [], []
+        # Sampled between clips: throttling moves latency without moving anything
+        # else, and after the run there is no way to tell that from a regression.
+        thermal = TH.ThermalLog()
+        thermal.sample()
         for i, clip_id in enumerate(clips):
             started = time.perf_counter()
             clip_rows, extras = run_clip(model, processor, avdi, clip_id, args, out_dir)
@@ -293,10 +299,12 @@ def main() -> None:
                     out_dir / "samples" / f"{clip_id}.png",
                 )
             extras.pop("data", None)  # frames are large; do not hold them for the whole run
+            reading = thermal.sample()
             print(
                 f"[{i + 1}/{len(clips)}] {clip_id[:8]} "
                 f"minADE {extras.get('min_ade', float('nan')):.3f} "
-                f"scene {extras['scene']} {time.perf_counter() - started:.1f}s"
+                f"scene {extras['scene']} {time.perf_counter() - started:.1f}s "
+                f"tj {reading.get('tj-thermal', float('nan')):.0f}C"
             )
 
         config = {
@@ -339,6 +347,9 @@ def main() -> None:
             "params_billions": sum(p.numel() for p in model.parameters()) / 1e9,
         }
         meta.update(M.model_size(model))
+        meta["thermal"] = thermal.summary()
+        meta["power_mode"] = thermal.mode
+        print(f"\n{thermal.verdict()}")
         W.write_run(out_dir, rows, config, meta, gt=gt_rows if args.include_gt else None)
         print(f"\nrun directory: {out_dir}")
 
@@ -384,6 +395,7 @@ def main() -> None:
         run.by_scenario(
             {c["clip_id"]: c["min_ade"] for c in per_clip if c.get("min_ade") is not None}
         )
+        run.metrics(thermal.summary())
         run.artifact(out_dir / "run.json", name="eval")
 
         if args.no_upload:
