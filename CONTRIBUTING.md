@@ -1,4 +1,27 @@
+# Contributing
+
+**This repository is a fork.** Which rules apply depends on what you are
+changing:
+
+- **Anything under `src/alpamayo1_5/trace/`, `scripts/`, `tests/` or `.github/`**
+  belongs to this fork. Open an issue or PR *here*. `pytest` must pass (52 tests,
+  no GPU needed) and `ruff check --line-length 100` must be clean on those paths;
+  CI enforces both, and `pre-commit install` runs the same checks locally.
+- **Anything else** is upstream [NVlabs/alpamayo1.5](https://github.com/NVlabs/alpamayo1.5)
+  code. Fixes belong there — nobody watching this repo can merge them into the
+  model everyone else uses. Upstream's rules follow below and are unmodified.
+
+One correction to those rules as they apply here: they state that no CI exists.
+That is true upstream; this fork runs checks on every push and pull request. The
+instruction to run `pre-commit` also works now — the config it needs is in
+`.pre-commit-config.yaml`, scoped to the paths above so that upstream's tree is
+not reformatted underneath the next merge.
+
+---
+
 ## Alpamayo 1.5 OSS Contribution Rules
+
+*(from upstream, for contributions to NVlabs/alpamayo1.5)*
 
 #### Issue Tracking
 
