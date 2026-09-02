@@ -348,6 +348,18 @@ def main() -> None:
         # Latency is meaningless without it, and a run made off the tailnet
         # has no env.host tag until it is imported.
         "machine": W.machine_name(args.machine),
+        # Switches that change what was read or produced. They were reachable
+        # only through the `cmd` tag -- an opaque string that records what was
+        # typed and says nothing about the defaults, and cannot be filtered on.
+        #
+        # allow_stream is the one that matters: it decides whether a clip came
+        # from the local cache or from the hub. A half-populated cache under it
+        # produces a run that read a mix of cached and live data, and nothing
+        # else in the record distinguishes that from a fully cached run.
+        "allow_stream": bool(args.allow_stream),
+        "include_gt": bool(args.include_gt),
+        "save_samples": not args.no_samples,
+        "upload": not args.no_upload,
     }
 
     def execute(run: mlp.Run | None) -> None:

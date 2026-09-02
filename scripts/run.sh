@@ -27,6 +27,14 @@ CLIP_LIST="notebooks/clip_ids.parquet"   # clip_id 열이 있는 parquet
 LIMIT=1                                  # 0 이면 목록 전부
 NUM_TRAJ_SAMPLES=6                       # 클립당 뽑을 궤적 수 (K)
 
+# 특정 클립만 돌릴 때.  적으면 CLIP_LIST 와 LIMIT 을 무시한다
+#   CLIP_IDS=("030c760c-ae38-49aa-9ad8-f5650a545d26" "0347d9f9-...")
+CLIP_IDS=()
+
+# 클립 안 어느 시점부터 예측하나 (마이크로초).  바꾸면 다른 상황을 보는 셈이라
+# 이전 run 과 비교가 안 된다
+T0_US=5100000
+
 # 샘플링
 TEMPERATURE=0.6
 TOP_P=0.98
@@ -39,6 +47,11 @@ MODEL="nvidia/Alpamayo-1.5-10B"
 ATTN="sdpa"                              # Jetson 은 sdpa. flash_attention_2 는 aarch64 휠이 없다
 DATA_SPEC="Cam-4"
 DATA_CACHE="/home/thor/Documents/Alpamayo/Data/Alpamayo-1.5_Cam-4_Vanilla"
+OUT_ROOT="out"                           # run 폴더가 생길 곳
+
+# 캐시에 없는 클립을 허브에서 받아올까.  기본은 아니오 —
+# 켜면 조용히 10배 느려지고, 캐시본과 스트림본이 섞여 무엇을 읽었는지 흐려진다
+ALLOW_STREAM=0
 
 # 이 run 이 왜 존재하는지 한두 문장.  6개월 뒤의 네가 읽는다
 NOTES="baseline 재측정"
@@ -101,10 +114,28 @@ fi
 
 # ── 데이터 ─────────────────────────────────────────────────────────────────
 DATA_OK=1
-[[ -d "$DATA_CACHE" ]] || { DATA_OK=0; fail "DATA_CACHE 가 없다: $DATA_CACHE
-       캐시가 없으면 스트리밍으로 떨어져 10배 느려지고, 출력에는 아무 표시도 안 남는다"; }
-[[ -z "$CLIP_LIST" || -f "$CLIP_LIST" ]] || { DATA_OK=0; fail "CLIP_LIST 가 없다: $CLIP_LIST"; }
-[[ "$DATA_OK" == "1" ]] && ok "데이터: $DATA_CACHE${CLIP_LIST:+  ·  $CLIP_LIST}"
+if [[ ! -d "$DATA_CACHE" ]]; then
+  if [[ "$ALLOW_STREAM" == "1" ]]; then
+    warn "DATA_CACHE 가 없는데 ALLOW_STREAM=1 이다: $DATA_CACHE
+       전부 허브에서 받는다 — 분 단위로 끝날 일이 시간 단위가 된다"
+  else
+    DATA_OK=0
+    fail "DATA_CACHE 가 없다: $DATA_CACHE
+       캐시가 없으면 스트리밍으로 떨어져 10배 느려지고, 출력에는 아무 표시도 안 남는다
+       일부러 그러는 거면 ALLOW_STREAM=1"
+  fi
+fi
+# 클립을 직접 지정했으면 목록 파일은 안 읽는다
+if [[ ${#CLIP_IDS[@]} -eq 0 && -n "$CLIP_LIST" && ! -f "$CLIP_LIST" ]]; then
+  DATA_OK=0; fail "CLIP_LIST 가 없다: $CLIP_LIST"
+fi
+if [[ "$DATA_OK" == "1" ]]; then
+  if [[ ${#CLIP_IDS[@]} -gt 0 ]]; then
+    ok "데이터: $DATA_CACHE  ·  클립 ${#CLIP_IDS[@]}개 직접 지정"
+  else
+    ok "데이터: $DATA_CACHE${CLIP_LIST:+  ·  $CLIP_LIST}$([[ "$LIMIT" != "0" ]] && echo "  ·  앞 $LIMIT 개")"
+  fi
+fi
 
 # ── 자격 ───────────────────────────────────────────────────────────────────
 if [[ -z "${HF_TOKEN:-}" && ! -f "$HOME/.cache/huggingface/token" ]]; then
@@ -147,21 +178,29 @@ fi
 ARGS=(
   --variant "$VARIANT"
   --num-traj-samples "$NUM_TRAJ_SAMPLES"
+  --t0-us "$T0_US"
   --temperature "$TEMPERATURE" --top-p "$TOP_P" --seed "$SEED"
   --max-generation-length "$MAX_GENERATION_LENGTH"
   --model "$MODEL" --attn "$ATTN"
   --data-spec "$DATA_SPEC" --data-cache "$DATA_CACHE"
+  --out-root "$OUT_ROOT"
   --experiment "$EXPERIMENT" --evals-repo "$EVALS_REPO"
 )
 [[ -n "$MACHINE" ]]        && ARGS+=(--machine "$MACHINE")
 [[ -n "$NOTES" ]]          && ARGS+=(--notes "$NOTES")
-[[ -n "$CLIP_LIST" ]]      && ARGS+=(--clip-list "$CLIP_LIST")
-[[ "$LIMIT" != "0" ]]      && ARGS+=(--limit "$LIMIT")
 [[ -n "$INFERENCE_STEP" ]] && ARGS+=(--inference-step "$INFERENCE_STEP")
-[[ "$UPLOAD"     == "0" ]] && ARGS+=(--no-upload)
-[[ "$TRACK"      == "0" ]] && ARGS+=(--no-track)
-[[ "$SAMPLES"    == "0" ]] && ARGS+=(--no-samples)
-[[ "$INCLUDE_GT" == "1" ]] && ARGS+=(--include-gt)
+# 클립을 직접 지정했으면 목록과 개수 제한은 뜻이 없다
+if [[ ${#CLIP_IDS[@]} -gt 0 ]]; then
+  for c in "${CLIP_IDS[@]}"; do ARGS+=(--clip-id "$c"); done
+else
+  [[ -n "$CLIP_LIST" ]] && ARGS+=(--clip-list "$CLIP_LIST")
+  [[ "$LIMIT" != "0" ]] && ARGS+=(--limit "$LIMIT")
+fi
+[[ "$ALLOW_STREAM" == "1" ]] && ARGS+=(--allow-stream)
+[[ "$UPLOAD"       == "0" ]] && ARGS+=(--no-upload)
+[[ "$TRACK"        == "0" ]] && ARGS+=(--no-track)
+[[ "$SAMPLES"      == "0" ]] && ARGS+=(--no-samples)
+[[ "$INCLUDE_GT"   == "1" ]] && ARGS+=(--include-gt)
 
 echo
 echo "${DIM}python scripts/run_inference_tracked.py ${ARGS[*]}${OFF}"
