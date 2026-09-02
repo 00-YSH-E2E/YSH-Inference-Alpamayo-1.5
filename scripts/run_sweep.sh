@@ -18,16 +18,27 @@
 # =============================================================================
 
 # 이 묶음의 이름. 모든 run 에 sweep 태그로 붙어서 나중에 이것만 골라볼 수 있다
-SWEEP_NAME="pruning-comparison"
+SWEEP_NAME="euler-step-sweep"
 
 # 축마다 값을 여러 개 적으면 조합이 전부 돈다.
 # 값이 하나면 그 축은 안 도는 것과 같다 (run.sh 기본값을 덮어쓴다).
 # 배열을 통째로 비우면 run.sh 값을 그대로 쓴다.
-SWEEP_VARIANT=("Vanilla") # 예: ("Vanilla" "Pruned-24L" "INT8")
+SWEEP_VARIANT=()                  # 예: ("Vanilla" "Pruned-24L" "INT8") — MODEL 과 짝지을 것
 SWEEP_MODEL=()                    # 변형마다 체크포인트가 다르면 VARIANT 와 같은 길이로
-SWEEP_NUM_TRAJ_SAMPLES=()         # 예: (1 6 16)
+SWEEP_NUM_TRAJ_SAMPLES=()         # 예: (1 6 16).  비우면 run.sh 의 6 — 공식 minADE_6 과 맞는 값
 SWEEP_TEMPERATURE=()              # 예: (0.6 0.9)
-SWEEP_INFERENCE_STEP=()           # 예: (5 10 20)
+
+# 이번 sweep 의 축. 10 이 기준선이고 나머지가 그것과 짝지어 비교된다.
+# 10 을 반드시 포함할 것 — 없으면 비교 대상이 없다.
+SWEEP_INFERENCE_STEP=(10 4 2 1)
+
+# 어느 클립으로 돌릴까.  비우면 run.sh 값을 쓴다.
+#   축이 아니라 **값 하나**인 이유: 클립 목록은 비교 축이 아니라 실험의 경계다.
+#   한 sweep 안에서 바뀌면 arm 마다 다른 클립을 보게 되어 paired 비교가 성립하지 않고,
+#   sweep 태그 하나에 별개의 실험 둘이 묶여 나중에 골라볼 때 섞인다.
+#   두 세트로 보고 싶으면 SWEEP_NAME 을 바꿔 가며 두 번 돌린다.
+SWEEP_CLIP_LIST="notebooks/clip_ids_gold644.parquet"    # 공식 644
+#SWEEP_CLIP_LIST="notebooks/clip_ids.parquet"           # 전체 1181 (gold 를 포함)
 
 # 하나가 죽어도 나머지를 계속 돌릴까.  0 이면 첫 실패에서 멈춘다
 CONTINUE_ON_FAILURE=1
@@ -120,7 +131,12 @@ for job in "${JOBS[@]}"; do
 done
 echo
 echo "  ${DIM}각각이 별개의 MLflow run 이 된다. sweep 태그로 묶인다.${OFF}"
-[[ "$LIMIT" != "0" ]] && echo "  ${DIM}클립 ${LIMIT}개씩 · 총 $((TOTAL * LIMIT)) 클립분${OFF}"
+# 어느 세트로 도는지는 조합 표에 안 나온다 — 축이 아니라 sweep 전체의 상수라서다.
+# 그래서 여기 한 줄로 적는다. 두 세트를 연달아 돌릴 때 어느 쪽이 도는지 헷갈리는 게
+# 실제로 일어나고, 폴더 이름(644clip / 1181clip)은 다 끝난 뒤에야 보인다.
+LIST_SHOWN="${SWEEP_CLIP_LIST:-$CLIP_LIST}"
+N_CLIPS=$([[ "$LIMIT" != "0" ]] && echo "$LIMIT" || echo "전부")
+echo "  ${DIM}클립: ${LIST_SHOWN} · ${N_CLIPS}${OFF}"
 echo
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -141,6 +157,7 @@ for job in "${JOBS[@]}"; do
   # run.sh 를 그대로 다시 부른다 — 점검이 조합마다 돈다. 설정은 환경변수로 덮는다.
   if OVERRIDE_VARIANT="$v" OVERRIDE_MODEL="$m" OVERRIDE_NUM_TRAJ_SAMPLES="$k" \
      OVERRIDE_TEMPERATURE="$t" OVERRIDE_INFERENCE_STEP="$s" \
+     ${SWEEP_CLIP_LIST:+OVERRIDE_CLIP_LIST="$SWEEP_CLIP_LIST"} \
      SWEEP="$SWEEP_NAME" LABEL="$lb" \
      bash "$HERE/run.sh"; then
     RESULTS+=("${GRN}완료${OFF}|$v|$k|$t|$(( $(date +%s) - t0 ))초")

@@ -22,25 +22,48 @@ VARIANT="Vanilla"
 #   호스트명이 그 기계를 부르는 이름이 아닐 때만 적는다 (대여 박스, 컨테이너)
 MACHINE="Pro6000-Vast.ai"
 
-# 몇 개나 돌릴 것인가
-CLIP_LIST="notebooks/clip_ids.parquet"   # clip_id 열이 있는 parquet
-LIMIT=1                                  # 0 이면 목록 전부
-NUM_TRAJ_SAMPLES=6                       # 클립당 뽑을 궤적 수 (K)
+# 어느 클립을 돌릴 것인가.  clip_id 열이 있는 parquet
+#
+#   clip_ids_gold644.parquet  NVIDIA 공식 평가 세트.  recipes 의 eval.py 가
+#                             --parquet 기본값으로 쓰는 그 644개 (열 이름만 맞춤).
+#                             세트 선택이 우리 판단이 아니라는 게 이 파일의 값어치다 —
+#                             "왜 그 클립을 골랐냐" 는 질문이 안 나온다.
+#   clip_ids.parquet          데모용 1181개.  gold 644 를 부분집합으로 포함한다.
+#                             더 넓게 보고 싶을 때만.
+CLIP_LIST="notebooks/clip_ids_gold644.parquet"    # 공식 644
+#CLIP_LIST="notebooks/clip_ids.parquet"           # 전체 1181 (gold 를 포함)
+
+# 앞에서 몇 개만 볼까.  0 이면 목록 전부 — **실험에서는 항상 0 이다.**
+#   LIMIT 은 스모크용 손잡이지 부분집합을 만드는 방법이 아니다. 250 으로 두면
+#   "gold 644 의 앞 250개" 인데, 그 250개가 왜 그 250개인지는 parquet 에 저장된
+#   순서 말고 근거가 없다. 진짜로 작은 세트가 필요하면 CLIP_LIST 를 새로 만든다 —
+#   그래야 "이 기준으로 골랐다" 가 파일로 남는다 (gold644 를 그렇게 만들었다).
+LIMIT=0
+NUM_TRAJ_SAMPLES=6                       # 클립당 뽑을 궤적 수 (K).
+                                         # 공식 지표가 minADE_6 이라 6 이 아니면 그 수치와 비교가 안 된다
 
 # 특정 클립만 돌릴 때.  적으면 CLIP_LIST 와 LIMIT 을 무시한다
 #   CLIP_IDS=("030c760c-ae38-49aa-9ad8-f5650a545d26" "0347d9f9-...")
 CLIP_IDS=()
 
-# 클립 안 어느 시점부터 예측하나 (마이크로초).  바꾸면 다른 상황을 보는 셈이라
-# 이전 run 과 비교가 안 된다
+# ── 아래 여섯 개는 NVIDIA 의 값이다 ────────────────────────────────────────
+# alpamayo-recipes/recipes/alpamayo1_5_quant/eval.py 의 argparse 기본값과 동일하다.
+# 모델 카드가 보고하는 minADE_6 @6.4s = 0.916m 이 이 설정에서 나온 숫자이므로,
+# 하나라도 바꾸면 그 수치와 비교할 근거가 사라진다.  바꿀 거면 왜 바꾸는지 적을 것.
+#
+# 클립 안 어느 시점에서 예측하나 (마이크로초).  t0 이전 1.5초를 보고 이후 6.4초를 예측한다.
+# gold parquet 에 event_t0s 열이 있지만 eval.py 는 쓰지 않는다 — 고정 5.1초다.
 T0_US=5100000
-
-# 샘플링
-TEMPERATURE=0.6
+TEMPERATURE=0.6                          # CoT 텍스트 생성용.  확산 노이즈와 무관하다
 TOP_P=0.98
-SEED=42
-MAX_GENERATION_LENGTH=256
-INFERENCE_STEP=""                        # 비우면 체크포인트 기본값
+SEED=42                                  # 클립마다 추론 직전에 건다.  같은 시드 → 같은 CoT
+                                         # → 같은 초기 노이즈.  paired 비교의 전제다
+MAX_GENERATION_LENGTH=256                # 상한일 뿐. 실측 CoT 는 6~14 토큰이다
+MODEL="nvidia/Alpamayo-1.5-10B"
+# ──────────────────────────────────────────────────────────────────────────
+
+INFERENCE_STEP=10                        # Euler 적분 스텝.  ⚠️ 비우면 열이 null 로 남아
+                                         # 다른 run 과 그룹핑이 안 된다.  기본값도 10 이지만 명시한다
 
 # 어느 파이썬으로 돌리나.  "python" 이면 PATH 에 있는 것 (venv 를 미리 활성화한 경우)
 #   venv 가 이 레포 밖에 있으면 절대경로로 적는다
@@ -51,8 +74,7 @@ PYTHON="/workspace/YSH-KD-Alpamayo-1.5/a1_5_venv/bin/python"
 #   0 이면 안 건드린다 (이 레포를 uv sync 로 직접 설치한 경우)
 FORCE_LOCAL_SRC=1
 
-# 모델과 데이터
-MODEL="nvidia/Alpamayo-1.5-10B"
+# 모델과 데이터 (MODEL 은 위 NVIDIA 블록에 있다)
 ATTN="sdpa"                              # Jetson 은 sdpa. flash_attention_2 는 aarch64 휠이 없다
 DATA_SPEC="Cam-4"
 DATA_CACHE="/workspace/.hf_home/hub"     # HF 허브 캐시 루트 (cache_dir 로 그대로 넘어간다)
@@ -99,6 +121,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # 거기에 ${VAR:-기본값} 을 쓰면 읽기 어려워지고, 무엇이 기본값인지 흐려진다.
 VARIANT="${OVERRIDE_VARIANT:-$VARIANT}"
 MODEL="${OVERRIDE_MODEL:-$MODEL}"
+# 클립 목록은 **비교 축이 아니라 실험의 경계**다. 한 sweep 안에서 바뀌면 arm 마다
+# 다른 클립을 보게 되어 paired 비교가 성립하지 않으므로 SWEEP_ 축은 두지 않는다.
+# 대신 오버라이드는 둔다 — 같은 sweep 을 다른 세트로 한 번 더 돌리는 건 별개의 실험이고,
+# 그때 이 파일을 고치면 워킹트리가 더러워져 run 들이 git_dirty 로 기록된다.
+CLIP_LIST="${OVERRIDE_CLIP_LIST:-$CLIP_LIST}"
 NUM_TRAJ_SAMPLES="${OVERRIDE_NUM_TRAJ_SAMPLES:-$NUM_TRAJ_SAMPLES}"
 TEMPERATURE="${OVERRIDE_TEMPERATURE:-$TEMPERATURE}"
 INFERENCE_STEP="${OVERRIDE_INFERENCE_STEP-$INFERENCE_STEP}"
