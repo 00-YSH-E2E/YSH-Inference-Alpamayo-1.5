@@ -150,6 +150,10 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 # ── 돌리기 ──────────────────────────────────────────────────────────────────
+# 비어 있을 수 있는 환경변수는 배열로 옮겨 둔다 (아래 env 주석 참고)
+CLIP_ENV=()
+[[ -n "${SWEEP_CLIP_LIST:-}" ]] && CLIP_ENV=(OVERRIDE_CLIP_LIST="$SWEEP_CLIP_LIST")
+
 declare -a RESULTS=()
 STARTED=$(date +%s)
 i=0
@@ -160,10 +164,15 @@ for job in "${JOBS[@]}"; do
   echo "────────────────────────────────────────────────────────────"
   t0=$(date +%s)
   # run.sh 를 그대로 다시 부른다 — 점검이 조합마다 돈다. 설정은 환경변수로 덮는다.
-  if OVERRIDE_VARIANT="$v" OVERRIDE_MODEL="$m" OVERRIDE_NUM_TRAJ_SAMPLES="$k" \
+  #
+  # `env` 를 거치는 이유:  이 자리에 조건부 변수를 두려면 그 방법밖에 없다.
+  # 대입 접두사는 **확장 전에** 어휘적으로 판별되므로, `${X:+VAR=val}` 이 만들어 낸
+  # 단어는 대입으로 안 보이고 **명령어 이름**이 된다.  실제로 그렇게 터졌다:
+  #   run_sweep.sh: line NNN: OVERRIDE_CLIP_LIST=...: No such file or directory
+  # env 의 인자로 넘기면 평범한 확장이라 그 규칙에 걸리지 않는다.
+  if env OVERRIDE_VARIANT="$v" OVERRIDE_MODEL="$m" OVERRIDE_NUM_TRAJ_SAMPLES="$k" \
      OVERRIDE_TEMPERATURE="$t" OVERRIDE_INFERENCE_STEP="$s" \
-     ${SWEEP_CLIP_LIST:+OVERRIDE_CLIP_LIST="$SWEEP_CLIP_LIST"} \
-     SWEEP="$SWEEP_NAME" LABEL="$lb" \
+     "${CLIP_ENV[@]}" SWEEP="$SWEEP_NAME" LABEL="$lb" \
      bash "$HERE/run.sh"; then
     RESULTS+=("${GRN}완료${OFF}|$v|$k|$t|$(( $(date +%s) - t0 ))초")
   else
