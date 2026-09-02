@@ -353,8 +353,8 @@ Directory names gain a segment naming only the axes that varied, so a batch is
 identifiable by eye rather than only by run id:
 
 ```
-Alpamayo-1.5_Cam-4_Vanilla_k1-t0.6_thor_26.09.02_39581f9b
-Alpamayo-1.5_Cam-4_Vanilla_k6-t0.9_thor_26.09.02_a1b2c3d4
+Alpamayo-1.5_Cam-4_Vanilla_100clip_k1-temp0.6_thor_26.09.02_39581f9b
+Alpamayo-1.5_Cam-4_Vanilla_100clip_k6-temp0.9_thor_26.09.02_a1b2c3d4
 ```
 
 A sweep that only varies the variant gets no such segment — the variant is
@@ -410,7 +410,7 @@ out/Alpamayo-1.5_Cam-4_Vanilla_thor_26.09.01_39581f9b/
 The name is the coordinate, and it reads in the order the questions get asked:
 
 ```
-{model}_{data}_{variant}_{machine}_{YY.MM.DD}_{run_id[:8]}
+{model}_{data}_{variant}_{clips}clip_k{K}-temp{T}_{machine}_{YY.MM.DD}_{run_id[:8]}
 ```
 
 **Machine is in the name because latency is meaningless without it.** The same

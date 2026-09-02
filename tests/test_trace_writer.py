@@ -72,15 +72,26 @@ def test_machine_defaults_to_the_short_hostname():
     assert W.machine_name("rented-a100") == "rented-a100"
 
 
-def test_label_distinguishes_a_sweep_that_holds_the_variant_fixed():
-    """A sweep over sampling settings leaves the variant alone.
+def test_label_distinguishes_runs_that_share_a_variant():
+    """A 1-clip smoke and a 100-clip evaluation are not the same run.
 
-    Without a label every directory in such a batch reads identically except
-    for the run id -- unique, but you cannot pick the one you want by eye.
+    Without the label they read identically except for the run id -- unique,
+    but you cannot pick the one you want by eye, and mistaking a smoke test for
+    a real measurement is easy and quiet.
     """
-    a = W.run_dir_name("Vanilla", "26.09.02", "aaaaaaaa11", machine="thor", label="k1-t0.6")
-    b = W.run_dir_name("Vanilla", "26.09.02", "bbbbbbbb22", machine="thor", label="k6-t0.9")
-    assert "_k1-t0.6_" in a and "_k6-t0.9_" in b
+    smoke = W.run_dir_name("Vanilla", "26.09.02", "aaaaaaaa11",
+                           machine="thor", label="1clip_k6-temp0.6")
+    real = W.run_dir_name("Vanilla", "26.09.02", "bbbbbbbb22",
+                          machine="thor", label="100clip_k6-temp0.6")
+    assert "_1clip_k6-temp0.6_" in smoke
+    assert "_100clip_k6-temp0.6_" in real
+
+
+def test_names_stay_inside_a_workable_width():
+    """Long enough to identify, short enough to read in a listing."""
+    longest = W.run_dir_name("Pruned-24L", "26.09.02", "aaaaaaaa11", machine="pro6000",
+                             label="100clip_k1-temp0.9-s20")
+    assert len(longest) < 100, longest
 
 
 def test_no_label_leaves_the_name_unchanged():

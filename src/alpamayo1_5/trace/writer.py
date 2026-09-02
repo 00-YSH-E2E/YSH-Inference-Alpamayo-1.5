@@ -17,7 +17,7 @@
 
 Layout, one directory per run (see :func:`run_dir_name`)::
 
-    out/Alpamayo-1.5_Cam-4_Vanilla_thor_26.09.01_39581f9b/
+    out/Alpamayo-1.5_Cam-4_Vanilla_100clip_k6-temp0.6_thor_26.09.01_39581f9b/
     ├── predictions.parquet   one row per (clip_id, t0_us, sample_k): raw output
     ├── per_clip.parquet      one row per clip: situation label and its metrics
     ├── run.json              run-level metadata and the constants needed to

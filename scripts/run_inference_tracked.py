@@ -133,9 +133,9 @@ def parse_args() -> argparse.Namespace:
                    help="Where this ran, for the run directory and run name. Defaults to "
                         "the short hostname, which is also what env.host records.")
     p.add_argument("--label", default=None,
-                   help="Extra segment in the run directory and run name, for a sweep that "
-                        "holds the variant fixed. Without it every directory in such a batch "
-                        "reads the same except for the run id -- unique but not identifiable.")
+                   help="Extra name segment, appended after the standard <n>clip_k<K>-temp<T>. "
+                        "Sweeps use it for axes beyond those, so two runs of one batch stay "
+                        "distinguishable by eye rather than only by run id.")
     p.add_argument("--sweep", default=None,
                    help="Tag every run of one sweep with this name so the batch can be "
                         "filtered as a unit. A sweep is N runs, not one run with N results "
@@ -381,9 +381,17 @@ def main() -> None:
 
         run_id = run.run_id if run is not None else f"local{int(time.time()):x}"
         machine = W.machine_name(args.machine)
+        # 이름에 늘 들어가는 꼬리. 클립 수와 샘플링은 결과를 직접 바꾸는데,
+        # 없으면 3클립 스모크와 100클립 본 run 이 폴더 이름으로 구분이 안 된다 —
+        # 그 둘을 헷갈리는 건 실제로 일어나고, 헷갈린 채 비교하면 조용히 틀린다.
+        # temperature 는 temp 로 풀어 쓴다: 이 코드베이스엔 t0_us 가 있어서 t 가 모호하다.
+        label = (f"{len(clips)}clip_k{args.num_traj_samples}"
+                 f"-temp{args.temperature:g}")
+        if args.label:              # sweep 이 붙이는 추가 축 (예: -s20)
+            label = f"{label}-{args.label}"
         out_dir = Path(args.out_root) / W.run_dir_name(
             args.variant, date, run_id, data=args.data_spec, machine=machine,
-            label=args.label,
+            label=label,
         )
         rows, per_clip, gt_rows = [], [], []
         # Throttling moves latency without moving anything else, and after the
@@ -664,9 +672,12 @@ def main() -> None:
         return
     with mlp.evaluate(
         args.experiment,
-        run_name=f"{args.variant}{'+' + args.label if args.label else ''}"
-                 f"@{W.machine_name(args.machine)}"
-                 f"-{len(clips)}clip-n{args.num_traj_samples}",
+        # 폴더 이름과 같은 표기를 쓴다. 표에서 본 run 을 디스크에서 찾을 때
+        # 머릿속에서 변환하지 않아도 되도록.
+        run_name=f"{args.variant}@{W.machine_name(args.machine)}"
+                 f"-{len(clips)}clip-k{args.num_traj_samples}"
+                 f"-temp{args.temperature:g}"
+                 f"{'-' + args.label if args.label else ''}",
         model=f"hf:{args.model}@main",
         hf_datasets=[f"{DATASET_REPO}@main"],
         params=params,

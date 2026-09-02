@@ -82,18 +82,14 @@ if [[ ${#SWEEP_VARIANT[@]} -gt 1 && "$PAIRED_MODEL" == "0" && ${#SWEEP_MODEL[@]}
   exit 1
 fi
 
-# 이름에 넣을 축을 고른다. **실제로 여러 값을 가진 축만** 넣는다 — 안 그러면 한 축짜리
-# sweep 의 폴더 이름까지 안 변하는 값으로 길어진다. variant 는 이미 이름에 있으니 뺀다.
-LABEL_K=0; LABEL_T=0; LABEL_S=0
-[[ ${#SWEEP_NUM_TRAJ_SAMPLES[@]} -gt 1 ]] && LABEL_K=1
-[[ ${#SWEEP_TEMPERATURE[@]}      -gt 1 ]] && LABEL_T=1
-[[ ${#SWEEP_INFERENCE_STEP[@]}   -gt 1 ]] && LABEL_S=1
+# 클립 수와 K·temperature 는 러너가 늘 이름에 넣는다. 여기서는 **그 밖의 축 중
+# 실제로 여러 값을 가진 것만** 꼬리에 더한다 — 안 변하는 값으로 이름을 늘리지 않는다.
+LABEL_S=0
+[[ ${#SWEEP_INFERENCE_STEP[@]} -gt 1 ]] && LABEL_S=1
 
-make_label() {  # $1=k $2=temp $3=step
+make_label() {  # $1=step
   local out=""
-  [[ "$LABEL_K" == "1" ]] && out="${out}${out:+-}k$1"
-  [[ "$LABEL_T" == "1" ]] && out="${out}${out:+-}t$2"
-  [[ "$LABEL_S" == "1" && -n "$3" ]] && out="${out}${out:+-}s$3"
+  [[ "$LABEL_S" == "1" && -n "$1" ]] && out="s$1"
   printf '%s' "$out"
 }
 
@@ -106,7 +102,7 @@ for vi in "${!SWEEP_VARIANT[@]}"; do
     for k in "${SWEEP_NUM_TRAJ_SAMPLES[@]}"; do
       for t in "${SWEEP_TEMPERATURE[@]}"; do
         for s in "${SWEEP_INFERENCE_STEP[@]}"; do
-          JOBS+=("${v}|${m}|${k}|${t}|${s}|$(make_label "$k" "$t" "$s")")
+          JOBS+=("${v}|${m}|${k}|${t}|${s}|$(make_label "$s")")
         done
       done
     done
