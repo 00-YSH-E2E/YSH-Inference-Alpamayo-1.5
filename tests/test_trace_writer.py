@@ -72,6 +72,26 @@ def test_machine_defaults_to_the_short_hostname():
     assert W.machine_name("rented-a100") == "rented-a100"
 
 
+def test_label_distinguishes_a_sweep_that_holds_the_variant_fixed():
+    """A sweep over sampling settings leaves the variant alone.
+
+    Without a label every directory in such a batch reads identically except
+    for the run id -- unique, but you cannot pick the one you want by eye.
+    """
+    a = W.run_dir_name("Vanilla", "26.09.02", "aaaaaaaa11", machine="thor", label="k1-t0.6")
+    b = W.run_dir_name("Vanilla", "26.09.02", "bbbbbbbb22", machine="thor", label="k6-t0.9")
+    assert "_k1-t0.6_" in a and "_k6-t0.9_" in b
+
+
+def test_no_label_leaves_the_name_unchanged():
+    """A sweep over one axis should not pay for a segment it does not use."""
+    plain = W.run_dir_name("Vanilla", "26.09.02", "aaaaaaaa11", machine="thor")
+    assert W.run_dir_name("Vanilla", "26.09.02", "aaaaaaaa11",
+                          machine="thor", label=None) == plain
+    assert W.run_dir_name("Vanilla", "26.09.02", "aaaaaaaa11",
+                          machine="thor", label="") == plain
+
+
 def test_run_dir_name_is_filesystem_safe():
     name = W.run_dir_name("INT8/w4 a16", "26.09.01", "abcdef0123", machine="box one")
     assert "/" not in name and " " not in name

@@ -132,6 +132,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--machine", default=None,
                    help="Where this ran, for the run directory and run name. Defaults to "
                         "the short hostname, which is also what env.host records.")
+    p.add_argument("--label", default=None,
+                   help="Extra segment in the run directory and run name, for a sweep that "
+                        "holds the variant fixed. Without it every directory in such a batch "
+                        "reads the same except for the run id -- unique but not identifiable.")
     p.add_argument("--sweep", default=None,
                    help="Tag every run of one sweep with this name so the batch can be "
                         "filtered as a unit. A sweep is N runs, not one run with N results "
@@ -378,7 +382,8 @@ def main() -> None:
         run_id = run.run_id if run is not None else f"local{int(time.time()):x}"
         machine = W.machine_name(args.machine)
         out_dir = Path(args.out_root) / W.run_dir_name(
-            args.variant, date, run_id, data=args.data_spec, machine=machine
+            args.variant, date, run_id, data=args.data_spec, machine=machine,
+            label=args.label,
         )
         rows, per_clip, gt_rows = [], [], []
         # Throttling moves latency without moving anything else, and after the
@@ -659,7 +664,8 @@ def main() -> None:
         return
     with mlp.evaluate(
         args.experiment,
-        run_name=f"{args.variant}@{W.machine_name(args.machine)}"
+        run_name=f"{args.variant}{'+' + args.label if args.label else ''}"
+                 f"@{W.machine_name(args.machine)}"
                  f"-{len(clips)}clip-n{args.num_traj_samples}",
         model=f"hf:{args.model}@main",
         hf_datasets=[f"{DATASET_REPO}@main"],
@@ -673,6 +679,8 @@ def main() -> None:
     ) as run:
         if args.sweep:
             run.tag("sweep", args.sweep)
+        if args.label:
+            run.tag("label", args.label)
         execute(run)
 
 

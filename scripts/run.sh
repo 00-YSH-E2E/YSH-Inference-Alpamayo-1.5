@@ -204,6 +204,7 @@ ARGS=(
 [[ -n "$MACHINE" ]]        && ARGS+=(--machine "$MACHINE")
 [[ -n "$NOTES" ]]          && ARGS+=(--notes "$NOTES")
 [[ -n "$SWEEP" ]]          && ARGS+=(--sweep "$SWEEP")
+[[ -n "${LABEL:-}" ]]      && ARGS+=(--label "$LABEL")
 [[ -n "$INFERENCE_STEP" ]] && ARGS+=(--inference-step "$INFERENCE_STEP")
 # 클립을 직접 지정했으면 목록과 개수 제한은 뜻이 없다
 if [[ ${#CLIP_IDS[@]} -gt 0 ]]; then

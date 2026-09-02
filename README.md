@@ -339,8 +339,26 @@ and the combinations all run:
 
 ```bash
 SWEEP_VARIANT=("Vanilla" "Pruned-24L" "INT8")
+SWEEP_MODEL=("nvidia/Alpamayo-1.5-10B" "hf:me/pruned-24l" "hf:me/int8")
 SWEEP_NUM_TRAJ_SAMPLES=(1 6)          # 3 x 2 = 6 runs
 ```
+
+**`--variant` is a label; `--model` decides what actually runs.** Listing three
+variants against one checkpoint runs the same weights three times under three
+names, and with a fixed seed the numbers come out identical — which reads as
+"the variant made no difference". The sweep refuses that combination rather
+than producing it.
+
+Directory names gain a segment naming only the axes that varied, so a batch is
+identifiable by eye rather than only by run id:
+
+```
+Alpamayo-1.5_Cam-4_Vanilla_k1-t0.6_thor_26.09.02_39581f9b
+Alpamayo-1.5_Cam-4_Vanilla_k6-t0.9_thor_26.09.02_a1b2c3d4
+```
+
+A sweep that only varies the variant gets no such segment — the variant is
+already in the name.
 
 What it does *not* do is fold those into one run. The recording rules forbid
 several evaluations in one run — the earlier result gets overwritten — so a

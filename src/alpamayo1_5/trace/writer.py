@@ -109,10 +109,23 @@ def run_dir_name(
     model: str = "Alpamayo-1.5",
     data: str = "Cam-4",
     machine: str | None = None,
+    label: str | None = None,
 ) -> str:
-    """Directory name: ``{model}_{data}_{variant}_{machine}_{date}_{run_id[:8]}``.
+    """Directory name: ``{model}_{data}_{variant}[_{label}]_{machine}_{date}_{run_id[:8]}``.
 
-    Example: ``Alpamayo-1.5_Cam-4_Vanilla_thor_26.09.01_39581f9b``.
+    Example: ``Alpamayo-1.5_Cam-4_Vanilla_thor_26.09.01_39581f9b``, and with a
+    label: ``Alpamayo-1.5_Cam-4_Vanilla_k6-t0.9_thor_26.09.01_39581f9b``.
+
+    ``label`` exists for sweeps. A sweep over sampling settings holds the
+    variant fixed and varies K or temperature, so without it every directory in
+    the batch reads identically except for the run id -- unique, but not
+    identifiable, and you cannot pick the one you want by eye. The label names
+    only what actually varied in that sweep, so a sweep over one axis does not
+    inherit clutter from axes that stayed still.
+
+    It is deliberately not folded into ``variant``: variant is the comparison
+    axis and has to stay the same string across runs for a grouping to hold.
+    Settings that change per run belong beside it, not inside it.
 
     The name answers, in order, the questions asked when looking at an old
     result: which model, on what data, run how, **where** -- then when. It
@@ -148,6 +161,7 @@ def run_dir_name(
         return "".join(c if c.isalnum() or c in "._-" else "-" for c in str(text)).strip("-")
 
     parts = [clean(model), clean(data), clean(variant) or "run",
+             clean(label) if label else "",
              clean(machine_name(machine)), clean(date), run_id[:8]]
     return "_".join(p for p in parts if p)
 

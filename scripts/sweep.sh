@@ -61,6 +61,42 @@ if [[ ${#SWEEP_MODEL[@]} -gt 1 && ${#SWEEP_MODEL[@]} -eq ${#SWEEP_VARIANT[@]} ]]
   PAIRED_MODEL=1
 fi
 
+# VARIANT 는 **라벨일 뿐이다.** 무엇이 도는지는 MODEL 이 정한다. 변형 이름만 여러 개
+# 적고 체크포인트를 안 바꾸면 같은 가중치가 N번 돌고 이름만 달리 붙는다 — 같은 시드에
+# 같은 설정이니 숫자까지 똑같이 나오고, 표에는 "가지치기가 아무 영향이 없다" 로 보인다.
+# 확신에 찬 오답이라 에러가 나는 것보다 나쁘다.
+if [[ ${#SWEEP_VARIANT[@]} -gt 1 && "$PAIRED_MODEL" == "0" && ${#SWEEP_MODEL[@]} -le 1 ]]; then
+  echo "${RED}막힘${OFF}  VARIANT 를 ${#SWEEP_VARIANT[@]}개 적었는데 MODEL 은 하나다." >&2
+  echo "        VARIANT 는 라벨이고, 실제로 무엇이 도는지는 MODEL 이 정한다." >&2
+  echo "        지금 이대로면 같은 가중치가 ${#SWEEP_VARIANT[@]}번 돌고 이름만 달라진다 —" >&2
+  echo "        숫자가 전부 같게 나와서 '변형이 영향이 없다' 로 읽힌다." >&2
+  echo >&2
+  echo "        변형마다 체크포인트를 짝지어 적는다:" >&2
+  echo "${DIM}          SWEEP_VARIANT=(${SWEEP_VARIANT[*]})" >&2
+  printf '          SWEEP_MODEL=(' >&2
+  for v in "${SWEEP_VARIANT[@]}"; do printf '"<%s 체크포인트>" ' "$v" >&2; done
+  echo ")${OFF}" >&2
+  echo >&2
+  echo "        정말 같은 모델을 여러 번 돌려 편차를 보려는 거라면" >&2
+  echo "        VARIANT 는 하나로 두고 SEED 를 축으로 삼는다." >&2
+  exit 1
+fi
+
+# 이름에 넣을 축을 고른다. **실제로 여러 값을 가진 축만** 넣는다 — 안 그러면 한 축짜리
+# sweep 의 폴더 이름까지 안 변하는 값으로 길어진다. variant 는 이미 이름에 있으니 뺀다.
+LABEL_K=0; LABEL_T=0; LABEL_S=0
+[[ ${#SWEEP_NUM_TRAJ_SAMPLES[@]} -gt 1 ]] && LABEL_K=1
+[[ ${#SWEEP_TEMPERATURE[@]}      -gt 1 ]] && LABEL_T=1
+[[ ${#SWEEP_INFERENCE_STEP[@]}   -gt 1 ]] && LABEL_S=1
+
+make_label() {  # $1=k $2=temp $3=step
+  local out=""
+  [[ "$LABEL_K" == "1" ]] && out="${out}${out:+-}k$1"
+  [[ "$LABEL_T" == "1" ]] && out="${out}${out:+-}t$2"
+  [[ "$LABEL_S" == "1" && -n "$3" ]] && out="${out}${out:+-}s$3"
+  printf '%s' "$out"
+}
+
 # ── 조합 만들기 ─────────────────────────────────────────────────────────────
 JOBS=()
 for vi in "${!SWEEP_VARIANT[@]}"; do
@@ -70,7 +106,7 @@ for vi in "${!SWEEP_VARIANT[@]}"; do
     for k in "${SWEEP_NUM_TRAJ_SAMPLES[@]}"; do
       for t in "${SWEEP_TEMPERATURE[@]}"; do
         for s in "${SWEEP_INFERENCE_STEP[@]}"; do
-          JOBS+=("${v}|${m}|${k}|${t}|${s}")
+          JOBS+=("${v}|${m}|${k}|${t}|${s}|$(make_label "$k" "$t" "$s")")
         done
       done
     done
@@ -80,11 +116,11 @@ done
 TOTAL=${#JOBS[@]}
 echo
 echo "${BLD}── sweep: ${SWEEP_NAME} ─ ${TOTAL}개 조합 ──────────────────────${OFF}"
-printf "  %-3s %-14s %-6s %-6s %-6s %s\n" "#" "VARIANT" "K" "temp" "step" "MODEL"
+printf "  %-3s %-14s %-6s %-6s %-6s %-12s %s\n" "#" "VARIANT" "K" "temp" "step" "이름꼬리" "MODEL"
 i=0
 for job in "${JOBS[@]}"; do
-  IFS='|' read -r v m k t s <<<"$job"; i=$((i+1))
-  printf "  %-3s %-14s %-6s %-6s %-6s %s\n" "$i" "$v" "$k" "$t" "${s:-기본}" "$m"
+  IFS='|' read -r v m k t s lb <<<"$job"; i=$((i+1))
+  printf "  %-3s %-14s %-6s %-6s %-6s %-12s %s\n" "$i" "$v" "$k" "$t" "${s:-기본}" "${lb:--}" "$m"
 done
 echo
 echo "  ${DIM}각각이 별개의 MLflow run 이 된다. sweep 태그로 묶인다.${OFF}"
@@ -101,14 +137,15 @@ declare -a RESULTS=()
 STARTED=$(date +%s)
 i=0
 for job in "${JOBS[@]}"; do
-  IFS='|' read -r v m k t s <<<"$job"; i=$((i+1))
+  IFS='|' read -r v m k t s lb <<<"$job"; i=$((i+1))
   echo
-  echo "${BLD}[$i/$TOTAL] ${v}  K=${k}  temp=${t}${s:+  step=$s}${OFF}"
+  echo "${BLD}[$i/$TOTAL] ${v}  K=${k}  temp=${t}${s:+  step=$s}${lb:+  → $lb}${OFF}"
   echo "────────────────────────────────────────────────────────────"
   t0=$(date +%s)
   # run.sh 를 그대로 다시 부른다 — 점검이 조합마다 돈다. 설정은 환경변수로 덮는다.
   if OVERRIDE_VARIANT="$v" OVERRIDE_MODEL="$m" OVERRIDE_NUM_TRAJ_SAMPLES="$k" \
-     OVERRIDE_TEMPERATURE="$t" OVERRIDE_INFERENCE_STEP="$s" SWEEP="$SWEEP_NAME" \
+     OVERRIDE_TEMPERATURE="$t" OVERRIDE_INFERENCE_STEP="$s" \
+     SWEEP="$SWEEP_NAME" LABEL="$lb" \
      bash "$HERE/run.sh"; then
     RESULTS+=("${GRN}완료${OFF}|$v|$k|$t|$(( $(date +%s) - t0 ))초")
   else
