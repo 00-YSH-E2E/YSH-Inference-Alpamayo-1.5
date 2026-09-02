@@ -322,6 +322,25 @@ artifacts with no metrics cannot be ranked.
 
 ## Start here
 
+The short way: **edit the settings block at the top of `scripts/run.sh` and run
+it.** Every flag has a named line there, and it checks what it can before
+spending any GPU time — the variant name, whether the working tree is committed,
+whether the data cache exists, whether MLflow is reachable. It reports every
+problem at once rather than one per attempt, and it takes three seconds.
+
+```bash
+$EDITOR scripts/run.sh     # VARIANT, MACHINE, LIMIT, NOTES ...
+./scripts/run.sh
+```
+
+That MLflow check matters more than it looks. The tracking server is bound to
+the tailnet address only, and the mlflow client retries seven times at a
+120-second timeout — so from outside the tailnet a run hangs for minutes before
+dying, having never started inference. The script gives up after three seconds
+and tells you the three ways out.
+
+The long way, if you would rather pass flags:
+
 ```bash
 # 1. does the model load and run at all on this board?
 python scripts/smoke_inference.py
@@ -414,6 +433,7 @@ Launched from a different repo, a run records that repo's commit instead.
 | | |
 |---|---|
 | `scripts/run_inference_tracked.py` | The CLI. Loads clips, runs the model, computes metrics, writes the run directory, records it |
+| `scripts/run.sh` | The settings block you edit instead of remembering flags. Pre-flight checks before any GPU time is spent |
 | `scripts/smoke_inference.py` | Does the model load and produce a trajectory on this board? No recording |
 | `scripts/ml_platform_track.py` | The recording helper. A byte-identical copy of `examples/ml_platform_track.py` in the ML_Platform repo — that one is canonical |
 | `src/alpamayo1_5/trace/token_trace.py` | Per-token logprob and entropy, CUDA-event timing split |
