@@ -70,14 +70,14 @@ INCLUDE_GT=0                             # 정답 궤적을 로컬에 남기기 
 # =============================================================================
 #  아래는 안 고쳐도 된다
 # =============================================================================
-# sweep.sh 가 이 파일을 source 해서 위 설정을 기본값으로 가져간다. 설정을 두 곳에
+# run_sweep.sh 가 이 파일을 source 해서 위 설정을 기본값으로 가져간다. 설정을 두 곳에
 # 적어 두면 반드시 갈라지므로, 설정이 사는 곳은 여기 하나다.
 (return 0 2>/dev/null) && return 0
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-# sweep.sh 가 조합마다 덮어쓰는 자리. 위 설정 블록은 손대지 않는다 —
+# run_sweep.sh 가 조합마다 덮어쓰는 자리. 위 설정 블록은 손대지 않는다 —
 # 거기에 ${VAR:-기본값} 을 쓰면 읽기 어려워지고, 무엇이 기본값인지 흐려진다.
 VARIANT="${OVERRIDE_VARIANT:-$VARIANT}"
 MODEL="${OVERRIDE_MODEL:-$MODEL}"
@@ -110,7 +110,14 @@ if [[ "$VARIANT" =~ ^(exp|run|test|tmp)[-_]?[0-9]+$ ]] || [[ "$VARIANT" =~ ^(v|v
        Vanilla · Pruned-24L · INT8 처럼 바뀐 내용을 적는다"
 fi
 MACHINE_SHOWN="${MACHINE:-$(hostname -s)}"
-ok "이름:  Alpamayo-1.5_${DATA_SPEC}_${VARIANT}_${MACHINE_SHOWN}_$(date +%y.%m.%d)_<run_id>"
+# 러너가 만드는 것과 같은 규칙으로 조립한다. 여기 미리보기와 실제 폴더 이름이
+# 다르면 미리보기가 없느니만 못하다.
+if [[ ${#CLIP_IDS[@]} -gt 0 ]]; then CLIPS_SHOWN="${#CLIP_IDS[@]}"
+elif [[ "$LIMIT" != "0" ]];    then CLIPS_SHOWN="$LIMIT"
+else                                CLIPS_SHOWN="N"; fi
+NAME_TAIL="${CLIPS_SHOWN}clip_k${NUM_TRAJ_SAMPLES}-temp${TEMPERATURE}"
+[[ -n "${LABEL:-}" ]] && NAME_TAIL="${NAME_TAIL}-${LABEL}"
+ok "이름:  Alpamayo-1.5_${DATA_SPEC}_${VARIANT}_${NAME_TAIL}_${MACHINE_SHOWN}_$(date +%y.%m.%d)_<run_id>"
 
 # ── 소급 불가한 것들 ────────────────────────────────────────────────────────
 [[ -n "$NOTES" ]] || warn "NOTES 가 비었다. 6개월 뒤에 이 run 이 왜 있는지 알 수 없다"
@@ -124,7 +131,17 @@ elif [[ -n "$(git status --porcelain)" ]]; then
   warn "워킹트리가 dirty 다. 이 run 은 정확히 재현되지 않는다 — 먼저 커밋하는 게 낫다"
   git status --porcelain | head -5 | sed 's/^/      /'
 else
-  ok "git:   $(git rev-parse --short HEAD) (clean)"
+  ok "git:   $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD), clean)"
+fi
+
+# 커밋이 어느 원격 브랜치에도 없으면 git_commit 은 이 디스크에만 있는 좌표다.
+# 기록 자체는 정상으로 남는다 — 그래서 조용하다. 나중에 rebase 나 amend 를 하면
+# 그 좌표는 아무것도 가리키지 않게 된다.
+if git rev-parse --git-dir >/dev/null 2>&1 \
+   && [[ -z "$(git branch -r --contains HEAD 2>/dev/null)" ]]; then
+  warn "이 커밋은 아직 push 안 됐다. 파라미터와 지표는 정상 기록되지만,
+       git_commit 이 이 기계에만 있는 커밋을 가리킨다 — 다른 사람은 못 찾고,
+       나중에 rebase/amend 하면 그 좌표는 죽는다"
 fi
 
 # ── 데이터 ─────────────────────────────────────────────────────────────────

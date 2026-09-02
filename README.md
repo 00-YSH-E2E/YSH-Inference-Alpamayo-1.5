@@ -333,7 +333,7 @@ $EDITOR scripts/run.sh     # VARIANT, MACHINE, LIMIT, NOTES ...
 ./scripts/run.sh
 ```
 
-To run several configurations, edit the axes at the top of `scripts/sweep.sh`
+To run several configurations, edit the axes at the top of `scripts/run_sweep.sh`
 and run that instead. It is hydra's `--multirun` idea — list values on an axis
 and the combinations all run:
 
@@ -469,7 +469,7 @@ Launched from a different repo, a run records that repo's commit instead.
 |---|---|
 | `scripts/run_inference_tracked.py` | The CLI. Loads clips, runs the model, computes metrics, writes the run directory, records it |
 | `scripts/run.sh` | The settings block you edit instead of remembering flags. Pre-flight checks before any GPU time is spent |
-| `scripts/sweep.sh` | Several configurations in one command. N runs sharing a `sweep` tag, not one run with N results |
+| `scripts/run_sweep.sh` | Several configurations in one command. N runs sharing a `sweep` tag, not one run with N results |
 | `scripts/smoke_inference.py` | Does the model load and produce a trajectory on this board? No recording |
 | `scripts/ml_platform_track.py` | The recording helper. A byte-identical copy of `examples/ml_platform_track.py` in the ML_Platform repo — that one is canonical |
 | `src/alpamayo1_5/trace/token_trace.py` | Per-token logprob and entropy, CUDA-event timing split |
