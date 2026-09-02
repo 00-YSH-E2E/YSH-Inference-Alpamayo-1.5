@@ -345,17 +345,35 @@ outputs local, `--no-track` to skip MLflow entirely.
 ## What a run leaves behind
 
 ```
-out/Alpamayo-1.5_Cam-4_Vanilla_26.09.01_39581f9b/
-├── predictions.parquet   one row per (clip, t0, trajectory sample)
+out/Alpamayo-1.5_Cam-4_Vanilla_thor_26.09.01_39581f9b/
+├── predictions.parquet   one row per (clip, t0, trajectory sample) — raw output
+├── per_clip.parquet      one row per clip — situation label and its metrics
 ├── run.json              params, normalization constants, parquet schema
 ├── gt.parquet            logged future — local only, never uploaded
 └── samples/<clip_id>.png camera grid + predicted vs logged trajectory
 ```
 
-The last eight characters of the directory name are the MLflow run id. That is
-what makes the link bidirectional: a directory names its run, and a run's
-`output_uri` names its directory. Re-running the same configuration on the same
-day is routine, so the date alone would collide.
+The name is the coordinate, and it reads in the order the questions get asked:
+
+```
+{model}_{data}_{variant}_{machine}_{YY.MM.DD}_{run_id[:8]}
+```
+
+**Machine is in the name because latency is meaningless without it.** The same
+checkpoint on a Thor and on a Pro 6000 otherwise produces two directories
+identical in every visible field, holding numbers that are not comparable. It
+defaults to the short hostname — the same word `env.host` records — and
+`--machine` overrides it for a rented box whose hostname means nothing.
+
+The last eight characters are the MLflow run id, which makes the link
+bidirectional: a directory names its run, and a run's `output_uri` names its
+directory. Re-running the same configuration on the same day is routine, so the
+date alone would collide.
+
+`per_clip.parquet` is what makes any breakdown possible. `predictions.parquet`
+holds raw model output by design, so minADE and the situation label are in
+neither it nor MLflow — without this file, asking "how did the braking clips
+do" means re-fetching the gated dataset and recomputing.
 
 Everything except `gt.parquet` is pushed to the evals repo
 (`--evals-repo`, default `YSHRobotics/Alpamayo-Evals`). **That repo has to stay
@@ -370,7 +388,8 @@ click and cannot be undone for anything already cloned.
 | Code | `git_commit`, `git_branch`, `git_dirty` |
 | Data & model | `hf_datasets`, `hf_models`, `model_source` — revisions pinned to 40-character shas, not branch names |
 | Machine | `env.host`, `env.gpu`, `env.compute_capability`, `env.torch`, `env.cuda`, `power_mode` |
-| Result | `score` (mean minADE, metres, lower is better), percentiles, per-scene breakdown |
+| Result | `score` (mean minADE, metres, lower is better), percentiles, per-situation breakdown |
+| Situation | `scenario.<bucket>.<metric>` on two axes — `straight`/`curve`/`lane_change`/`other` and `cruise`/`accel`/`decel` — classified from the **logged future**, so every variant is compared over the same clips |
 | Latency | `t_vision_ms`, `t_prefill_ms`, `t_decode_ms`, `t_postgen_ms`, `t_expert_ms`, `t_other_ms` — the six sum to `t_total_ms` |
 | Thermal | `temp.tj_max_c`, `temp.peak_c`, `power.<rail>_mean_w`, `temp.throttle_risk` |
 | Where the outputs went | `output_uri` — must be durable; a local path fails the check |

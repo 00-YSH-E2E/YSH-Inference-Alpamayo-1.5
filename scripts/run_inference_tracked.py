@@ -129,6 +129,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--attn", default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
     p.add_argument("--variant", default="Vanilla", help="Vanilla, Pruned-24L, INT8 ...")
     p.add_argument("--data-spec", default="Cam-4")
+    p.add_argument("--machine", default=None,
+                   help="Where this ran, for the run directory and run name. Defaults to "
+                        "the short hostname, which is also what env.host records.")
     p.add_argument("--experiment", default="alpamayo-1.5")
     p.add_argument("--notes", help="One or two human sentences: why this run exists.")
     p.add_argument("--data-cache", default=DATA_CACHE)
@@ -342,6 +345,9 @@ def main() -> None:
         "torch_version": torch.__version__,
         "data_cache": args.data_cache,
         "power_mode": TH.power_mode(),
+        # Latency is meaningless without it, and a run made off the tailnet
+        # has no env.host tag until it is imported.
+        "machine": W.machine_name(args.machine),
     }
 
     def execute(run: mlp.Run | None) -> None:
@@ -354,8 +360,9 @@ def main() -> None:
             torch.cuda.reset_peak_memory_stats()
 
         run_id = run.run_id if run is not None else f"local{int(time.time()):x}"
+        machine = W.machine_name(args.machine)
         out_dir = Path(args.out_root) / W.run_dir_name(
-            args.variant, date, run_id, data=args.data_spec
+            args.variant, date, run_id, data=args.data_spec, machine=machine
         )
         rows, per_clip, gt_rows = [], [], []
         # Throttling moves latency without moving anything else, and after the
@@ -414,6 +421,7 @@ def main() -> None:
             "run_id": run_id,
             "variant": args.variant,
             "date": date,
+            "machine": machine,
             "clips": clips,
             "params": params,
             # Normalization differs per checkpoint; without it, kinematics
@@ -635,7 +643,8 @@ def main() -> None:
         return
     with mlp.evaluate(
         args.experiment,
-        run_name=f"{args.variant}-{len(clips)}clip-n{args.num_traj_samples}",
+        run_name=f"{args.variant}@{W.machine_name(args.machine)}"
+                 f"-{len(clips)}clip-n{args.num_traj_samples}",
         model=f"hf:{args.model}@main",
         hf_datasets=[f"{DATASET_REPO}@main"],
         params=params,

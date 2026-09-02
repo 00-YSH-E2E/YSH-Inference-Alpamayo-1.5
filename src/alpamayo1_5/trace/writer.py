@@ -17,16 +17,17 @@
 
 Layout, one directory per run (see :func:`run_dir_name`)::
 
-    out/Alpamayo-1.5_Cam-4_Vanilla_26.09.01_39581f9b/
-    ├── predictions.parquet   one row per (clip_id, t0_us, sample_k)
+    out/Alpamayo-1.5_Cam-4_Vanilla_thor_26.09.01_39581f9b/
+    ├── predictions.parquet   one row per (clip_id, t0_us, sample_k): raw output
+    ├── per_clip.parquet      one row per clip: situation label and its metrics
     ├── run.json              run-level metadata and the constants needed to
     │                         recompute anything offline
     ├── gt.parquet            logged future -- local only, never uploaded
     └── samples/<clip_id>.png
 
-The trailing eight characters are the MLflow run id, which is what makes the
-link bidirectional: a directory names its run, and a run's ``output_uri``
-names its directory.
+The name carries the machine, and the trailing eight characters are the MLflow
+run id -- so a directory names both where it ran and which run it was, and a
+run's ``output_uri`` names its directory.
 
 Two decisions drive the whole schema.
 
@@ -60,6 +61,7 @@ anything already cloned.
 from __future__ import annotations
 
 import json
+import socket
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -86,19 +88,43 @@ _ARRAY_SHAPES = {
 }
 
 
+def machine_name(explicit: str | None = None) -> str:
+    """Short label for the machine a run happened on.
+
+    Defaults to the hostname's first component, which is what ``env.host``
+    records and what ``config/experiments.yaml`` matches on -- so the directory
+    name, the MLflow tag and the hub's machine rule all say the same word.
+    Pass ``explicit`` when the hostname is not the name you think of the machine
+    by (a rented box, a container).
+    """
+    if explicit:
+        return explicit.strip()
+    return socket.gethostname().split(".")[0] or "unknown"
+
+
 def run_dir_name(
     variant: str,
     date: str,
     run_id: str,
     model: str = "Alpamayo-1.5",
     data: str = "Cam-4",
+    machine: str | None = None,
 ) -> str:
-    """Directory name for one run: ``{model}_{data}_{variant}_{date}_{run_id}``.
+    """Directory name: ``{model}_{data}_{variant}_{machine}_{date}_{run_id[:8]}``.
 
-    The name answers, in order, the three questions asked when looking at an old
-    result: which model, on what data, run how -- then when. It matches the
-    layout of the data directories (``Alpamayo-1.5_Cam-4_Vanilla``) with the
-    date appended.
+    Example: ``Alpamayo-1.5_Cam-4_Vanilla_thor_26.09.01_39581f9b``.
+
+    The name answers, in order, the questions asked when looking at an old
+    result: which model, on what data, run how, **where** -- then when. It
+    matches the layout of the data directories (``Alpamayo-1.5_Cam-4_Vanilla``)
+    with the machine and date appended.
+
+    Machine is in the name rather than only in the tags because latency is
+    meaningless without it. The same checkpoint on a Thor and on a Pro 6000
+    produces two directories that are otherwise identical in every visible
+    field, and the numbers inside are not comparable. It also matters for runs
+    made off the tailnet, where the MLflow record does not exist yet and the
+    directory name is the only thing saying where the work happened.
 
     Args:
         variant: How this run differs -- ``Vanilla``, ``Pruned-24L``, ``INT8``.
@@ -108,6 +134,8 @@ def run_dir_name(
         run_id: MLflow run id. Only the first 8 characters are used.
         model: Model identity.
         data: What the model was fed -- camera count, sensor set.
+        machine: Where it ran. Defaults to the short hostname, matching
+            ``env.host``.
 
     The run id is part of the name for two reasons. Two runs of the same variant
     on the same day would otherwise collide, which is not hypothetical -- the
@@ -119,7 +147,8 @@ def run_dir_name(
     def clean(text: str) -> str:
         return "".join(c if c.isalnum() or c in "._-" else "-" for c in str(text)).strip("-")
 
-    parts = [clean(model), clean(data), clean(variant) or "run", clean(date), run_id[:8]]
+    parts = [clean(model), clean(data), clean(variant) or "run",
+             clean(machine_name(machine)), clean(date), run_id[:8]]
     return "_".join(p for p in parts if p)
 
 

@@ -46,12 +46,34 @@ def test_run_dir_name_ends_with_the_run_id():
     the directory. Two runs of the same variant on the same day are routine
     while something is being debugged, so the date alone collides.
     """
-    name = W.run_dir_name("Pruned-24L", "26.09.01", "deadbeefcafe1234")
-    assert name == "Alpamayo-1.5_Cam-4_Pruned-24L_26.09.01_deadbeef"
+    name = W.run_dir_name("Pruned-24L", "26.09.01", "deadbeefcafe1234", machine="thor")
+    assert name == "Alpamayo-1.5_Cam-4_Pruned-24L_thor_26.09.01_deadbeef"
+
+
+def test_run_dir_name_carries_the_machine():
+    """Two runs of the same checkpoint on different boards are not comparable.
+
+    Without the machine in the name they produce directories identical in every
+    visible field, and the latency inside them means different things. It also
+    matters off the tailnet, where there is no MLflow record yet and the
+    directory name is the only thing saying where the work happened.
+    """
+    thor = W.run_dir_name("Vanilla", "26.09.01", "abcdef0123", machine="thor")
+    pro = W.run_dir_name("Vanilla", "26.09.01", "abcdef0123", machine="pro6000")
+    assert thor != pro
+    assert "_thor_" in thor and "_pro6000_" in pro
+
+
+def test_machine_defaults_to_the_short_hostname():
+    """The same word env.host records, so the directory and the tag agree."""
+    import socket
+
+    assert W.machine_name() == socket.gethostname().split(".")[0]
+    assert W.machine_name("rented-a100") == "rented-a100"
 
 
 def test_run_dir_name_is_filesystem_safe():
-    name = W.run_dir_name("INT8/w4 a16", "26.09.01", "abcdef0123")
+    name = W.run_dir_name("INT8/w4 a16", "26.09.01", "abcdef0123", machine="box one")
     assert "/" not in name and " " not in name
 
 
