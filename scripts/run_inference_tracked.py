@@ -100,6 +100,12 @@ _CLIP_METRICS = (
     "diversity_mean_m", "diversity_final_m", "diversity_max_m", "sample_gain",
 )
 
+# Numeric per-clip values that locate a row rather than measure it. Averaging one
+# says nothing -- mean(t0_us) is t0_us -- so they are excluded from the warning
+# below instead of being added to _CLIP_METRICS, which would log them to MLflow
+# as though they were results and put a constant on every comparison chart.
+_CLIP_COORDS = frozenset({"t0_us"})
+
 # What each situation bucket reports, beyond its clip count. Short on purpose:
 # every entry here is multiplied by the number of buckets, and the per-clip
 # table in the run directory already carries everything for offline pivots.
@@ -535,6 +541,7 @@ def main() -> None:
         unrecorded = sorted(
             {k for c in per_clip for k, v in c.items() if isinstance(v, (int, float))}
             - set(_CLIP_METRICS)
+            - _CLIP_COORDS
         )
         if unrecorded:
             print(f"[trace] not recorded (add to _CLIP_METRICS): {', '.join(unrecorded)}")
