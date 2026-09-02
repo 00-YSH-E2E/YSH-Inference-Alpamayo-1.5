@@ -613,7 +613,7 @@ def test_the_sign_test_excludes_ties_rather_than_splitting_them():
 
     result = C.sign_test(baseline, arm)
 
-    assert (result["n_better"], result["n_worse"], result["n_tie"]) == (3, 0, 3)
+    assert (result["n_lower"], result["n_higher"], result["n_tie"]) == (3, 0, 3)
     assert result["p_value"] == pytest.approx(0.25)   # 2 * (1/2)^3, not (1/2)^6
 
 
@@ -684,3 +684,170 @@ def test_duplicate_clips_within_an_arm_are_refused(tmp_path):
 
     with pytest.raises(ValueError, match="duplicate"):
         C.paired_matrix(per_clip, metrics=["min_ade"], arms=["s10", "s4"])
+
+
+# -- tables ----------------------------------------------------------------
+
+def synthetic_matrix(n=200, arms=3, seed=0):
+    """A collapsing sampler, as ``paired_matrix`` would return it."""
+    rng = np.random.default_rng(seed)
+    centres = rng.normal(0.0, 2.0, size=(n, 2))
+    cloud = rng.normal(0.0, 1.5, size=(n, 6, 2))
+    blocks = []
+    for shrink in np.linspace(1.0, 0.2, arms):
+        samples = centres[:, None, :] + cloud * shrink
+        dist = np.linalg.norm(samples, axis=2)
+        blocks.append(np.stack([dist.min(axis=1), dist.mean(axis=1)], axis=1))
+    X = np.stack(blocks, axis=1)
+    index = pd.DataFrame({
+        "clip_id": [f"c{i:04d}" for i in range(n)],
+        "t0_us": 5_100_000,
+        "scene": rng.choice(["straight", "curve"], n),
+        "speed_profile": rng.choice(["cruise", "decel"], n),
+    })
+    return X, index
+
+
+def test_the_baseline_is_absent_from_the_ordering_table():
+    """Its divergence is exactly zero in every replicate, by construction.
+
+    Left in, ``P(a > b)`` becomes ``P(0 > 0)`` and prints as 0.000 -- which
+    reads as near-certainty that one stratum diverges less than another, next
+    to rows where 0.000 means exactly that. It is the most misleading number
+    the table can hold, and it is not a measurement.
+    """
+    X, index = synthetic_matrix()
+
+    tables = C.build_tables(X, index, ["s10", "s4", "s1"], ["min_ade", "mean_ade"],
+                            n_boot=200, min_stratum_clips=10)
+
+    assert len(tables["order"]), "there should be orderings to report"
+    assert "s10" not in set(tables["order"]["arm"])
+    assert set(tables["order"]["arm"]) == {"s4", "s1"}
+
+
+def test_the_overall_row_is_the_stratum_called_all():
+    """One frame, not two. An overall table and a per-stratum table would be
+    two schemas that must agree forever, and the day they disagree nobody
+    knows which is authoritative."""
+    X, index = synthetic_matrix()
+
+    tables = C.build_tables(X, index, ["s10", "s4", "s1"], ["min_ade", "mean_ade"],
+                            n_boot=200, min_stratum_clips=10)
+    overall = tables["metrics"][tables["metrics"]["axis"] == "all"]
+
+    assert set(overall["n"]) == {len(index)}
+    assert len(overall) == 3 * 2
+    assert overall[overall["arm"] == "s10"]["delta_pct"].abs().max() == 0.0
+
+
+def test_the_corrected_interval_is_narrower_than_the_naive_one():
+    """Both are reported so the difference stays visible.
+
+    Subtracting two independently-derived intervals discards the correlation
+    between the metrics. The result is wider, correct-looking, and wide enough
+    to turn a real effect into "not significant" with nothing to show for it.
+    """
+    X, index = synthetic_matrix(n=400)
+
+    tables = C.build_tables(X, index, ["s10", "s4", "s1"], ["min_ade", "mean_ade"],
+                            n_boot=2000, min_stratum_clips=10)
+    div = tables["divergence"]
+    real = div[div["arm"] != "s10"]
+
+    widths = real["hi"] - real["lo"]
+    naive = real["naive_hi"] - real["naive_lo"]
+    assert (widths < naive).all()
+
+
+def test_dropped_strata_reach_the_caller_not_just_the_floor():
+    X, index = synthetic_matrix(n=100)
+    index.loc[index.index[:3], "scene"] = "u_turn"
+    index.loc[index.index[3:], "scene"] = "straight"
+
+    tables = C.build_tables(X, index, ["s10", "s4", "s1"], ["min_ade", "mean_ade"],
+                            n_boot=100, min_stratum_clips=20)
+
+    assert any(d["stratum"] == "u_turn" for d in tables["dropped"])
+    assert "u_turn" not in set(tables["metrics"]["stratum"])
+
+
+# -- arithmetic the figures will depend on ---------------------------------
+
+def test_shared_limits_do_not_hide_a_collapse():
+    """Per-panel autoscale is how a five-fold shrink comes out looking
+    identical: the spread falls, the axis falls with it, and the only thing
+    that changed is in the tick labels."""
+    wide = [0.0, 10.0]
+    narrow = [4.9, 5.1]
+
+    limits = C.shared_limits(wide + narrow)
+
+    assert limits[0] <= 0.0 and limits[1] >= 10.0
+    assert (limits[1] - limits[0]) > 9.0
+
+
+def test_a_degenerate_spread_is_reported_rather_than_skipped():
+    """A KDE guard that skips a zero-variance arm removes from the figure the
+    exact arm the figure is about."""
+    assert C.spread_is_degenerate([1.0, 1.0, 1.0])
+    assert C.spread_is_degenerate([2.0])
+    assert not C.spread_is_degenerate([1.0, 2.0, 3.0])
+
+
+def test_an_arm_keeps_its_colour_and_marker_across_figures():
+    arms = ["s10", "s4", "s2", "s1"]
+
+    first = C.arm_colors(arms)
+    again = C.arm_colors(arms)
+
+    assert first == again
+    assert len(set(first.values())) == len(arms)
+    assert len(set(C.arm_markers(arms).values())) == len(arms)
+
+
+def test_a_mode_collapse_is_not_reported_as_an_improvement():
+    """Lower is better for displacement and worse for diversity.
+
+    A sign test that assumed one direction for everything reported a sampler
+    losing spread on every single clip as beating the baseline on every single
+    clip -- in the experiment whose headline is that the sampler collapses.
+    The test is direction-free; ``METRIC_DIRECTION`` supplies the meaning.
+    """
+    n = 50
+    X = np.zeros((n, 2, 2))
+    X[:, 0, 0] = 1.0          # baseline min_ade
+    X[:, 1, 0] = 1.5          # arm is worse on error
+    X[:, 0, 1] = 4.0          # baseline diversity
+    X[:, 1, 1] = 1.0          # arm has collapsed
+
+    index = pd.DataFrame({"clip_id": [f"c{i}" for i in range(n)], "t0_us": 0})
+    table = C.build_tables(X, index, ["s10", "s1"],
+                           ["min_ade", "diversity_final_m"],
+                           n_boot=50, strata=())["metrics"]
+    arm = table[table["arm"] == "s1"].set_index("metric")
+
+    assert arm.at["min_ade", "n_better"] == 0, "higher error is not an improvement"
+    assert arm.at["diversity_final_m", "n_lower"] == n
+    assert arm.at["diversity_final_m", "n_better"] == 0, \
+        "a collapse is not an improvement"
+    assert arm.at["diversity_final_m", "n_worse"] == n
+
+
+def test_a_metric_with_no_good_direction_is_not_ranked():
+    """``sample_gain`` is how much the K samples bought over their own mean.
+
+    Whether more of it is better is the question the sweep is asking, so
+    answering it in the table would be assuming the conclusion.
+    """
+    n = 20
+    X = np.tile(np.array([[1.0], [2.0]]), (n, 1, 1))
+    index = pd.DataFrame({"clip_id": [f"c{i}" for i in range(n)], "t0_us": 0})
+
+    table = C.build_tables(X, index, ["s10", "s1"], ["sample_gain"],
+                           n_boot=50, strata=())["metrics"]
+    arm = table[table["arm"] == "s1"]
+
+    assert arm["direction"].iloc[0] == "neutral"
+    assert arm["n_better"].isna().all()
+    assert arm["n_higher"].iloc[0] == n

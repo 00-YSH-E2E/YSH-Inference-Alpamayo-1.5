@@ -57,7 +57,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -93,6 +93,19 @@ DEFAULT_METRICS = (
     "min_ade", "mean_ade", "min_fde", "mean_fde",
     "diversity_final_m", "diversity_mean_m", "sample_gain",
 )
+
+# Which way is good. Displacement error is a distance to the logged future, so
+# lower is better; diversity is the spread among the samples, so lower is a
+# mode collapse. `sample_gain` is neither -- it is how much the K samples
+# bought over their own mean, and whether more is better depends on whether
+# the extra spread lands near the future or away from it, which is the whole
+# question the sweep is asking. Reporting it as "better" either way would be
+# assuming the answer.
+METRIC_DIRECTION = {
+    "min_ade": "lower", "mean_ade": "lower", "min_fde": "lower", "mean_fde": "lower",
+    "diversity_mean_m": "higher", "diversity_final_m": "higher",
+    "diversity_max_m": "higher", "sample_gain": "neutral",
+}
 
 # Columns that only exist when K >= 2. `metrics.diversity` returns {} for a
 # single sample, so these are absent -- not zero -- in a K=1 run.
@@ -847,11 +860,17 @@ def _log10_of_int(value: int) -> float:
 def sign_test(baseline: np.ndarray, arm: np.ndarray, tol: float = 0.0) -> dict[str, Any]:
     """Exact two-sided sign test on a paired vector. No scipy on the runner.
 
-    Counts clips where ``arm`` beats ``baseline`` (smaller is better for every
-    metric here) against clips where it loses, and asks how surprising that
-    split is under a fair coin. It makes no assumption about the shape of the
-    per-clip differences, which matters because they are heavily skewed: a few
-    clips move by metres while most move by centimetres.
+    Counts clips where ``arm`` came out **lower** than ``baseline`` against
+    clips where it came out higher, and asks how surprising that split is
+    under a fair coin. It makes no assumption about the shape of the per-clip
+    differences, which matters because they are heavily skewed: a few clips
+    move by metres while most move by centimetres.
+
+    It deliberately does not know which direction is *better*. Lower is better
+    for displacement error and worse for sample diversity, and a function that
+    guessed would report a mode collapse -- diversity falling on every single
+    clip -- as an improvement on every single clip. :data:`METRIC_DIRECTION`
+    holds that knowledge, and :func:`build_tables` applies it.
 
     Ties are **excluded**, not split. They are real and not rare -- when the
     sampler collapses in bfloat16, several samples become bit-identical and the
@@ -864,15 +883,205 @@ def sign_test(baseline: np.ndarray, arm: np.ndarray, tol: float = 0.0) -> dict[s
     """
     d = np.asarray(arm, dtype=float) - np.asarray(baseline, dtype=float)
     d = d[~np.isnan(d)]
-    n_better = int((d < -tol).sum())
-    n_worse = int((d > tol).sum())
-    n_tie = int(len(d) - n_better - n_worse)
-    m = n_better + n_worse
+    n_lower = int((d < -tol).sum())
+    n_higher = int((d > tol).sum())
+    n_tie = int(len(d) - n_lower - n_higher)
+    m = n_lower + n_higher
     if m == 0:
-        return {"n_better": 0, "n_worse": 0, "n_tie": n_tie,
+        return {"n_lower": 0, "n_higher": 0, "n_tie": n_tie,
                 "p_value": 1.0, "p_log10": 0.0}
-    tail = sum(math.comb(m, k) for k in range(0, min(n_better, n_worse) + 1))
+    tail = sum(math.comb(m, k) for k in range(0, min(n_lower, n_higher) + 1))
     p_log10 = min(0.0, math.log10(2.0) + _log10_of_int(tail) - m * math.log10(2.0))
-    return {"n_better": n_better, "n_worse": n_worse, "n_tie": n_tie,
+    return {"n_lower": n_lower, "n_higher": n_higher, "n_tie": n_tie,
             "p_value": min(1.0, 10.0 ** p_log10) if p_log10 > -300 else 0.0,
             "p_log10": p_log10}
+
+
+# --------------------------------------------------------------------------
+#  Tables
+# --------------------------------------------------------------------------
+
+def build_tables(
+    X: np.ndarray,
+    index: pd.DataFrame,
+    arms: Sequence[str],
+    metrics: Sequence[str],
+    n_boot: int = 10_000,
+    seed: int = 0,
+    min_stratum_clips: int = 20,
+    strata: Sequence[str] = ("scene", "speed_profile"),
+    level: float = 0.95,
+) -> dict[str, Any]:
+    """The whole comparison, as three tidy frames plus what was left out.
+
+    ``metrics`` is one frame rather than the two the obvious split suggests --
+    an overall table and a per-stratum table -- because the overall result is
+    just the stratum ``all``. Two frames would need two schemas that must agree
+    forever, and they would eventually disagree about a rounding or a column
+    name and nobody would notice which was authoritative.
+
+    Everything derived is computed inside the bootstrap replicate. The point
+    estimates come from the data itself rather than from the replicate mean,
+    so an interval can sit slightly off-centre around its estimate; that is
+    the bootstrap being honest about skew, not a bug.
+
+    Returns a dict with ``metrics``, ``divergence``, ``order``, ``dropped``
+    and ``arms``.
+    """
+    arms = list(arms)
+    metrics = list(metrics)
+    labels, masks, dropped = stratum_masks(index, strata, min_stratum_clips)
+    block = bootstrap_group_means(X, masks, n_boot=n_boot, seed=seed)
+    delta_block = ratio_deltas(block)
+
+    point = np.stack([X[m].mean(axis=0) for m in masks])          # [G, A, M]
+    delta_point = ratio_deltas(point)
+    lo, hi = percentile_interval(delta_block, level)
+
+    steps = [int(a[1:]) for a in arms]
+    rows: list[dict[str, Any]] = []
+    for g, label in enumerate(labels):
+        sel = masks[g]
+        for a, arm in enumerate(arms):
+            for m, metric in enumerate(metrics):
+                sign = sign_test(X[sel, 0, m], X[sel, a, m])
+                direction = METRIC_DIRECTION.get(metric, "lower")
+                better = {"lower": sign["n_lower"], "higher": sign["n_higher"]}
+                rows.append({
+                    **label, "arm": arm, "step": steps[a], "metric": metric,
+                    "direction": direction,
+                    "mean": float(point[g, a, m]),
+                    "delta_pct": float(delta_point[g, a, m]),
+                    "delta_lo": float(lo[g, a, m]),
+                    "delta_hi": float(hi[g, a, m]),
+                    "n_lower": sign["n_lower"],
+                    "n_higher": sign["n_higher"],
+                    "ties": sign["n_tie"],
+                    # NaN, not a number, when the metric has no good direction --
+                    # so a reader who sorts by it gets nothing rather than a
+                    # ranking of a quantity that was never ranked.
+                    "n_better": better.get(direction, np.nan),
+                    "n_worse": better.get({"lower": "higher", "higher": "lower"}
+                                          .get(direction, ""), np.nan),
+                    "sign_p_log10": sign["p_log10"],
+                })
+    metrics_table = pd.DataFrame(rows)
+
+    divergence_table = pd.DataFrame()
+    order_table = pd.DataFrame()
+    if "min_ade" in metrics and "mean_ade" in metrics:
+        i_min, i_mean = metrics.index("min_ade"), metrics.index("mean_ade")
+        div_point = divergence(delta_point, i_min, i_mean)        # [G, A]
+        div_block = divergence(delta_block, i_min, i_mean)        # [B, G, A]
+        dlo, dhi = percentile_interval(div_block, level)
+        # The naive interval is carried alongside on purpose: it is what you
+        # get from two independently-derived intervals, and seeing it beside
+        # the correct one is the only way the difference stays visible.
+        mlo, mhi = percentile_interval(delta_block[..., i_min], level)
+        alo, ahi = percentile_interval(delta_block[..., i_mean], level)
+        divergence_table = pd.DataFrame([
+            {**labels[g], "arm": arms[a], "step": steps[a],
+             "divergence_pct": float(div_point[g, a]),
+             "lo": float(dlo[g, a]), "hi": float(dhi[g, a]),
+             "naive_lo": float(mlo[g, a] - ahi[g, a]),
+             "naive_hi": float(mhi[g, a] - alo[g, a]),
+             "min_ade_delta_pct": float(delta_point[g, a, i_min]),
+             "mean_ade_delta_pct": float(delta_point[g, a, i_mean])}
+            for g in range(len(labels)) for a in range(len(arms))
+        ])
+
+        # Pairwise, not a ranking. "curve diverges more than straight" is a
+        # claim about two strata; asserting a total order over four of them
+        # would be four claims dressed as one, and the two axes here overlap
+        # so a single ordering across both is not even well defined.
+        #
+        # The baseline is excluded. Its divergence is exactly zero in every
+        # replicate -- it is being compared with itself -- so `a > b` is
+        # `0 > 0` and the probability comes out 0.000, which reads as a
+        # confident claim that one stratum diverges less than another. It is
+        # not a measurement at all, and printed beside real rows it is the
+        # most misleading number the table can contain.
+        order_rows: list[dict[str, Any]] = []
+        for axis in sorted({lab["axis"] for lab in labels} - {"all"}):
+            members = [g for g, lab in enumerate(labels) if lab["axis"] == axis]
+            for a, arm in enumerate(arms):
+                if a == 0:
+                    continue
+                for gi in members:
+                    for gj in members:
+                        if gi >= gj:
+                            continue
+                        p = float((div_block[:, gi, a] > div_block[:, gj, a]).mean())
+                        order_rows.append({
+                            "axis": axis, "arm": arm, "step": steps[a],
+                            "stratum_a": labels[gi]["stratum"],
+                            "stratum_b": labels[gj]["stratum"],
+                            "n_a": labels[gi]["n"], "n_b": labels[gj]["n"],
+                            "divergence_a": float(div_point[gi, a]),
+                            "divergence_b": float(div_point[gj, a]),
+                            "p_a_greater": p,
+                        })
+        order_table = pd.DataFrame(order_rows)
+
+    return {"metrics": metrics_table, "divergence": divergence_table,
+            "order": order_table, "dropped": dropped, "arms": arms,
+            "strata": labels}
+
+
+# --------------------------------------------------------------------------
+#  Arithmetic that figures depend on
+# --------------------------------------------------------------------------
+
+def shared_limits(values: Iterable[float], pad: float = 0.05,
+                  floor: float | None = None) -> tuple[float, float]:
+    """One axis range for every panel that will be compared by eye.
+
+    Matplotlib's per-panel autoscale is the standard way to erase a collapse:
+    the spread shrinks five-fold, the axis shrinks with it, and the panels look
+    identical. The reader has no way to tell, because nothing is missing --
+    only the scale changed, and it changed in the caption-sized text.
+
+    A degenerate range (every value equal) is widened rather than returned as
+    a zero-width interval, which some backends render as a blank panel.
+    """
+    finite = np.asarray([v for v in np.ravel(np.asarray(list(values), dtype=float))
+                         if np.isfinite(v)], dtype=float)
+    if not finite.size:
+        return (0.0, 1.0)
+    lo, hi = float(finite.min()), float(finite.max())
+    if floor is not None:
+        lo = min(lo, floor)
+    span = hi - lo
+    if span <= 0:
+        return (lo - 0.5, hi + 0.5)
+    return (lo - pad * span, hi + pad * span)
+
+
+def spread_is_degenerate(values: Iterable[float], tol: float = 1e-4) -> bool:
+    """Whether a density estimate would fail on this sample.
+
+    Gaussian KDE divides by the standard deviation, so a collapsed arm raises
+    or returns garbage. The usual guard is to skip such an arm, which removes
+    from the figure precisely the arm the figure is about -- so the caller
+    needs to know it happened and draw a spike instead of drawing nothing.
+    """
+    finite = np.asarray([v for v in np.ravel(np.asarray(list(values), dtype=float))
+                         if np.isfinite(v)], dtype=float)
+    return finite.size < 2 or float(finite.std()) <= tol
+
+
+# Chosen for order, not for prettiness: the baseline is the darkest and each
+# reduction is lighter, so the direction of the axis is legible without the
+# legend and survives being printed in grey.
+_ARM_COLORS = ("#1a1a2e", "#16537e", "#3d8fb5", "#7bc0d8", "#b8dce8")
+_ARM_MARKERS = ("o", "s", "^", "D", "v")
+
+
+def arm_colors(arms: Sequence[str]) -> dict[str, str]:
+    """Stable colour per arm, so an arm is the same colour in every figure."""
+    return {a: _ARM_COLORS[i % len(_ARM_COLORS)] for i, a in enumerate(arms)}
+
+
+def arm_markers(arms: Sequence[str]) -> dict[str, str]:
+    """Stable marker per arm, so the figures survive being printed in grey."""
+    return {a: _ARM_MARKERS[i % len(_ARM_MARKERS)] for i, a in enumerate(arms)}
