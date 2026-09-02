@@ -18,7 +18,7 @@
 # =============================================================================
 
 # 이 묶음의 이름. 모든 run 에 sweep 태그로 붙어서 나중에 이것만 골라볼 수 있다
-SWEEP_NAME="euler-step-sweep"
+SWEEP_NAME="Euler-Step-1181"
 
 # 축마다 값을 여러 개 적으면 조합이 전부 돈다.
 # 값이 하나면 그 축은 안 도는 것과 같다 (run.sh 기본값을 덮어쓴다).
@@ -29,16 +29,21 @@ SWEEP_NUM_TRAJ_SAMPLES=()         # 예: (1 6 16).  비우면 run.sh 의 6 — �
 SWEEP_TEMPERATURE=()              # 예: (0.6 0.9)
 
 # 이번 sweep 의 축. 10 이 기준선이고 나머지가 그것과 짝지어 비교된다.
-# 10 을 반드시 포함할 것 — 없으면 비교 대상이 없다.
-SWEEP_INFERENCE_STEP=(10 4 2 1)
+#   기준선을 여기 **안 적었다.** 10 스텝 × 1181 클립은 이미 돌아서 디스크에 있고
+#   (`..._1181clip_..._7cf04eb4`), 설정이 전부 같으니 그대로 arm 으로 쓴다.
+#   비교는 sweep 태그가 아니라 per_clip 의 `inference_step` 열로 짝지으므로,
+#   기준선에 sweep 태그가 없어도 분석은 성립한다.
+#   ⚠️ 클립 목록이나 K·temperature·seed 를 하나라도 바꾸면 그 재사용이 깨진다.
+#      그때는 10 을 다시 넣어 네 arm 을 전부 새로 돌려야 한다.
+SWEEP_INFERENCE_STEP=(4 2 1)
 
 # 어느 클립으로 돌릴까.  비우면 run.sh 값을 쓴다.
 #   축이 아니라 **값 하나**인 이유: 클립 목록은 비교 축이 아니라 실험의 경계다.
 #   한 sweep 안에서 바뀌면 arm 마다 다른 클립을 보게 되어 paired 비교가 성립하지 않고,
 #   sweep 태그 하나에 별개의 실험 둘이 묶여 나중에 골라볼 때 섞인다.
 #   두 세트로 보고 싶으면 SWEEP_NAME 을 바꿔 가며 두 번 돌린다.
-SWEEP_CLIP_LIST="notebooks/clip_ids_gold644.parquet"    # 공식 644
-#SWEEP_CLIP_LIST="notebooks/clip_ids.parquet"           # 전체 1181 (gold 를 포함)
+#SWEEP_CLIP_LIST="notebooks/clip_ids_gold644.parquet"   # 공식 644
+SWEEP_CLIP_LIST="notebooks/clip_ids.parquet"            # 전체 1181 (gold 를 포함)
 
 # 하나가 죽어도 나머지를 계속 돌릴까.  0 이면 첫 실패에서 멈춘다
 CONTINUE_ON_FAILURE=1
