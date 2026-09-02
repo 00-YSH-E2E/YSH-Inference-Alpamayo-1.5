@@ -70,8 +70,23 @@ INCLUDE_GT=0                             # 정답 궤적을 로컬에 남기기 
 # =============================================================================
 #  아래는 안 고쳐도 된다
 # =============================================================================
+# sweep.sh 가 이 파일을 source 해서 위 설정을 기본값으로 가져간다. 설정을 두 곳에
+# 적어 두면 반드시 갈라지므로, 설정이 사는 곳은 여기 하나다.
+(return 0 2>/dev/null) && return 0
+
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+# sweep.sh 가 조합마다 덮어쓰는 자리. 위 설정 블록은 손대지 않는다 —
+# 거기에 ${VAR:-기본값} 을 쓰면 읽기 어려워지고, 무엇이 기본값인지 흐려진다.
+VARIANT="${OVERRIDE_VARIANT:-$VARIANT}"
+MODEL="${OVERRIDE_MODEL:-$MODEL}"
+NUM_TRAJ_SAMPLES="${OVERRIDE_NUM_TRAJ_SAMPLES:-$NUM_TRAJ_SAMPLES}"
+TEMPERATURE="${OVERRIDE_TEMPERATURE:-$TEMPERATURE}"
+INFERENCE_STEP="${OVERRIDE_INFERENCE_STEP-$INFERENCE_STEP}"
+SEED="${OVERRIDE_SEED:-$SEED}"
+LIMIT="${OVERRIDE_LIMIT:-$LIMIT}"
+SWEEP="${SWEEP:-}"
 
 RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; DIM=$'\033[2m'; OFF=$'\033[0m'
 # 처음 걸린 것에서 멈추지 않는다. 하나 고치고 다시 돌려서 다음 걸 발견하는 건
@@ -188,6 +203,7 @@ ARGS=(
 )
 [[ -n "$MACHINE" ]]        && ARGS+=(--machine "$MACHINE")
 [[ -n "$NOTES" ]]          && ARGS+=(--notes "$NOTES")
+[[ -n "$SWEEP" ]]          && ARGS+=(--sweep "$SWEEP")
 [[ -n "$INFERENCE_STEP" ]] && ARGS+=(--inference-step "$INFERENCE_STEP")
 # 클립을 직접 지정했으면 목록과 개수 제한은 뜻이 없다
 if [[ ${#CLIP_IDS[@]} -gt 0 ]]; then

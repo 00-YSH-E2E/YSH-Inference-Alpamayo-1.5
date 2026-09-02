@@ -132,6 +132,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--machine", default=None,
                    help="Where this ran, for the run directory and run name. Defaults to "
                         "the short hostname, which is also what env.host records.")
+    p.add_argument("--sweep", default=None,
+                   help="Tag every run of one sweep with this name so the batch can be "
+                        "filtered as a unit. A sweep is N runs, not one run with N results "
+                        "-- the recording rules forbid folding several evaluations into one.")
     p.add_argument("--experiment", default="alpamayo-1.5")
     p.add_argument("--notes", help="One or two human sentences: why this run exists.")
     p.add_argument("--data-cache", default=DATA_CACHE)
@@ -667,6 +671,8 @@ def main() -> None:
         seed=args.seed,
         notes=args.notes,
     ) as run:
+        if args.sweep:
+            run.tag("sweep", args.sweep)
         execute(run)
 
 

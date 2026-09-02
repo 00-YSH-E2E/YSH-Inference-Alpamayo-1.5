@@ -333,6 +333,23 @@ $EDITOR scripts/run.sh     # VARIANT, MACHINE, LIMIT, NOTES ...
 ./scripts/run.sh
 ```
 
+To run several configurations, edit the axes at the top of `scripts/sweep.sh`
+and run that instead. It is hydra's `--multirun` idea — list values on an axis
+and the combinations all run:
+
+```bash
+SWEEP_VARIANT=("Vanilla" "Pruned-24L" "INT8")
+SWEEP_NUM_TRAJ_SAMPLES=(1 6)          # 3 x 2 = 6 runs
+```
+
+What it does *not* do is fold those into one run. The recording rules forbid
+several evaluations in one run — the earlier result gets overwritten — so a
+sweep is N separate runs carrying a shared `sweep` tag. They line up one per row
+in the comparison table, and the tag selects the batch. Defaults come from
+`run.sh`, which is sourced rather than duplicated, so settings live in one file.
+A failed combination does not stop the rest, and the summary at the end says
+which ones landed.
+
 That MLflow check matters more than it looks. The tracking server is bound to
 the tailnet address only, and the mlflow client retries seven times at a
 120-second timeout — so from outside the tailnet a run hangs for minutes before
@@ -434,6 +451,7 @@ Launched from a different repo, a run records that repo's commit instead.
 |---|---|
 | `scripts/run_inference_tracked.py` | The CLI. Loads clips, runs the model, computes metrics, writes the run directory, records it |
 | `scripts/run.sh` | The settings block you edit instead of remembering flags. Pre-flight checks before any GPU time is spent |
+| `scripts/sweep.sh` | Several configurations in one command. N runs sharing a `sweep` tag, not one run with N results |
 | `scripts/smoke_inference.py` | Does the model load and produce a trajectory on this board? No recording |
 | `scripts/ml_platform_track.py` | The recording helper. A byte-identical copy of `examples/ml_platform_track.py` in the ML_Platform repo — that one is canonical |
 | `src/alpamayo1_5/trace/token_trace.py` | Per-token logprob and entropy, CUDA-event timing split |
