@@ -252,7 +252,9 @@ def build_rows(samples: Iterable[dict], config: dict) -> pd.DataFrame:
 _PER_CLIP_DROP = frozenset({"pred_xy", "gt_xy", "data"})
 
 
-def write_per_clip(out_dir: Path, per_clip: list[dict]) -> Path | None:
+def write_per_clip(
+    out_dir: Path, per_clip: list[dict], config: dict | None = None
+) -> Path | None:
     """One row per clip: its situation label and every metric computed for it.
 
     This is what makes a breakdown possible at all. ``predictions.parquet``
@@ -265,15 +267,39 @@ def write_per_clip(out_dir: Path, per_clip: list[dict]) -> Path | None:
     recompute *if you still have the inputs*, and the inputs are gated. A few
     kilobytes here buys every pivot anyone will want later, and the file names
     its schema_version so a stale definition is visible rather than silent.
+
+    ``config`` stamps run identity onto every row, exactly as
+    :func:`build_rows` does, and for the same reason: **a sweep writes one of
+    these files per run, and without identity they concatenate into a pile with
+    no axis to group on.** The pivot this file promises is a comparison across
+    runs, so the run has to be a column. ``t0_us`` comes from the row rather
+    than from ``config["columns"]`` because it varies per clip once anyone
+    sweeps the sample timestamp -- putting it in the config would silently
+    overwrite the real value with a single scalar.
     """
-    rows = [{k: v for k, v in c.items() if k not in _PER_CLIP_DROP} for c in per_clip]
-    rows = [r for r in rows if r.get("clip_id")]
+    identity: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
+    columns: dict[str, Any] = {}
+    if config is not None:
+        identity["run_id"] = config.get("run_id")
+        identity["variant"] = config.get("variant")
+        identity["git_commit"] = config.get("git_commit")
+        columns = dict(config.get("columns", {}))
+
+    rows = []
+    for clip in per_clip:
+        if not clip.get("clip_id"):
+            continue
+        row = dict(identity)
+        row.update({k: v for k, v in clip.items() if k not in _PER_CLIP_DROP})
+        # Same precedence as build_rows: config wins a name collision, so the
+        # two files can never disagree about what the run was.
+        row.update(columns)
+        rows.append(row)
     if not rows:
         return None
-    frame = pd.DataFrame(rows)
-    frame.insert(0, "schema_version", SCHEMA_VERSION)
+
     path = Path(out_dir) / "per_clip.parquet"
-    frame.to_parquet(path, index=False, compression="zstd")
+    pd.DataFrame(rows).to_parquet(path, index=False, compression="zstd")
     return path
 
 
@@ -299,7 +325,7 @@ def write_run(
     frame = build_rows(samples, config)
     frame.to_parquet(out_dir / "predictions.parquet", index=False, compression="zstd")
     if per_clip:
-        write_per_clip(out_dir, per_clip)
+        write_per_clip(out_dir, per_clip, config)
 
     payload = dict(meta)
     payload["schema_version"] = SCHEMA_VERSION

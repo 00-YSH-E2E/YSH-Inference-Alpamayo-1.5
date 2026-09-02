@@ -21,6 +21,7 @@ writer.py imports no torch, so all of this runs anywhere.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from alpamayo1_5.trace import writer as W
@@ -175,6 +176,74 @@ def test_schema_version_is_stamped_on_every_row():
 def test_array_columns_are_flattened_to_float32_lists():
     frame = W.build_rows([sample(pred_xy=np.ones((4, 2)))], {"run_id": "r"})
     assert frame["pred_xy"].iloc[0] == [1.0] * 8
+
+
+# -- per_clip identity ------------------------------------------------------
+def clip(clip_id: str = "c1", **extra):
+    row = {"clip_id": clip_id, "t0_us": 5_100_000, "min_ade": 0.5, "scene": "curve"}
+    row.update(extra)
+    return row
+
+
+def test_per_clip_carries_run_identity(tmp_path):
+    """Without it a sweep's per_clip files concatenate into an unusable pile.
+
+    This file exists to be pivoted, and the pivot anyone actually wants is
+    across runs. That needs the run to be a column.
+    """
+    pytest.importorskip("pyarrow", reason="parquet I/O needs pyarrow")
+    path = W.write_per_clip(
+        tmp_path, [clip("c1"), clip("c2")],
+        {"run_id": "r1", "variant": "Vanilla", "git_commit": "a" * 40,
+         "columns": {"inference_step": 2, "seed": 42}},
+    )
+    frame = pd.read_parquet(path)
+    assert set(frame["run_id"]) == {"r1"}
+    assert set(frame["variant"]) == {"Vanilla"}
+    assert set(frame["git_commit"]) == {"a" * 40}
+    assert set(frame["inference_step"]) == {2}
+    assert set(frame["schema_version"]) == {W.SCHEMA_VERSION}
+    assert list(frame["clip_id"]) == ["c1", "c2"]
+
+
+def test_per_clip_t0_comes_from_the_clip_not_the_config(tmp_path):
+    """The pairing key is (clip_id, t0_us), so t0 has to survive per row.
+
+    It is constant today, which is exactly why a config-level t0 would look
+    correct right up until someone sweeps the sample timestamp.
+    """
+    pytest.importorskip("pyarrow", reason="parquet I/O needs pyarrow")
+    path = W.write_per_clip(
+        tmp_path,
+        [clip("c1", t0_us=3_100_000), clip("c2", t0_us=7_100_000)],
+        {"run_id": "r1", "columns": {"inference_step": 2}},
+    )
+    assert list(pd.read_parquet(path)["t0_us"]) == [3_100_000, 7_100_000]
+
+
+def test_per_clip_without_a_config_still_writes(tmp_path):
+    """config is optional, so an older caller keeps working."""
+    pytest.importorskip("pyarrow", reason="parquet I/O needs pyarrow")
+    frame = pd.read_parquet(W.write_per_clip(tmp_path, [clip()]))
+    assert set(frame["schema_version"]) == {W.SCHEMA_VERSION}
+    assert "run_id" not in frame.columns
+
+
+def test_per_clip_two_runs_concatenate_with_an_axis_to_group_on(tmp_path):
+    """The thing the missing identity made impossible."""
+    pytest.importorskip("pyarrow", reason="parquet I/O needs pyarrow")
+    frames = []
+    for step in (10, 2):
+        out = tmp_path / f"run_s{step}"
+        out.mkdir()
+        frames.append(pd.read_parquet(W.write_per_clip(
+            out, [clip("c1"), clip("c2")],
+            {"run_id": f"r{step}", "variant": "Vanilla",
+             "columns": {"inference_step": step}},
+        )))
+    merged = pd.concat(frames, ignore_index=True)
+    assert set(merged["inference_step"]) == {10, 2}
+    assert len(merged.groupby(["clip_id", "inference_step"])) == 4
 
 
 # -- what leaves the machine -----------------------------------------------

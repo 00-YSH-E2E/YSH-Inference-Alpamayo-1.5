@@ -23,7 +23,7 @@ SWEEP_NAME="pruning-comparison"
 # 축마다 값을 여러 개 적으면 조합이 전부 돈다.
 # 값이 하나면 그 축은 안 도는 것과 같다 (run.sh 기본값을 덮어쓴다).
 # 배열을 통째로 비우면 run.sh 값을 그대로 쓴다.
-SWEEP_VARIANT=("Vanilla" "Pruned-24L" "INT8")
+SWEEP_VARIANT=("Vanilla") # 예: ("Vanilla" "Pruned-24L" "INT8")
 SWEEP_MODEL=()                    # 변형마다 체크포인트가 다르면 VARIANT 와 같은 길이로
 SWEEP_NUM_TRAJ_SAMPLES=()         # 예: (1 6 16)
 SWEEP_TEMPERATURE=()              # 예: (0.6 0.9)

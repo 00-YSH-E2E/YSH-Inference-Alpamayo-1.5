@@ -281,7 +281,11 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
             row.update(trace.sample(k))
         rows.append(row)
 
-    extras = {"clip_id": clip_id, "gt_xy": gt_xy, "data": data}
+    # t0_us belongs to the clip, not to the run: the pairing key across runs is
+    # (clip_id, t0_us), and it is degenerate only for as long as nobody sweeps
+    # the sample timestamp. Carry it here rather than in the config columns so
+    # it stays a per-row value when that day comes.
+    extras = {"clip_id": clip_id, "t0_us": args.t0_us, "gt_xy": gt_xy, "data": data}
     if gt_xy is not None:
         # Pass the checkpoint's own dt rather than letting the 0.1 default
         # stand. The horizon labels (ade_1.0s and friends) are derived from it,
