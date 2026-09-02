@@ -20,7 +20,7 @@ VARIANT="Vanilla"
 # 어느 기계인가.  비우면 호스트명을 쓴다.
 #   폴더 이름과 run 이름에 들어가고, config/experiments.yaml 이 이 값으로 기기를 가른다.
 #   호스트명이 그 기계를 부르는 이름이 아닐 때만 적는다 (대여 박스, 컨테이너)
-MACHINE="Pro6000-Vast.ai"
+MACHINE="Pro6000 x 1 - Lent"
 
 # 어느 클립을 돌릴 것인가.  clip_id 열이 있는 parquet
 #
@@ -30,8 +30,8 @@ MACHINE="Pro6000-Vast.ai"
 #                             "왜 그 클립을 골랐냐" 는 질문이 안 나온다.
 #   clip_ids.parquet          데모용 1181개.  gold 644 를 부분집합으로 포함한다.
 #                             더 넓게 보고 싶을 때만.
-CLIP_LIST="notebooks/clip_ids_gold644.parquet"    # 공식 644
-#CLIP_LIST="notebooks/clip_ids.parquet"           # 전체 1181 (gold 를 포함)
+# CLIP_LIST="notebooks/clip_ids_gold644.parquet"    # 공식 644
+CLIP_LIST="notebooks/clip_ids.parquet"           # 전체 1181 (gold 를 포함)
 
 # 앞에서 몇 개만 볼까.  0 이면 목록 전부 — **실험에서는 항상 0 이다.**
 #   LIMIT 은 스모크용 손잡이지 부분집합을 만드는 방법이 아니다. 250 으로 두면
