@@ -349,6 +349,26 @@ def test_arms_with_different_seed_schemes_are_refused(tmp_path):
     assert "seed_scheme" in table.set_index("check").at["config", "detail"]
 
 
+def test_the_axis_itself_is_exempt_from_the_config_check(tmp_path):
+    """diffusion_temperature is a pairing setting when the axis is the step
+    count, and the axis when the sweep is a temperature ladder. The first
+    temperature ladder was refused by its own gate for varying the one
+    setting it was built to vary."""
+    write_run(tmp_path, 10, name="hot", diffusion_temperature=1.0)
+    write_run(tmp_path, 10, name="cold", diffusion_temperature=0.5)
+    runs = C.discover_runs(tmp_path)
+
+    as_axis = C.gate(C.load_per_clip(runs, axis="diffusion_temperature"), runs,
+                     axis="diffusion_temperature")
+    assert statuses(as_axis)["config"] == "ok"
+    assert "diffusion_temperature is the axis" in as_axis.set_index("check").at["config", "detail"]
+
+    # The same two runs along the step axis are two settings under one label.
+    as_setting = C.gate(C.load_per_clip(runs), runs)
+    assert statuses(as_setting)["config"] == "fail"
+    assert "diffusion_temperature" in as_setting.set_index("check").at["config", "detail"]
+
+
 def test_arms_covering_different_clips_are_refused(tmp_path):
     """An arm that died on the hard clips scores best on what it finished."""
     write_run(tmp_path, 10, n=8)

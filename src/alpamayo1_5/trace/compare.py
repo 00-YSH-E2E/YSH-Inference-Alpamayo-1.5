@@ -591,6 +591,10 @@ def gate(
     disagree: list[str] = []
     absent: list[str] = []
     for col in PAIRING_CONFIG:
+        if col == axis:
+            # The axis is the one setting that is *supposed* to differ between
+            # arms; checking it here would refuse every sweep along it.
+            continue
         if col not in per_clip.columns:
             absent.append(col)
             continue
@@ -605,10 +609,12 @@ def gate(
                          "between them is not attributable to the axis -- "
                          + "; ".join(disagree), ", ".join(arms)))
     else:
+        n_checked = len(PAIRING_CONFIG) - len(absent) - (1 if axis in PAIRING_CONFIG else 0)
         rows.append(_row("config", "ok",
-                         f"{len(PAIRING_CONFIG) - len(absent)} settings identical across arms"
-                         + (f" ({', '.join(absent)} not in this schema)" if absent else ""),
-                         ", ".join(arms), len(PAIRING_CONFIG) - len(absent)))
+                         f"{n_checked} settings identical across arms"
+                         + (f" ({', '.join(absent)} not in this schema)" if absent else "")
+                         + (f" ({axis} is the axis)" if axis in PAIRING_CONFIG else ""),
+                         ", ".join(arms), n_checked))
 
     # 6 -- strata are a property of the clip, not of the arm
     strat_bad: list[str] = []

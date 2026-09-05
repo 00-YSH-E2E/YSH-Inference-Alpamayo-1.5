@@ -153,6 +153,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--flush-every", type=int, default=100,
                    help="Rewrite the run directory every N clips, so a crash at clip "
                         "1299 of 1300 loses N clips rather than the run. 0 disables.")
+    p.add_argument("--x0-from", default=None,
+                   help="A teacher run's predictions.parquet (schema 3). Its recorded x0 for "
+                        "each (clip, sample_k) is injected into the sampler, so this run's "
+                        "samples start from the teacher's noise and can be paired on it.")
     p.add_argument("--split", default=None,
                    help="Comma-separated subset of the clip list's `split` column, e.g. "
                         "val,test. Keeps evaluation clips out of any training run.")
@@ -304,6 +308,11 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
     diffusion_kwargs = {"temperature": args.diffusion_temperature}
     if args.inference_step is not None:
         diffusion_kwargs["inference_step"] = args.inference_step
+    if getattr(args, "x0_table", None) is not None:
+        x0 = args.x0_table.get(clip_id)
+        if x0 is None or x0.shape[0] != args.num_traj_samples:
+            raise SystemExit(f"--x0-from has no {args.num_traj_samples} rows for clip {clip_id}")
+        diffusion_kwargs["x0"] = torch.as_tensor(x0, dtype=torch.float32, device="cuda")
 
     torch.cuda.manual_seed_all(clip_seed(args.seed, clip_id))
     with trace_inference(model) as tracer:
@@ -426,6 +435,7 @@ def main() -> None:
         "diffusion_temperature": args.diffusion_temperature,
         "dataset_revision": args.dataset_revision,
         "split": args.split,
+        "x0_from": args.x0_from,
         "attn_impl": args.attn,
         "dtype": "bfloat16",
         "t0_us": args.t0_us,
@@ -457,6 +467,27 @@ def main() -> None:
         model = Alpamayo1_5.from_pretrained(
             args.model, dtype=torch.bfloat16, attn_implementation=args.attn
         ).to("cuda").eval()
+        args.x0_table = None
+        if args.x0_from:
+            import inspect
+            if "x0" not in inspect.signature(model.diffusion.sample).parameters:
+                raise SystemExit(
+                    "--x0-from was given, but this model's sampler does not accept x0 -- the "
+                    "upstream sample() drops unknown kwargs, so the run would look paired "
+                    "without being paired. Load a student checkpoint (its config names "
+                    "ShortcutFlowMatching), or drop --x0-from."
+                )
+            import numpy as np
+            import pandas as pd
+            t = pd.read_parquet(args.x0_from, columns=["clip_id", "sample_k", "x0"])
+            if t["x0"].isna().any():
+                raise SystemExit(f"{args.x0_from} has rows without x0 (schema < 3?)")
+            args.x0_table = {
+                cid: np.stack([np.asarray(v, np.float32).reshape(-1, 2)
+                               for v in g.sort_values("sample_k")["x0"]])
+                for cid, g in t.groupby("clip_id")
+            }
+            print(f"[x0] {len(args.x0_table)} clips of teacher noise from {args.x0_from}")
         processor = helper.get_processor(model.tokenizer)
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -491,6 +522,7 @@ def main() -> None:
                 "seed": args.seed,
                 "seed_scheme": "clip-hash",
                 "diffusion_temperature": args.diffusion_temperature,
+                "x0_source": "teacher" if args.x0_from else "sampled",
                 "num_traj_samples": args.num_traj_samples,
                 "conditioning_source": "generated",
             },
@@ -778,7 +810,7 @@ def main() -> None:
                  f"-{len(clips)}clip-k{args.num_traj_samples}"
                  f"-temp{args.temperature:g}"
                  f"{'-' + args.label if args.label else ''}",
-        model=f"hf:{args.model}@main",
+        model=(f"path:{args.model}" if Path(args.model).is_dir() else f"hf:{args.model}@main"),
         hf_datasets=[f"{DATASET_REPO}@main"],
         params=params,
         variant=args.variant,

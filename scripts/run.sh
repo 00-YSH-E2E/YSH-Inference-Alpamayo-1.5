@@ -56,6 +56,8 @@ CLIP_IDS=()
 T0_US=5100000
 TEMPERATURE=0.6                          # CoT 텍스트 생성용.  확산 노이즈와 무관하다
 DIFFUSION_TEMPERATURE=1.0                # 확산 **초기 노이즈** 크기.  위 TEMPERATURE 와 별개다.
+X0_FROM=""                               # 교사 run 의 predictions.parquet.  비면 노이즈를 새로 뽑고,
+                                         # 주면 그 파일의 x0 을 (clip, sample_k) 별로 주입해 짝지은 평가가 된다.
                                          # flow_matching.py 의 randn 에 곱해진다.  1.0 이 학습 분포
                                          # (N(0,I)).  낮추면 방향은 그대로, 퍼짐만 준다 — 스텝 수를
                                          # 안 바꾸고 다양성만 줄이는 대조군용.  지금까지 모든 run 이
@@ -134,6 +136,7 @@ CLIP_LIST="${OVERRIDE_CLIP_LIST:-$CLIP_LIST}"
 NUM_TRAJ_SAMPLES="${OVERRIDE_NUM_TRAJ_SAMPLES:-$NUM_TRAJ_SAMPLES}"
 TEMPERATURE="${OVERRIDE_TEMPERATURE:-$TEMPERATURE}"
 DIFFUSION_TEMPERATURE="${OVERRIDE_DIFFUSION_TEMPERATURE:-$DIFFUSION_TEMPERATURE}"
+X0_FROM="${OVERRIDE_X0_FROM:-$X0_FROM}"
 INFERENCE_STEP="${OVERRIDE_INFERENCE_STEP-$INFERENCE_STEP}"
 SEED="${OVERRIDE_SEED:-$SEED}"
 T0_US="${OVERRIDE_T0_US:-$T0_US}"
@@ -326,6 +329,7 @@ ARGS=(
 [[ -n "$SWEEP" ]]          && ARGS+=(--sweep "$SWEEP")
 [[ -n "${LABEL:-}" ]]      && ARGS+=(--label "$LABEL")
 [[ -n "$INFERENCE_STEP" ]] && ARGS+=(--inference-step "$INFERENCE_STEP")
+[[ -n "$X0_FROM" ]]        && ARGS+=(--x0-from "$X0_FROM")
 # 클립을 직접 지정했으면 목록과 개수 제한은 뜻이 없다
 if [[ ${#CLIP_IDS[@]} -gt 0 ]]; then
   for c in "${CLIP_IDS[@]}"; do ARGS+=(--clip-id "$c"); done
