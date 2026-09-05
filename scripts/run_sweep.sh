@@ -55,6 +55,16 @@ CONTINUE_ON_FAILURE=1
 # 진짜로 돌리기 전에 무엇이 돌지만 본다
 DRY_RUN=0
 
+# 축을 **파일로** 주입할 수도 있다:   SWEEP_CONFIG=sweeps/B_euler_steps_1300.sh ./scripts/run_sweep.sh
+#   위 [축] 을 제자리에서 고치면 트리가 dirty 해져서 그 sweep 의 모든 arm 이 거짓 git_commit 을
+#   기록한다.  sweeps/ 의 파일은 커밋되므로 실험 정의가 이력에 남고, run_queue.sh 로 여러 sweep 을
+#   순서대로 걸 수 있다.  파일이 [축] 의 값을 덮어쓴다.
+if [[ -n "${SWEEP_CONFIG:-}" ]]; then
+  [[ -r "$SWEEP_CONFIG" ]] || { echo "SWEEP_CONFIG 를 못 읽는다: $SWEEP_CONFIG" >&2; exit 1; }
+  # shellcheck disable=SC1090
+  source "$SWEEP_CONFIG"
+fi
+
 # =============================================================================
 #  아래는 안 고쳐도 된다
 # =============================================================================
