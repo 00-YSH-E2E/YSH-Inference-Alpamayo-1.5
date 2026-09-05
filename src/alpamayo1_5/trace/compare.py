@@ -80,6 +80,15 @@ PAIRING_CONFIG = (
     "seed", "num_traj_samples", "temperature", "top_p", "model",
     "attn_impl", "data_spec", "dtype", "max_new_tokens", "variant",
     "conditioning_source",
+    # How the seed reached the generator. Runs that re-seeded every clip with
+    # the bare value have non-exchangeable samples (index 0 sat 0.5 m off the
+    # others); runs that XOR a clip hash do not. Pairing one against the other
+    # compares two different sampling procedures under one name.
+    "seed_scheme",
+    # Initial-noise scale on the flow head. Pinned at 1.0 for every run made
+    # before it was exposed, so an older file simply lacks the column and the
+    # check reports it absent rather than failing.
+    "diffusion_temperature",
 )
 
 # What identifies a clip across arms. `t0_us` is a constant today -- one sample

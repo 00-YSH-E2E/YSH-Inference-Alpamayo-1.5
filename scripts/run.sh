@@ -55,6 +55,11 @@ CLIP_IDS=()
 # gold parquet 에 event_t0s 열이 있지만 eval.py 는 쓰지 않는다 — 고정 5.1초다.
 T0_US=5100000
 TEMPERATURE=0.6                          # CoT 텍스트 생성용.  확산 노이즈와 무관하다
+DIFFUSION_TEMPERATURE=1.0                # 확산 **초기 노이즈** 크기.  위 TEMPERATURE 와 별개다.
+                                         # flow_matching.py 의 randn 에 곱해진다.  1.0 이 학습 분포
+                                         # (N(0,I)).  낮추면 방향은 그대로, 퍼짐만 준다 — 스텝 수를
+                                         # 안 바꾸고 다양성만 줄이는 대조군용.  지금까지 모든 run 이
+                                         # 이 값을 못 건드려 1.0 이었다
 TOP_P=0.98
 SEED=42                                  # 클립마다 추론 직전에 건다.  같은 시드 → 같은 CoT
                                          # → 같은 초기 노이즈.  paired 비교의 전제다
@@ -128,8 +133,10 @@ MODEL="${OVERRIDE_MODEL:-$MODEL}"
 CLIP_LIST="${OVERRIDE_CLIP_LIST:-$CLIP_LIST}"
 NUM_TRAJ_SAMPLES="${OVERRIDE_NUM_TRAJ_SAMPLES:-$NUM_TRAJ_SAMPLES}"
 TEMPERATURE="${OVERRIDE_TEMPERATURE:-$TEMPERATURE}"
+DIFFUSION_TEMPERATURE="${OVERRIDE_DIFFUSION_TEMPERATURE:-$DIFFUSION_TEMPERATURE}"
 INFERENCE_STEP="${OVERRIDE_INFERENCE_STEP-$INFERENCE_STEP}"
 SEED="${OVERRIDE_SEED:-$SEED}"
+T0_US="${OVERRIDE_T0_US:-$T0_US}"
 LIMIT="${OVERRIDE_LIMIT:-$LIMIT}"
 SWEEP="${SWEEP:-}"
 
@@ -261,19 +268,27 @@ fi
 # 120초로 몇 분을 매달린 뒤에야 죽는다 — 그것도 추론이 시작되기도 전에.
 if [[ "$TRACK" == "1" ]]; then
   URI="${MLFLOW_TRACKING_URI:-http://${ML_PLATFORM_HOST}:5000}"
-  if curl -fsS -m 3 "${URI}/health" >/dev/null 2>&1; then
+  # 3회 재시도 (0·5·10초 백오프).  그래도 안 되면 **막지 않고 TRACK=0 으로 강등**한다.
+  #
+  # 이유:  run_sweep.sh 는 실패한 조합을 건너뛰고 다음으로 간다.  여기서 '막힘' 으로
+  # exit 1 하면, 테일넷이 30초 끊긴 사이에 남은 조합 전부가 5분 만에 줄줄이 실패한다 —
+  # 무인 스윕에서 가장 큰 사고다.  추론과 HF 업로드는 MLflow 없이도 온전히 되므로,
+  # 기록만 포기하고 돈다.  (아래 warn 이 남고, run.json 의 params 에 track=0 이 찍힌다.)
+  MLFLOW_UP=0
+  for attempt in 1 2 3; do
+    if curl -fsS -m 3 "${URI}/health" >/dev/null 2>&1; then MLFLOW_UP=1; break; fi
+    [[ "$attempt" -lt 3 ]] && sleep $(( attempt * 5 ))
+  done
+  if [[ "$MLFLOW_UP" == "1" ]]; then
     ok "MLflow: $URI"
   else
-    fail "MLflow 에 3초 안에 못 닿았다: $URI
-       테일넷 밖이면 MLflow 는 안 열린다 (100.81.70.49 에만 묶여 있다).
-       고르는 법:
-         · 테일넷에 붙는다:        tailscale up
-         · 프록시를 거친다:         이 파일에서 NETWORK_PROXY=\"socks5h://127.0.0.1:1055\"
-                                  (userspace 모드 tailscaled 가 여는 SOCKS 포트)
-         · 터널을 판다:            ssh -N -L 5000:100.81.70.49:5000 <중계>
-                                  export MLFLOW_TRACKING_URI=http://localhost:5000
-         · 기록 없이 돌린다:        이 파일에서 TRACK=0
-                                  (추론과 HF 업로드는 그대로 된다)"
+    warn "MLflow 에 3회(≈15초) 못 닿았다: $URI
+       → 이 run 은 TRACK=0 으로 강등해서 돈다.  추론·HF 업로드는 그대로, MLflow 기록만 없다.
+       테일넷 밖이면 MLflow 는 안 열린다 (100.81.70.49 에만 묶여 있다).  붙이는 법:
+         · tailscale up
+         · NETWORK_PROXY=\"socks5h://127.0.0.1:1055\"  (userspace tailscaled 의 SOCKS)
+         · ssh -N -L 5000:100.81.70.49:5000 <중계>;  export MLFLOW_TRACKING_URI=http://localhost:5000"
+    TRACK=0
   fi
   export MLFLOW_TRACKING_URI="$URI"
 else
@@ -295,6 +310,7 @@ ARGS=(
   --num-traj-samples "$NUM_TRAJ_SAMPLES"
   --t0-us "$T0_US"
   --temperature "$TEMPERATURE" --top-p "$TOP_P" --seed "$SEED"
+  --diffusion-temperature "$DIFFUSION_TEMPERATURE"
   --max-generation-length "$MAX_GENERATION_LENGTH"
   --model "$MODEL" --attn "$ATTN"
   --data-spec "$DATA_SPEC" --data-cache "$DATA_CACHE"

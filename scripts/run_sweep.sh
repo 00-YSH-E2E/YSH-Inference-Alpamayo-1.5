@@ -26,7 +26,11 @@ SWEEP_NAME="Euler-Step-1181"
 SWEEP_VARIANT=()                  # 예: ("Vanilla" "Pruned-24L" "INT8") — MODEL 과 짝지을 것
 SWEEP_MODEL=()                    # 변형마다 체크포인트가 다르면 VARIANT 와 같은 길이로
 SWEEP_NUM_TRAJ_SAMPLES=()         # 예: (1 6 16).  비우면 run.sh 의 6 — 공식 minADE_6 과 맞는 값
-SWEEP_TEMPERATURE=()              # 예: (0.6 0.9)
+SWEEP_TEMPERATURE=()              # 예: (0.6 0.9)  — CoT 텍스트 온도
+SWEEP_SEED=()                     # 예: (42 43 44).  run-to-run 밴드.  시드는 클립 id 와 XOR 된다
+SWEEP_T0_US=()                    # 예: (5100000 8100000).  클립 안 예측 시점.  유효 [1600000, 13600000]
+SWEEP_DIFFUSION_TEMPERATURE=()    # 예: (1.0 0.7 0.5).  확산 초기 노이즈 크기 — CoT 온도와 별개.
+                                  # 스텝 수를 고정한 채 다양성만 줄이는 대조군 축
 
 # 이번 sweep 의 축. 10 이 기준선이고 나머지가 그것과 짝지어 비교된다.
 #   기준선을 여기 **안 적었다.** 10 스텝 × 1181 클립은 이미 돌아서 디스크에 있고
@@ -70,6 +74,9 @@ RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; DIM=$'\033[2m'; BLD=$'\033[1m
 [[ ${#SWEEP_NUM_TRAJ_SAMPLES[@]}  -eq 0 ]] && SWEEP_NUM_TRAJ_SAMPLES=("$NUM_TRAJ_SAMPLES")
 [[ ${#SWEEP_TEMPERATURE[@]}       -eq 0 ]] && SWEEP_TEMPERATURE=("$TEMPERATURE")
 [[ ${#SWEEP_INFERENCE_STEP[@]}    -eq 0 ]] && SWEEP_INFERENCE_STEP=("$INFERENCE_STEP")
+[[ ${#SWEEP_SEED[@]}              -eq 0 ]] && SWEEP_SEED=("$SEED")
+[[ ${#SWEEP_T0_US[@]}             -eq 0 ]] && SWEEP_T0_US=("$T0_US")
+[[ ${#SWEEP_DIFFUSION_TEMPERATURE[@]} -eq 0 ]] && SWEEP_DIFFUSION_TEMPERATURE=("$DIFFUSION_TEMPERATURE")
 
 # 변형마다 체크포인트가 다른 경우는 조합이 아니라 짝이다. 길이가 같으면 짝으로 본다.
 PAIRED_MODEL=0
@@ -100,13 +107,21 @@ fi
 
 # 클립 수와 K·temperature 는 러너가 늘 이름에 넣는다. 여기서는 **그 밖의 축 중
 # 실제로 여러 값을 가진 것만** 꼬리에 더한다 — 안 변하는 값으로 이름을 늘리지 않는다.
-LABEL_S=0
-[[ ${#SWEEP_INFERENCE_STEP[@]} -gt 1 ]] && LABEL_S=1
+LABEL_S=0; LABEL_SEED=0; LABEL_T0=0; LABEL_DT=0
+[[ ${#SWEEP_INFERENCE_STEP[@]}        -gt 1 ]] && LABEL_S=1
+[[ ${#SWEEP_SEED[@]}                  -gt 1 ]] && LABEL_SEED=1
+[[ ${#SWEEP_T0_US[@]}                 -gt 1 ]] && LABEL_T0=1
+[[ ${#SWEEP_DIFFUSION_TEMPERATURE[@]} -gt 1 ]] && LABEL_DT=1
 
-make_label() {  # $1=step
-  local out=""
-  [[ "$LABEL_S" == "1" && -n "$1" ]] && out="s$1"
-  printf '%s' "$out"
+# 축이 여럿이면 꼬리도 여럿이다.  안 그러면 확산 온도만 다른 두 arm 이 **같은 디렉토리
+# 이름**을 갖는다 — 러너는 클립 수·K·CoT 온도만 이름에 넣기 때문이다.
+make_label() {  # $1=step $2=seed $3=t0_us $4=diffusion_temperature
+  local parts=()
+  [[ "$LABEL_S"    == "1" && -n "$1" ]] && parts+=("s$1")
+  [[ "$LABEL_SEED" == "1" ]]            && parts+=("seed$2")
+  [[ "$LABEL_T0"   == "1" ]]            && parts+=("t$(( $3 / 100000 ))")     # 0.1초 단위: t51 = 5.1s
+  [[ "$LABEL_DT"   == "1" ]]            && parts+=("dt$4")
+  local IFS='-'; printf '%s' "${parts[*]}"
 }
 
 # ── 조합 만들기 ─────────────────────────────────────────────────────────────
@@ -118,7 +133,13 @@ for vi in "${!SWEEP_VARIANT[@]}"; do
     for k in "${SWEEP_NUM_TRAJ_SAMPLES[@]}"; do
       for t in "${SWEEP_TEMPERATURE[@]}"; do
         for s in "${SWEEP_INFERENCE_STEP[@]}"; do
-          JOBS+=("${v}|${m}|${k}|${t}|${s}|$(make_label "$s")")
+          for sd in "${SWEEP_SEED[@]}"; do
+            for t0us in "${SWEEP_T0_US[@]}"; do
+              for dt in "${SWEEP_DIFFUSION_TEMPERATURE[@]}"; do
+                JOBS+=("${v}|${m}|${k}|${t}|${s}|${sd}|${t0us}|${dt}|$(make_label "$s" "$sd" "$t0us" "$dt")")
+              done
+            done
+          done
         done
       done
     done
@@ -128,11 +149,11 @@ done
 TOTAL=${#JOBS[@]}
 echo
 echo "${BLD}── sweep: ${SWEEP_NAME} ─ ${TOTAL}개 조합 ──────────────────────${OFF}"
-printf "  %-3s %-14s %-6s %-6s %-6s %-12s %s\n" "#" "VARIANT" "K" "temp" "step" "이름꼬리" "MODEL"
+printf "  %-3s %-12s %-4s %-5s %-5s %-5s %-8s %-5s %-16s %s\n" "#" "VARIANT" "K" "temp" "step" "seed" "t0_us" "dτ" "이름꼬리" "MODEL"
 i=0
 for job in "${JOBS[@]}"; do
-  IFS='|' read -r v m k t s lb <<<"$job"; i=$((i+1))
-  printf "  %-3s %-14s %-6s %-6s %-6s %-12s %s\n" "$i" "$v" "$k" "$t" "${s:-기본}" "${lb:--}" "$m"
+  IFS='|' read -r v m k t s sd t0us dt lb <<<"$job"; i=$((i+1))
+  printf "  %-3s %-12s %-4s %-5s %-5s %-5s %-8s %-5s %-16s %s\n" "$i" "$v" "$k" "$t" "${s:-기본}" "$sd" "$t0us" "$dt" "${lb:--}" "$m"
 done
 echo
 echo "  ${DIM}각각이 별개의 MLflow run 이 된다. sweep 태그로 묶인다.${OFF}"
@@ -156,13 +177,16 @@ CLIP_ENV=()
 
 declare -a RESULTS=()
 STARTED=$(date +%s)
+# 60초도 안 돼 죽는 실패가 연달아 나면 조합이 나쁜 게 아니라 **사전점검이 계속 막히는**
+# 것이다 (데이터 캐시·토큰·파이썬 …).  그대로 두면 남은 조합이 전부 몇 분 만에 소진된다.
+FAST_FAILS=0
 i=0
 for job in "${JOBS[@]}"; do
-  IFS='|' read -r v m k t s lb <<<"$job"; i=$((i+1))
+  IFS='|' read -r v m k t s sd t0us dt lb <<<"$job"; i=$((i+1))
   echo
-  echo "${BLD}[$i/$TOTAL] ${v}  K=${k}  temp=${t}${s:+  step=$s}${lb:+  → $lb}${OFF}"
+  echo "${BLD}[$i/$TOTAL] ${v}  K=${k}  temp=${t}${s:+  step=$s}  seed=${sd}  t0=${t0us}  dτ=${dt}${lb:+  → $lb}${OFF}"
   echo "────────────────────────────────────────────────────────────"
-  t0=$(date +%s)
+  t_start=$(date +%s)
   # run.sh 를 그대로 다시 부른다 — 점검이 조합마다 돈다. 설정은 환경변수로 덮는다.
   #
   # `env` 를 거치는 이유:  이 자리에 조건부 변수를 두려면 그 방법밖에 없다.
@@ -172,11 +196,20 @@ for job in "${JOBS[@]}"; do
   # env 의 인자로 넘기면 평범한 확장이라 그 규칙에 걸리지 않는다.
   if env OVERRIDE_VARIANT="$v" OVERRIDE_MODEL="$m" OVERRIDE_NUM_TRAJ_SAMPLES="$k" \
      OVERRIDE_TEMPERATURE="$t" OVERRIDE_INFERENCE_STEP="$s" \
+     OVERRIDE_SEED="$sd" OVERRIDE_T0_US="$t0us" OVERRIDE_DIFFUSION_TEMPERATURE="$dt" \
      "${CLIP_ENV[@]}" SWEEP="$SWEEP_NAME" LABEL="$lb" \
      bash "$HERE/run.sh"; then
-    RESULTS+=("${GRN}완료${OFF}|$v|$k|$t|$(( $(date +%s) - t0 ))초")
+    RESULTS+=("${GRN}완료${OFF}|$v|$k|$t|$(( $(date +%s) - t_start ))초")
+    FAST_FAILS=0
   else
-    RESULTS+=("${RED}실패${OFF}|$v|$k|$t|$(( $(date +%s) - t0 ))초")
+    el=$(( $(date +%s) - t_start ))
+    RESULTS+=("${RED}실패${OFF}|$v|$k|$t|${el}초")
+    if [[ "$el" -lt 60 ]]; then FAST_FAILS=$((FAST_FAILS+1)); else FAST_FAILS=0; fi
+    if [[ "$FAST_FAILS" -ge 2 ]]; then
+      echo "${RED}60초 안에 죽는 실패가 2번 연속 — 조합 문제가 아니라 큐 드레인이다. 여기서 멈춘다.${OFF}" >&2
+      echo "${DIM}위 실패의 사전점검 출력을 보고 고친 뒤, 남은 조합만 다시 건다.${OFF}" >&2
+      break
+    fi
     if [[ "$CONTINUE_ON_FAILURE" != "1" ]]; then
       echo "${RED}CONTINUE_ON_FAILURE=0 — 여기서 멈춘다.${OFF}" >&2
       break

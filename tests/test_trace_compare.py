@@ -296,6 +296,21 @@ def test_arms_run_at_different_settings_are_refused(tmp_path):
     assert statuses(table)["config"] == "fail"
 
 
+def test_arms_with_different_seed_schemes_are_refused(tmp_path):
+    """Per-clip bare re-seeding and clip-hash seeding are two sampling
+    procedures. The first made sample index 0 sit 0.5 m off the others; the
+    second does not. Comparing them under one name attributes that difference
+    to whatever the axis happens to be."""
+    write_run(tmp_path, 10, seed_scheme="clip-hash")
+    write_run(tmp_path, 4, seed_scheme="per-clip")
+    runs = C.discover_runs(tmp_path)
+
+    table = C.gate(C.load_per_clip(runs), runs)
+
+    assert statuses(table)["config"] == "fail"
+    assert "seed_scheme" in table.set_index("check").at["config", "detail"]
+
+
 def test_arms_covering_different_clips_are_refused(tmp_path):
     """An arm that died on the hard clips scores best on what it finished."""
     write_run(tmp_path, 10, n=8)

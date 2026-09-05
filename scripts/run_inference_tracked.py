@@ -39,6 +39,7 @@ and therefore the latency, so runs on either side of that are not comparable.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -117,6 +118,15 @@ _CLIP_COORDS = frozenset({"t0_us"})
 _BUCKET_METRICS = ("min_ade", "mean_ade", "min_fde", "sample_gain", "diversity_final_m")
 
 
+# The snapshot every cached chunk was downloaded from. Passed explicitly
+# because `PhysicalAIAVDatasetInterface(revision=None)` resolves `main` over
+# the network at construction time: the day NVIDIA pushes a commit, every clip
+# misses the cache and raises -- or, with --allow-stream, silently re-downloads
+# 79 GB. For a run that has to survive a week unattended, the revision is part
+# of the experiment definition, not an environment detail.
+DATASET_REVISION = "b719eea7f0a63619ef51ec7f54178af0937ef050"
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--clip-id", action="append", help="Repeat for several clips.")
@@ -130,7 +140,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inference-step", type=int, default=None,
                    help="Diffusion Euler steps. 0 is rejected: the sampler reads it as "
                         "'unset' and silently runs its default, corrupting any latency number.")
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=42,
+                   help="XORed with a hash of each clip id before seeding, so every clip "
+                        "starts the CUDA generator at its own point. Re-seeding every clip "
+                        "with the same value made sample k always draw the same slice of the "
+                        "stream, and sample 0 came out 0.5 m worse than the others.")
+    p.add_argument("--diffusion-temperature", type=float, default=1.0,
+                   help="Scale on the flow head's initial noise. 1.0 is the training prior. "
+                        "Distinct from --temperature, which is the CoT text temperature.")
+    p.add_argument("--dataset-revision", default=DATASET_REVISION,
+                   help="Dataset snapshot to read from the cache. Pinned; see DATASET_REVISION.")
+    p.add_argument("--split", default=None,
+                   help="Comma-separated subset of the clip list's `split` column, e.g. "
+                        "val,test. Keeps evaluation clips out of any training run.")
     p.add_argument("--model", default=MODEL_REPO)
     p.add_argument("--attn", default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
     p.add_argument("--variant", default="Vanilla", help="Vanilla, Pruned-24L, INT8 ...")
@@ -169,7 +191,18 @@ def resolve_clips(args: argparse.Namespace) -> list[str]:
     if args.clip_list:
         import pandas as pd
 
-        clips = pd.read_parquet(args.clip_list)["clip_id"].tolist()
+        table = pd.read_parquet(args.clip_list)
+        if args.split:
+            wanted = [x.strip() for x in args.split.split(",") if x.strip()]
+            if "split" not in table.columns:
+                raise SystemExit(
+                    f"--split {args.split} asked for, but {args.clip_list} has no `split` "
+                    "column. Use notebooks/clip_ids_cached1300.parquet, which carries one."
+                )
+            table = table[table["split"].isin(wanted)]
+            if not len(table):
+                raise SystemExit(f"no clips in {args.clip_list} with split in {wanted}")
+        clips = table["clip_id"].tolist()
         return clips[: args.limit] if args.limit else clips
     return [DEFAULT_CLIP]
 
@@ -219,6 +252,27 @@ def render_sample(result: dict, data: dict, path: Path) -> bool:
         return False
 
 
+def clip_seed(seed: int, clip_id: str) -> int:
+    """The seed for one clip: the run seed XORed with a hash of the clip id.
+
+    Seeding every clip with the same value is what made the K samples
+    non-exchangeable. Each clip then started the CUDA Philox generator from
+    the same state, and because the CoT decode consumes only a small,
+    similar-sized slice before the trajectory noise is drawn, sample k landed
+    on nearly the same counter range every time. Over 1181 clips the per-index
+    means never averaged out: sample 0 sat 1.32 m from the sample centroid
+    against 0.78-1.07 m for the others and scored 0.51 m worse in ADE.
+
+    XOR with a clip hash keeps what mattered about per-clip seeding -- the same
+    clip gives the same trajectories in every arm, so arms stay paired -- and
+    makes the result independent of which other clips are in the list and in
+    what order. Seeding once at the start of the run would not: a different
+    --clip-list would then change what every clip after the first sees.
+    """
+    digest = hashlib.blake2b(clip_id.encode(), digest_size=4).hexdigest()
+    return seed ^ int(digest, 16)
+
+
 def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple[list[dict], dict]:
     """Inference for one clip. Returns one row per sample, plus per-clip extras."""
     data = load_physical_aiavdataset(
@@ -239,11 +293,11 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
         },
         "cuda",
     )
-    diffusion_kwargs = {}
+    diffusion_kwargs = {"temperature": args.diffusion_temperature}
     if args.inference_step is not None:
         diffusion_kwargs["inference_step"] = args.inference_step
 
-    torch.cuda.manual_seed_all(args.seed)
+    torch.cuda.manual_seed_all(clip_seed(args.seed, clip_id))
     with trace_inference(model) as tracer:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
@@ -356,6 +410,13 @@ def main() -> None:
         "max_generation_length": args.max_generation_length,
         "inference_step": args.inference_step,
         "seed": args.seed,
+        # How the seed reaches the generator. Runs before this scheme existed
+        # re-seeded every clip with the bare value; they must not share an
+        # MLflow axis with these, because their samples are not exchangeable.
+        "seed_scheme": "clip-hash",
+        "diffusion_temperature": args.diffusion_temperature,
+        "dataset_revision": args.dataset_revision,
+        "split": args.split,
         "attn_impl": args.attn,
         "dtype": "bfloat16",
         "t0_us": args.t0_us,
@@ -381,7 +442,9 @@ def main() -> None:
     }
 
     def execute(run: mlp.Run | None) -> None:
-        avdi = physical_ai_av.PhysicalAIAVDatasetInterface(cache_dir=args.data_cache)
+        avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
+            cache_dir=args.data_cache, revision=args.dataset_revision
+        )
         model = Alpamayo1_5.from_pretrained(
             args.model, dtype=torch.bfloat16, attn_implementation=args.attn
         ).to("cuda").eval()
@@ -451,6 +514,8 @@ def main() -> None:
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "seed": args.seed,
+                "seed_scheme": "clip-hash",
+                "diffusion_temperature": args.diffusion_temperature,
                 "num_traj_samples": args.num_traj_samples,
                 "conditioning_source": "generated",
             },
