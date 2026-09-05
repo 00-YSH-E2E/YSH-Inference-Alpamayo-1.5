@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--name", default="sweep", help="Name for the output directory.")
     p.add_argument("--axis", default="inference_step",
                    help="per_clip column separating the arms.")
-    p.add_argument("--baseline", type=int, default=None,
+    p.add_argument("--baseline", type=float, default=None,
                    help="Axis value everything is compared against. "
                         "Defaults to the largest.")
     p.add_argument("--metrics", default=",".join(C.DEFAULT_METRICS))
@@ -225,7 +225,7 @@ def main() -> int:
     per_clip = C.load_per_clip(runs, axis=args.axis)
     arms = C.arm_order(per_clip, baseline=args.baseline)
     gate_table = C.gate(per_clip, runs, baseline=args.baseline,
-                        allow_partial=args.allow_partial)
+                        allow_partial=args.allow_partial, axis=args.axis)
 
     print("\n-- gate " + "-" * 63)
     for r in gate_table.itertuples():

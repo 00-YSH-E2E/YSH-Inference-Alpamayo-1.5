@@ -158,6 +158,27 @@ def test_call_counts_reach_the_parquet():
     assert frame["n_expert_calls"].iloc[0] == 10
 
 
+def test_x0_is_stored_flat_beside_the_prediction_it_produced():
+    """The flow head's initial noise is the other irrecoverable input.
+
+    A one-step student is scored on reproducing the teacher's map from this
+    tensor to the trajectory, point by point; without it the only pairing key
+    is the clip, and six samples of one clip are then indistinguishable.
+    """
+    x0 = np.arange(8, dtype=np.float32).reshape(4, 2)
+    frame = W.build_rows([sample(x0=x0)], {})
+
+    assert frame["x0"].iloc[0] == x0.reshape(-1).tolist()
+    assert W._ARRAY_SHAPES["x0"] == ("T", 2), "a reader reshapes it like pred_xy"
+
+
+def test_a_row_without_x0_is_null_not_zero():
+    """A run made without the tracer lacks the column; it did not draw zeros."""
+    frame = W.build_rows([sample()], {})
+
+    assert frame["x0"].iloc[0] is None
+
+
 def test_config_columns_repeat_on_every_row():
     """Repetition is what makes cross-run concatenation work."""
     rows = [sample(k) for k in range(3)]

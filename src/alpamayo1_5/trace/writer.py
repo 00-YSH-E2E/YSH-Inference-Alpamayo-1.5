@@ -76,12 +76,19 @@ import pandas as pd
 #    written as 0 into run.json by a reader that asked the row for a key the row
 #    never carried, so refusing to concatenate v1 with v2 is the right outcome
 #    rather than an inconvenience.
-SCHEMA_VERSION = 2
+# 3: x0, seed_scheme, diffusion_temperature. Version 2 runs re-seeded every
+#    clip with the bare seed, which made their K samples non-exchangeable
+#    (sample 0 sat 0.5 m off the others); version 3 runs XOR a clip hash. The
+#    samples in the two are drawn by different procedures, so a comparison
+#    across the boundary would attribute that difference to whatever axis it
+#    was grouped on. Refusing to concatenate them is, again, the point.
+SCHEMA_VERSION = 3
 
 # Columns whose values are flat float32 arrays. Stored as lists; the trailing
 # shape is recorded in run.json so a reader can reshape without guessing.
 _ARRAY_SHAPES = {
     "pred_xy": ("T", 2),
+    "x0": ("T", 2),
     "pred_rot": ("T", 3, 3),
     "hist_xy": ("N_hist", 2),
     "hist_rot": ("N_hist", 3, 3),
@@ -199,6 +206,10 @@ def build_rows(samples: Iterable[dict], config: dict) -> pd.DataFrame:
             "sample_k": int(s["sample_k"]),
             # model output -- irrecoverable
             "pred_xy": _flat(s["pred_xy"]),
+            # model input to the flow head -- equally irrecoverable, and the
+            # thing a step-distilled student is paired against. None when the
+            # tracer did not run.
+            "x0": _flat(s["x0"]) if s.get("x0") is not None else None,
             "pred_rot": _flat(s["pred_rot"]) if s.get("pred_rot") is not None else None,
             # model input -- without this the kinematics cannot be recomputed
             "hist_xy": _flat(s["hist_xy"]),

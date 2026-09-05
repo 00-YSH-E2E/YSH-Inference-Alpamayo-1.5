@@ -150,6 +150,9 @@ def parse_args() -> argparse.Namespace:
                         "Distinct from --temperature, which is the CoT text temperature.")
     p.add_argument("--dataset-revision", default=DATASET_REVISION,
                    help="Dataset snapshot to read from the cache. Pinned; see DATASET_REVISION.")
+    p.add_argument("--flush-every", type=int, default=100,
+                   help="Rewrite the run directory every N clips, so a crash at clip "
+                        "1299 of 1300 loses N clips rather than the run. 0 disables.")
     p.add_argument("--split", default=None,
                    help="Comma-separated subset of the clip list's `split` column, e.g. "
                         "val,test. Keeps evaluation clips out of any training run.")
@@ -202,6 +205,11 @@ def resolve_clips(args: argparse.Namespace) -> list[str]:
             table = table[table["split"].isin(wanted)]
             if not len(table):
                 raise SystemExit(f"no clips in {args.clip_list} with split in {wanted}")
+        # The split rides on the clip so per_clip.parquet can be cut by it
+        # offline: a headline computed over training-split clips is a leak, and
+        # nothing downstream can tell unless the row says which split it was.
+        if "split" in table.columns:
+            args.clip_split = dict(zip(table["clip_id"], table["split"]))
         clips = table["clip_id"].tolist()
         return clips[: args.limit] if args.limit else clips
     return [DEFAULT_CLIP]
@@ -345,7 +353,8 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
     # (clip_id, t0_us), and it is degenerate only for as long as nobody sweeps
     # the sample timestamp. Carry it here rather than in the config columns so
     # it stays a per-row value when that day comes.
-    extras = {"clip_id": clip_id, "t0_us": args.t0_us, "gt_xy": gt_xy, "data": data}
+    extras = {"clip_id": clip_id, "t0_us": args.t0_us, "gt_xy": gt_xy, "data": data,
+              "split": getattr(args, "clip_split", {}).get(clip_id)}
     if gt_xy is not None:
         # Pass the checkpoint's own dt rather than letting the 0.1 default
         # stand. The horizon labels (ade_1.0s and friends) are derived from it,
@@ -466,6 +475,32 @@ def main() -> None:
             args.variant, date, run_id, data=args.data_spec, machine=machine,
             label=label,
         )
+        config = {
+            "run_id": run_id,
+            "variant": args.variant,
+            "git_commit": mlp.git_tags(REPO_ROOT).get("git_commit"),
+            "columns": {
+                "model": args.model,
+                "data_spec": args.data_spec,
+                "attn_impl": args.attn,
+                "dtype": "bfloat16",
+                "inference_step": args.inference_step,
+                "max_new_tokens": args.max_generation_length,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "seed": args.seed,
+                "seed_scheme": "clip-hash",
+                "diffusion_temperature": args.diffusion_temperature,
+                "num_traj_samples": args.num_traj_samples,
+                "conditioning_source": "generated",
+            },
+        }
+        # Written on every flush and at the end. Everything here is known before
+        # the first clip, so there is no reason for it to wait for the last.
+        identity = {
+            "run_id": run_id, "variant": args.variant, "date": date,
+            "machine": machine, "clips": clips, "params": params,
+        }
         rows, per_clip, gt_rows = [], [], []
         # Throttling moves latency without moving anything else, and after the
         # run there is no way to tell that from a regression.
@@ -492,6 +527,15 @@ def main() -> None:
                         out_dir / "samples" / f"{clip_id}.png",
                     )
                 extras.pop("data", None)  # frames are large; do not hold them for the whole run
+                # A partial run directory is a valid one. It carries every row
+                # finished so far and a run.json that says it is partial, so a
+                # crash costs at most flush_every clips and the analysis can
+                # still read what completed. The final write below replaces it.
+                done = i + 1
+                if args.flush_every and done % args.flush_every == 0 and done < len(clips):
+                    W.write_run(out_dir, rows, config,
+                                {**identity, "partial": True, "n_clips_done": done},
+                                gt=gt_rows if args.include_gt else None, per_clip=per_clip)
                 reading = thermal.sample()
                 print(
                     f"[{i + 1}/{len(clips)}] {clip_id[:8]} "
@@ -500,34 +544,14 @@ def main() -> None:
                     f"tj {reading.get('tj-thermal', float('nan')):.0f}C"
                 )
 
-        config = {
-            "run_id": run_id,
-            "variant": args.variant,
-            "git_commit": mlp.git_tags(REPO_ROOT).get("git_commit"),
-            "columns": {
-                "model": args.model,
-                "data_spec": args.data_spec,
-                "attn_impl": args.attn,
-                "dtype": "bfloat16",
-                "inference_step": args.inference_step,
-                "max_new_tokens": args.max_generation_length,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "seed": args.seed,
-                "seed_scheme": "clip-hash",
-                "diffusion_temperature": args.diffusion_temperature,
-                "num_traj_samples": args.num_traj_samples,
-                "conditioning_source": "generated",
-            },
-        }
         space = model.action_space
         meta = {
-            "run_id": run_id,
-            "variant": args.variant,
-            "date": date,
-            "machine": machine,
-            "clips": clips,
-            "params": params,
+            **identity,
+            # Explicit, so a reader that finds a run.json can tell a finished
+            # run from a flush that happened to be the last thing written
+            # before the process died.
+            "partial": False,
+            "n_clips_done": len(clips),
             # Normalization differs per checkpoint; without it, kinematics
             # recomputed offline are quietly wrong.
             "accel_mean": float(space.accel_mean),

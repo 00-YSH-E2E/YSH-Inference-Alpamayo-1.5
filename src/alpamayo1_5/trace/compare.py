@@ -121,6 +121,25 @@ METRIC_DIRECTION = {
 DIVERSITY_COLUMNS = ("diversity_mean_m", "diversity_final_m", "diversity_max_m")
 
 
+# Display prefix per axis, so an arm reads as what it is: s10 is ten Euler
+# steps, dt0.5 is a diffusion temperature of 0.5, K16 is sixteen samples. The
+# value is recovered by stripping the alphabetic prefix, which is why prefixes
+# contain no digits.
+_AXIS_PREFIX = {
+    "inference_step": "s", "diffusion_temperature": "dt", "num_traj_samples": "K",
+    "seed": "seed", "t0_us": "t", "temperature": "temp",
+}
+
+
+def axis_prefix(axis: str) -> str:
+    return _AXIS_PREFIX.get(axis, axis.rstrip("0123456789")[:3] or "a")
+
+
+def arm_value(arm: str) -> float:
+    """The axis value an arm label encodes: ``s10`` -> 10.0, ``dt0.5`` -> 0.5."""
+    return float(arm.lstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"))
+
+
 class GateError(RuntimeError):
     """A comparison was refused. Carries the gate table for reporting."""
 
@@ -308,11 +327,22 @@ def load_per_clip(
         df = df.copy()
         df["run_dir"] = r.run_dir
         raw = df[axis] if axis in df.columns else pd.Series([None] * len(df))
-        df["step"] = pd.to_numeric(raw, errors="coerce").astype("Int64")
+        numeric = pd.to_numeric(raw, errors="coerce")
+        # `step` is the axis value whatever the axis is. It is an integer only
+        # for a step count; a temperature or a seed keeps its float form.
+        df["step"] = numeric.astype("Int64") if axis == "inference_step" else numeric.astype(float)
         df["step_source"] = "declared"
         if df["step"].isna().any():
             need_fallback.append(r.run_dir)
         frames.append(df)
+
+    # n_expert_calls recovers a missing *step count* and nothing else: a null
+    # temperature or seed has no executed-count to fall back on.
+    if need_fallback and axis != "inference_step":
+        raise ValueError(
+            f"`{axis}` is null for: {', '.join(need_fallback)}. Only inference_step "
+            "can be recovered from the executed expert-call count."
+        )
 
     if need_fallback:
         if executed is None:
@@ -341,11 +371,12 @@ def load_per_clip(
         )
 
     out = pd.concat(frames, ignore_index=True)
-    out["arm"] = "s" + out["step"].astype(int).astype(str)
+    prefix = axis_prefix(axis)
+    out["arm"] = out["step"].map(lambda v: f"{prefix}{float(v):g}")
     return out
 
 
-def arm_order(per_clip: pd.DataFrame, baseline: int | None = None) -> list[str]:
+def arm_order(per_clip: pd.DataFrame, baseline: float | None = None) -> list[str]:
     """Arms with the baseline first, then descending by step.
 
     Descending because the axis is a reduction: ten steps is the reference and
@@ -357,10 +388,10 @@ def arm_order(per_clip: pd.DataFrame, baseline: int | None = None) -> list[str]:
              .sort_values("step", ascending=False))
     arms = list(pairs["arm"])
     if baseline is not None:
-        want = f"s{int(baseline)}"
-        if want not in arms:
+        want = next((a for a in arms if arm_value(a) == float(baseline)), None)
+        if want is None:
             raise ValueError(
-                f"baseline {want} is not among the arms: {', '.join(arms) or '(none)'}"
+                f"baseline {baseline:g} is not among the arms: {', '.join(arms) or '(none)'}"
             )
         arms.remove(want)
         arms.insert(0, want)
@@ -414,8 +445,9 @@ def gate(
     runs: pd.DataFrame,
     executed: pd.DataFrame | None = None,
     tokens: pd.DataFrame | None = None,
-    baseline: int | None = None,
+    baseline: float | None = None,
     allow_partial: bool = False,
+    axis: str = "inference_step",
 ) -> pd.DataFrame:
     """Everything that must be true before a paired difference means anything.
 
@@ -447,7 +479,7 @@ def gate(
     clips diverging that way is a different thing from a systematic mismatch.
     """
     rows: list[dict[str, Any]] = []
-    arms = sorted(per_clip["arm"].unique(), key=lambda a: -int(a[1:]))
+    arms = sorted(per_clip["arm"].unique(), key=lambda a: -arm_value(a))
     by_arm = {a: g for a, g in per_clip.groupby("arm", dropna=False)}
 
     # 1 -- schema version
@@ -464,7 +496,7 @@ def gate(
                          ", ".join(arms), len(arms)))
 
     # 2 -- enough arms, distinct, baseline present
-    steps = sorted({int(s) for s in per_clip["step"].dropna().unique()})
+    steps = sorted({float(s) for s in per_clip["step"].dropna().unique()})
     if len(arms) < 2:
         rows.append(_row("arms", "fail",
                          f"only {len(arms)} arm ({', '.join(arms) or 'none'}) -- "
@@ -474,12 +506,13 @@ def gate(
                          f"{len(arms)} arms but {len(steps)} distinct steps -- "
                          "two runs share a step and would be averaged together",
                          ", ".join(arms), len(arms)))
-    elif baseline is not None and f"s{int(baseline)}" not in arms:
+    elif baseline is not None and not any(arm_value(a) == float(baseline) for a in arms):
         rows.append(_row("arms", "fail",
-                         f"baseline s{int(baseline)} is not present; have {', '.join(arms)}",
+                         f"baseline {baseline:g} is not present; have {', '.join(arms)}",
                          ", ".join(arms), len(arms)))
     else:
-        rows.append(_row("arms", "ok", f"{len(arms)} arms at steps {steps}",
+        shown = ", ".join(f"{v:g}" for v in steps)
+        rows.append(_row("arms", "ok", f"{len(arms)} arms at {axis} = [{shown}]",
                          ", ".join(arms), len(arms)))
 
     # 3 -- what actually executed
@@ -493,31 +526,44 @@ def gate(
         if e.run_dir not in dir_to_arm.index:
             continue
         a = dir_to_arm.at[e.run_dir, "arm"]
-        step = int(dir_to_arm.at[e.run_dir, "step"])
+        step = float(dir_to_arm.at[e.run_dir, "step"])
         if pd.isna(e.n_expert_calls_min):
             missing.append(a)
         elif e.n_expert_calls_min != e.n_expert_calls_max:
             varied.append(f"{a}: {e.n_expert_calls_min:g}..{e.n_expert_calls_max:g}")
-        else:
+        elif axis == "inference_step":
             ratios[a] = float(e.n_expert_calls_min) / step
+        else:
+            # On any other axis the step count is held fixed, so the executed
+            # count must simply agree across arms. A drift here means one arm
+            # ran a different number of steps under a label that says otherwise.
+            ratios[a] = float(e.n_expert_calls_min)
     distinct = sorted(set(round(v, 6) for v in ratios.values()))
     if varied:
         rows.append(_row("executed_steps", "fail",
                          "n_expert_calls is not constant within an arm: "
                          + "; ".join(varied), ", ".join(sorted(set(varied)))))
-    elif len(distinct) > 1:
+    elif len(distinct) > 1 and axis == "inference_step":
         worst = ", ".join(f"{a}={ratios[a]:g} calls/step" for a in arms if a in ratios)
         rows.append(_row("executed_steps", "fail",
                          "calls-per-step differs across arms, so at least one arm did "
                          f"not run the step count it claims: {worst}. `inference_step "
                          "or num_inference_steps` in flow_matching means a falsy value "
                          "silently runs the default.", ", ".join(sorted(ratios))))
+    elif len(distinct) > 1:
+        worst = ", ".join(f"{a}={ratios[a]:g} calls" for a in arms if a in ratios)
+        rows.append(_row("executed_steps", "fail",
+                         f"the axis is {axis}, so every arm should have run the same "
+                         f"number of expert calls, and they did not: {worst}",
+                         ", ".join(sorted(ratios))))
     elif not ratios:
         rows.append(_row("executed_steps", "warn",
                          "no predictions.parquet to read n_expert_calls from -- the "
                          "step counts are taken on trust", ", ".join(missing)))
     else:
-        note = f"{distinct[0]:g} expert call(s) per declared step, same in every arm"
+        note = (f"{distinct[0]:g} expert call(s) per declared step, same in every arm"
+                if axis == "inference_step" else
+                f"{distinct[0]:g} expert calls in every arm ({axis} held the step count fixed)")
         rows.append(_row("executed_steps", "ok" if not missing else "warn",
                          note + ("" if not missing
                                  else f"; unverified for {', '.join(missing)}"),
@@ -947,7 +993,7 @@ def build_tables(
     delta_point = ratio_deltas(point)
     lo, hi = percentile_interval(delta_block, level)
 
-    steps = [int(a[1:]) for a in arms]
+    steps = [arm_value(a) for a in arms]
     rows: list[dict[str, Any]] = []
     for g, label in enumerate(labels):
         sel = masks[g]

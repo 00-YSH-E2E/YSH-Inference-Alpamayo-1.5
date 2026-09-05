@@ -232,6 +232,44 @@ def test_arm_order_puts_the_baseline_first(tmp_path):
         C.arm_order(per_clip, baseline=7)
 
 
+def test_a_float_axis_labels_arms_by_its_own_prefix(tmp_path):
+    """A diffusion-temperature sweep holds the step count at ten and varies
+    the noise scale. Its arms are dt1 and dt0.5, not s10 twice."""
+    write_run(tmp_path, 10, name="hot", diffusion_temperature=1.0)
+    write_run(tmp_path, 10, name="cold", diffusion_temperature=0.5)
+
+    per_clip = C.load_per_clip(C.discover_runs(tmp_path), axis="diffusion_temperature")
+
+    assert set(per_clip["arm"]) == {"dt1", "dt0.5"}
+    assert per_clip["step"].dtype == float
+    assert C.arm_order(per_clip, baseline=1.0) == ["dt1", "dt0.5"]
+    assert C.arm_value("dt0.5") == 0.5 and C.arm_value("s10") == 10.0
+
+
+def test_on_a_non_step_axis_the_expert_call_check_demands_constancy(tmp_path):
+    """With the step count held fixed, the executed call count must not move.
+    If it does, one arm ran a different number of steps under a label that
+    says only the temperature changed."""
+    write_run(tmp_path, 10, name="hot", diffusion_temperature=1.0, calls=10)
+    write_run(tmp_path, 10, name="cold", diffusion_temperature=0.5, calls=4)
+    runs = C.discover_runs(tmp_path)
+    per_clip = C.load_per_clip(runs, axis="diffusion_temperature")
+
+    table = C.gate(per_clip, runs, axis="diffusion_temperature")
+
+    assert statuses(table)["executed_steps"] == "fail"
+
+
+def test_a_null_value_on_a_non_step_axis_is_refused_not_recovered(tmp_path):
+    """n_expert_calls can stand in for a missing step count. It says nothing
+    about a missing temperature, so there is nothing to recover from."""
+    write_run(tmp_path, 10, name="hot", diffusion_temperature=1.0)
+    write_run(tmp_path, 10, name="nan", diffusion_temperature=float("nan"))
+
+    with pytest.raises(ValueError, match="Only inference_step"):
+        C.load_per_clip(C.discover_runs(tmp_path), axis="diffusion_temperature")
+
+
 # -- the gate --------------------------------------------------------------
 
 def statuses(table):

@@ -82,6 +82,13 @@ class TokenTrace:
     n_cot: np.ndarray  # [K] tokens inside the reasoning span
     eos_missing: np.ndarray  # [K] bool -- ran to max_new_tokens without the marker
     prompt_len: int
+    #: ``[K, T, 2]`` -- the flow head's initial condition, as it entered the
+    #: first Euler step (so already multiplied by the diffusion temperature).
+    #: The other irrecoverable input: the ten-step teacher is a deterministic
+    #: map from this tensor to the trajectory, and a one-step student is judged
+    #: on reproducing that map point by point. Without x0 there is nothing to
+    #: pair student and teacher on except the clip, which is far too coarse.
+    x0: np.ndarray | None = None
 
     def sample(self, k: int) -> dict[str, Any]:
         """Row ``k``, trimmed to its own valid length."""
@@ -99,6 +106,7 @@ class TokenTrace:
             # run.json written so far carries prompt_len 0, which reads as a
             # real measurement and slices an offline reader into the padding.
             "prompt_len": int(self.prompt_len),
+            "x0": self.x0[k] if self.x0 is not None else None,
         }
 
 
@@ -175,6 +183,7 @@ class InferenceTracer:
             self.ids.update(special_token_ids)
         self.trace: TokenTrace | None = None
         self.timing = SegmentTiming()
+        self._x0: Any = None
         self._handles: list[Any] = []
         self._saved: dict[str, Any] = {}
         self._events: dict[str, list] = {}
@@ -226,6 +235,15 @@ class InferenceTracer:
             self._handles.append(
                 language.register_forward_hook(lambda *_: self._mark("lm", "end"))
             )
+
+        # The flow head's initial condition. step_fn calls action_in_proj(x, t)
+        # once per Euler step, and on the first call x is the noise the sampler
+        # just drew. Captured here rather than by changing the sampler, so the
+        # upstream file stays untouched and a run made without the tracer is
+        # simply missing the column rather than behaving differently.
+        proj = getattr(self.model, "action_in_proj", None)
+        if proj is not None:
+            self._handles.append(proj.register_forward_pre_hook(self._capture_x0))
 
         # Trajectory head: one call per Euler step.
         expert = getattr(self.model, "expert", None)
@@ -282,11 +300,20 @@ class InferenceTracer:
 
         return wrapper
 
+    def _capture_x0(self, module: Any, args: tuple) -> None:
+        """Keep the first action_in_proj input of a sample() call; ignore the rest."""
+        if self._x0 is None and args:
+            self._x0 = args[0].detach()
+
     def _wrap_sample(self, original: Any) -> Any:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            self._x0 = None
             self._mark("diffusion", "start")
             out = original(*args, **kwargs)
             self._mark("diffusion", "end")
+            # generate() ran first and built self.trace; the noise only exists now.
+            if self.trace is not None and self._x0 is not None:
+                self.trace.x0 = self._x0.float().cpu().numpy()
             return out
 
         return wrapper

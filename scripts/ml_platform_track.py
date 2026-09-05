@@ -287,39 +287,54 @@ def upload_run_dir(
     """
     try:
         from huggingface_hub import CommitOperationAdd, HfApi
-
-        operations = []
-        for path in paths:
-            # Preserve the samples/ subdirectory; everything else sits at the top
-            # of the run directory.
-            leaf = f"samples/{path.name}" if path.parent.name == "samples" else path.name
-            operations.append(
-                CommitOperationAdd(
-                    path_in_repo=f"{path_in_repo}/{leaf}", path_or_fileobj=str(path)
-                )
-            )
-        if not operations:
-            print("[ml_platform] nothing to upload -- the run directory is empty",
-                  file=sys.stderr)
-            return None
-        # Pass the token explicitly. Relying on ambient auth means a machine
-        # where nobody ran `hf auth login` degrades to a local-only run that
-        # still looks recorded.
-        api = HfApi(token=_hf_token() or None)
-        api.create_repo(repo_id=repo, repo_type="dataset", private=True, exist_ok=True)
-        info = api.create_commit(
-            repo_id=repo,
-            repo_type="dataset",
-            operations=operations,
-            commit_message=commit_message or f"Add run {path_in_repo}",
-        )
-        return getattr(info, "oid", None)
-    except Exception as exc:
-        # Returning None is not enough on its own: the caller must record that
-        # this happened, or the run claims a local path as its archive and
-        # passes its own rules. See Run.check().
+    except ImportError as exc:
         print(f"[ml_platform] upload failed, outputs stay local: {exc}", file=sys.stderr)
         return None
+
+    operations = []
+    for path in paths:
+        # Preserve the samples/ subdirectory; everything else sits at the top
+        # of the run directory.
+        leaf = f"samples/{path.name}" if path.parent.name == "samples" else path.name
+        operations.append(
+            CommitOperationAdd(path_in_repo=f"{path_in_repo}/{leaf}", path_or_fileobj=str(path))
+        )
+    if not operations:
+        print("[ml_platform] nothing to upload -- the run directory is empty", file=sys.stderr)
+        return None
+
+    # Three attempts with backoff. A run directory is the only durable record
+    # of an hour of GPU time, and on this machine the disk it sits on does not
+    # survive a recycle. One transient HTTP error during a week-long unattended
+    # sweep must not be what decides whether that hour existed.
+    for attempt in range(1, 4):
+        try:
+            # Pass the token explicitly. Relying on ambient auth means a machine
+            # where nobody ran `hf auth login` degrades to a local-only run that
+            # still looks recorded.
+            api = HfApi(token=_hf_token() or None)
+            api.create_repo(repo_id=repo, repo_type="dataset", private=True, exist_ok=True)
+            info = api.create_commit(
+                repo_id=repo,
+                repo_type="dataset",
+                operations=operations,
+                commit_message=commit_message or f"Add run {path_in_repo}",
+            )
+            return getattr(info, "oid", None)
+        except Exception as exc:
+            if attempt < 3:
+                wait = 20 * attempt
+                print(f"[ml_platform] upload attempt {attempt}/3 failed ({exc}); "
+                      f"retrying in {wait}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            # Returning None is not enough on its own: the caller must record
+            # that this happened, or the run claims a local path as its archive
+            # and passes its own rules. See Run.check().
+            print(f"[ml_platform] upload failed after 3 attempts, outputs stay local: {exc}",
+                  file=sys.stderr)
+            return None
+    return None
 
 
 # -- run -------------------------------------------------------------------
