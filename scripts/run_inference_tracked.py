@@ -477,7 +477,6 @@ def main() -> None:
                     "without being paired. Load a student checkpoint (its config names "
                     "ShortcutFlowMatching), or drop --x0-from."
                 )
-            import numpy as np
             import pandas as pd
             t = pd.read_parquet(args.x0_from, columns=["clip_id", "sample_k", "x0"])
             if t["x0"].isna().any():
