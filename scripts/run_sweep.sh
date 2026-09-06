@@ -53,7 +53,7 @@ SWEEP_CLIP_LIST="notebooks/clip_ids.parquet"            # 전체 1181 (gold 를 
 CONTINUE_ON_FAILURE=1
 
 # 진짜로 돌리기 전에 무엇이 돌지만 본다
-DRY_RUN=0
+DRY_RUN="${DRY_RUN:-0}"                 # 환경에서 DRY_RUN=1 을 주면 조합 표만 찍고 끝낸다
 
 # 축을 **파일로** 주입할 수도 있다:   SWEEP_CONFIG=sweeps/B_euler_steps_1300.sh ./scripts/run_sweep.sh
 #   위 [축] 을 제자리에서 고치면 트리가 dirty 해져서 그 sweep 의 모든 arm 이 거짓 git_commit 을
