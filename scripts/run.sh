@@ -194,6 +194,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # run_sweep.sh 가 조합마다 덮어쓰는 자리. 위 설정 블록은 손대지 않는다 —
 # 거기에 ${VAR:-기본값} 을 쓰면 읽기 어려워지고, 무엇이 기본값인지 흐려진다.
 VARIANT="${OVERRIDE_VARIANT:-$VARIANT}"
+# 이 run 이 왜 있는지.  설정 블록의 NOTES 는 추적되는 값이라 한 실험의 문구가 다음 실험까지
+# 남기 쉽다 — 그대로 두면 다른 run 이 그 설명을 달고 MLflow 에 기록된다.  run 마다 여기로 준다
+NOTES="${OVERRIDE_NOTES:-$NOTES}"
 MODEL="${OVERRIDE_MODEL:-$MODEL}"
 MODEL_REVISION="${OVERRIDE_MODEL_REVISION:-$MODEL_REVISION}"
 # 클립 목록은 **비교 축이 아니라 실험의 경계**다. 한 sweep 안에서 바뀌면 arm 마다
