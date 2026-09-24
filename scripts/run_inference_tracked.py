@@ -226,6 +226,11 @@ def parse_args() -> argparse.Namespace:
                    help="Extra passes per repeated clip, for the latency noise band.")
     p.add_argument("--repeat-clips", type=int, default=5,
                    help="How many clips, from the start, get --timing-repeats.")
+    p.add_argument("--sample-hz", type=float, default=10.0,
+                   help="Board sampler rate: power, GPU clock and over-current counters. "
+                        "Temperatures and the slower sensors run at a fifth of it, at most "
+                        "1 Hz slower. 10 Hz resolves a clip's energy, and a segment's once "
+                        "it lasts a couple of seconds.")
     p.add_argument("--memory-snapshot", type=int, default=0,
                    help="Give the first N clips an extra pass under the allocator's history "
                         "recorder, and write each snapshot next to the run (local only; open "
@@ -465,11 +470,13 @@ def run_clip(
     other measurement goes to the timing table.
     """
     data, model_inputs, diffusion_kwargs = prepare_clip(processor, avdi, clip_id, args)
+    TH.mark("infer")
     started = time.perf_counter()
     pred_xyz, pred_rot, extra, tracer = infer(
         model, clip_id, model_inputs, diffusion_kwargs, args, args.trace_level
     )
     HS.add_since("model_call_ms", started)
+    TH.mark("post")
     timing = tracer.timing
     trace = tracer.trace
 
@@ -556,6 +563,8 @@ def run_clip(
     timing_rows = [{**timing.row(), "row_kind": "main", "pass_index": 0,
                     "trace_level": args.trace_level}]
     started = time.perf_counter()
+    if extra_passes:
+        TH.mark("extra")
     for index, (kind, level) in enumerate(extra_passes, start=1):
         if kind == "memsnap":
             torch.cuda.memory._record_memory_history(max_entries=200_000)
@@ -570,6 +579,7 @@ def run_clip(
         })
     if extra_passes:
         HS.add_since("extra_passes_ms", started)
+        TH.mark("post")
     return rows, extras, timing_rows
 
 
@@ -622,6 +632,7 @@ def main() -> None:
         "timing_repeats": args.timing_repeats,
         "repeat_clips": args.repeat_clips,
         "memory_snapshot": args.memory_snapshot,
+        "sample_hz": args.sample_hz,
         "torch_disable_native_jit": os.environ.get("TORCH_DISABLE_NATIVE_JIT"),
         "torch_version": torch.__version__,
         "data_cache": args.data_cache,
@@ -729,6 +740,9 @@ def main() -> None:
             "machine": machine, "clips": clips, "params": params,
         }
         rows, per_clip, gt_rows, timing_rows = [], [], [], []
+        # What the board is: release, driver, clock ranges. Into every timing
+        # row (the two that decide comparability), the params and run.json.
+        hw = TH.hw_inventory()
         # Repeated on every timing row, for the same reason the config columns
         # repeat on every prediction row: runs concatenate, and a latency number
         # is only comparable with one taken under the same conditions -- which
@@ -756,7 +770,9 @@ def main() -> None:
             "cuda_graph": args.cuda_graph,
             "cuda_graph_max_graphs": args.cuda_graph_max_graphs if args.cuda_graph else None,
             "trace_level": args.trace_level,
-            "sample_hz": 2.0,
+            "sample_hz": args.sample_hz,
+            "l4t_release": hw.get("hw.l4t_release"),
+            "nvidia_driver": hw.get("hw.nvidia_driver"),
             "warmup": args.warmup,
             "overhead_probe": args.overhead_probe,
             "timing_repeats": args.timing_repeats,
@@ -771,13 +787,14 @@ def main() -> None:
         # one of them lands after inference finished and after the figure was
         # drawn -- so the power averages described an idle GPU, which is a
         # different quantity rather than a low estimate.
-        thermal = TH.ThermalLog()
+        thermal = TH.ThermalLog(hz=args.sample_hz)
         thermal.sample()
         if args.trace_level == "off":
             print("[trace] level off: no token statistics, no x0 and no spans are recorded -- "
                   "only the wall clock. predictions.parquet will lack token_ids.")
         with thermal.sampling():
             if args.warmup and clips:
+                TH.mark("warmup", 0)
                 # On the first clip, inside the sampler so the board's state during
                 # warmup is on record too. Nothing from these passes reaches the
                 # predictions: they exist to absorb the process's first-pass costs.
@@ -798,6 +815,9 @@ def main() -> None:
                 started = time.perf_counter()
                 clock = HS.StageClock()
                 HS.CURRENT.clock = clock
+                # Every board reading from here on belongs to clip i, and to the
+                # phase of it the pipeline is in -- run_clip moves it along.
+                TH.mark("load", i)
                 clip_rows, extras, clip_timing = run_clip(
                     model, processor, avdi, clip_id, args, out_dir,
                     extra_passes=extra_passes_for(i, args),
@@ -830,11 +850,12 @@ def main() -> None:
                         W.write_run(out_dir, rows, config,
                                     {**identity, "partial": True, "n_clips_done": done},
                                     gt=gt_rows if args.include_gt else None, per_clip=per_clip,
-                                    timing=timing_rows)
+                                    timing=timing_rows, thermal=thermal)
                 main_row.update(clock.row(
                     clip_wall_ms=(time.perf_counter() - clock.started) * 1000.0))
                 HS.CURRENT.clock = None
-                reading = thermal.sample()
+                TH.mark("between")
+                reading = thermal.latest()
                 print(
                     f"[{i + 1}/{len(clips)}] {clip_id[:8]} "
                     f"minADE {extras.get('min_ade', float('nan')):.3f} "
@@ -903,10 +924,11 @@ def main() -> None:
         }
         meta["thermal"] = thermal.summary()
         meta["power_mode"] = thermal.mode
+        meta["hw"] = hw
         print(f"\n{thermal.verdict()}")
         W.write_run(out_dir, rows, config, meta,
                     gt=gt_rows if args.include_gt else None, per_clip=per_clip,
-                    timing=timing_rows)
+                    timing=timing_rows, thermal=thermal)
         print(f"\nrun directory: {out_dir}")
 
         # Archive before the tracking short-circuit below. --no-track means "do
@@ -1042,6 +1064,7 @@ def main() -> None:
         # The model's weights by part are known only once it has loaded, which
         # is after the run opened: they join the same late batch.
         late = {key: round(value, 4) for key, value in inventory.items()}
+        late.update(hw)
         if probe:
             late["trace.overhead_pct"] = round(probe["trace.overhead_pct"], 4)
             late["trace.overhead_n"] = int(probe["trace.overhead_n"])

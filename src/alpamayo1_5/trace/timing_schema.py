@@ -53,7 +53,7 @@ import numpy as np
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 6
+TIMING_SCHEMA_VERSION = 7
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
@@ -76,6 +76,8 @@ CHANGELOG = {
     6: "Memory and shapes: allocator peak per segment, clip peak, reserved peak, OOMs, host "
     "memory available; the KV cache the head attends to, the image and patch counts, and the "
     "memory_snapshot condition. Tracer 5 reads the allocator at segment boundaries.",
+    7: "Board conditions: l4t_release and nvidia_driver. sample_hz is now the fast tier's "
+    "rate (10 by default).",
 }
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
@@ -362,8 +364,15 @@ SHAPES = _cols("shape", (
      "Clips that got an extra pass under the allocator's history recorder."),
 ), since=6)
 
+BOARD = _cols("condition", (
+    ("l4t_release", "s", "", "N",
+     "Jetson Linux release. A JetPack upgrade changes kernels, clocks and power policy."),
+    ("nvidia_driver", "s", "", "N", "GPU driver version."),
+), since=7)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
-                            + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST + MEMORY + SHAPES)
+                            + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST + MEMORY + SHAPES
+                            + BOARD)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)

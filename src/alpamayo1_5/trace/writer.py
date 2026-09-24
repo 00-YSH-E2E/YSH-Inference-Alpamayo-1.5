@@ -21,6 +21,7 @@ Layout, one directory per run (see :func:`run_dir_name`)::
     ├── predictions.parquet   one row per (clip_id, t0_us, sample_k): raw output
     ├── per_clip.parquet      one row per clip: situation label and its metrics
     ├── timing.parquet        one row per inference pass: where the time went
+    ├── thermal.parquet       the board over the run: one row per sensor reading
     ├── run.json              run-level metadata and the constants needed to
     │                         recompute anything offline
     ├── gt.parquet            logged future -- local only, never uploaded
@@ -348,6 +349,36 @@ def write_timing(out_dir: Path, rows: list[dict]) -> Path | None:
     return path
 
 
+def write_thermal(out_dir: Path, thermal: Any, run_id: str | None = None) -> Path | None:
+    """The board sampler's full series, long format: one row per sensor reading.
+
+    Kept whole rather than summarised, because the questions asked of it come
+    later: which clip ran hot, whether the clock sagged inside one segment,
+    when the over-current counter moved. Every row carries the perf_counter
+    stamp the tracer also uses, the clip index and the phase of the clip.
+    """
+    table = thermal.table() if thermal is not None else None
+    if not table or not table.get("tick"):
+        return None
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from alpamayo1_5.trace import thermal as TH
+
+    n = len(table["tick"])
+    schema = pa.schema([
+        ("thermal_schema_version", pa.int16()), ("run_id", pa.string()),
+        ("tick", pa.int32()), ("t_host_s", pa.float64()), ("t_unix_s", pa.float64()),
+        ("read_ms", pa.float32()), ("clip_index", pa.int32()), ("phase", pa.string()),
+        ("sensor", pa.string()), ("value", pa.float64()), ("unit", pa.string()),
+    ])
+    columns = {"thermal_schema_version": [TH.THERMAL_SCHEMA_VERSION] * n,
+               "run_id": [run_id] * n, **table}
+    path = Path(out_dir) / "thermal.parquet"
+    pq.write_table(pa.Table.from_pydict(columns, schema=schema), path, compression="zstd")
+    return path
+
+
 def write_run(
     out_dir: Path,
     samples: list[dict],
@@ -356,6 +387,7 @@ def write_run(
     gt: list[dict] | None = None,
     per_clip: list[dict] | None = None,
     timing: list[dict] | None = None,
+    thermal: Any = None,
 ) -> Path:
     """Write predictions/per_clip/timing parquet, run.json and (locally) gt.parquet.
 
@@ -374,6 +406,8 @@ def write_run(
         write_per_clip(out_dir, per_clip, config)
     if timing:
         write_timing(out_dir, timing)
+    if thermal is not None:
+        write_thermal(out_dir, thermal, config.get("run_id"))
 
     payload = dict(meta)
     payload["schema_version"] = SCHEMA_VERSION
@@ -403,7 +437,7 @@ def upload_paths(out_dir: Path) -> list[Path]:
     """Files that go to Hugging Face. ``gt.parquet`` is deliberately absent."""
     out_dir = Path(out_dir)
     paths = [out_dir / "predictions.parquet", out_dir / "per_clip.parquet",
-             out_dir / "timing.parquet", out_dir / "run.json"]
+             out_dir / "timing.parquet", out_dir / "thermal.parquet", out_dir / "run.json"]
     samples = out_dir / "samples"
     if samples.is_dir():
         paths.extend(sorted(samples.glob("*.png")))

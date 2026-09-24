@@ -408,3 +408,27 @@ def test_upload_paths_include_timing(tmp_path):
     names = {p.name for p in W.upload_paths(tmp_path)}
     assert "timing.parquet" in names
     assert "gt.parquet" not in names
+
+
+def test_thermal_series_round_trips(tmp_path):
+    from alpamayo1_5.trace import thermal as TH
+
+    log = TH.ThermalLog(mode="unknown")
+    log._record({"power.VIN": 150.0, "freq.gpu": 1575.0}, 10.0, 0.3)
+    path = W.write_thermal(tmp_path, log, run_id="r")
+    frame = pd.read_parquet(path)
+    assert sorted(frame["sensor"]) == ["freq.gpu", "power.VIN"]
+    assert set(frame["unit"]) == {"MHz", "W"}
+    assert (frame["thermal_schema_version"] == TH.THERMAL_SCHEMA_VERSION).all()
+    assert (frame["run_id"] == "r").all()
+
+
+def test_an_empty_thermal_log_writes_nothing(tmp_path):
+    from alpamayo1_5.trace import thermal as TH
+
+    assert W.write_thermal(tmp_path, TH.ThermalLog(mode="unknown")) is None
+
+
+def test_upload_paths_include_thermal(tmp_path):
+    (tmp_path / "thermal.parquet").touch()
+    assert "thermal.parquet" in {p.name for p in W.upload_paths(tmp_path)}

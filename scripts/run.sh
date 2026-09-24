@@ -111,6 +111,9 @@ REPEAT_CLIPS=5
 # 앞에서 몇 클립에 할당자 기록 패스를 더 돌려 메모리 스냅숏을 남길까 (로컬 파일, 업로드 안 됨).
 # pytorch.org/memory_viz 에서 열면 KV concat 이 만드는 할당이 하나하나 보인다
 MEMORY_SNAPSHOT=0
+# 보드 샘플러 주기 (Hz).  전력·GPU 클럭·over-current 카운터가 이 주기로, 온도 등은 그 1/5 로 돈다.
+# 10 이면 클립 에너지가 몇 % 안으로 잡히고, 2초 넘는 구간(디코드·expert)은 구간별로도 잡힌다
+SAMPLE_HZ=10
 
 # 한 번에 하나만.  두 run 이 겹치면 서로의 지연시간을 부풀린다 — 2026-09-01 에 실제로
 # 겹쳐서 기준선이 6% 부풀었다.  run·sweep·queue 가 전부 이 파일을 잠근다.
@@ -198,6 +201,7 @@ OVERHEAD_PROBE="${OVERRIDE_OVERHEAD_PROBE:-$OVERHEAD_PROBE}"
 TIMING_REPEATS="${OVERRIDE_TIMING_REPEATS:-$TIMING_REPEATS}"
 REPEAT_CLIPS="${OVERRIDE_REPEAT_CLIPS:-$REPEAT_CLIPS}"
 MEMORY_SNAPSHOT="${OVERRIDE_MEMORY_SNAPSHOT:-$MEMORY_SNAPSHOT}"
+SAMPLE_HZ="${OVERRIDE_SAMPLE_HZ:-$SAMPLE_HZ}"
 CUDA_GRAPH_MAX_GRAPHS="${OVERRIDE_CUDA_GRAPH_MAX_GRAPHS:-$CUDA_GRAPH_MAX_GRAPHS}"
 SWEEP="${SWEEP:-}"
 
@@ -438,7 +442,7 @@ fi
 [[ "$CUDA_GRAPH"   == "1" ]] && ARGS+=(--cuda-graph --cuda-graph-max-graphs "$CUDA_GRAPH_MAX_GRAPHS")
 ARGS+=(--trace-level "$TRACE_LEVEL" --warmup "$WARMUP" --overhead-probe "$OVERHEAD_PROBE"
        --timing-repeats "$TIMING_REPEATS" --repeat-clips "$REPEAT_CLIPS"
-       --memory-snapshot "$MEMORY_SNAPSHOT")
+       --memory-snapshot "$MEMORY_SNAPSHOT" --sample-hz "$SAMPLE_HZ")
 
 [[ "$FORCE_LOCAL_SRC" == "1" ]] && export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 
