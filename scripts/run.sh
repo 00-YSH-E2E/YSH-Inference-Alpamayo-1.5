@@ -124,6 +124,11 @@ PROFILE_TRACE=0
 # GEMV·read·copy·KV concat 피크를 재서 (~10 초) 구간별 효율을 루프라인 대비 비율로도 낸다
 FLOP_COUNT=0
 ROOFLINE_PROBE=0
+# 지연시간 예산 (ms).  비우면 보고하지 않는다.  주면 main 패스 중 예산을 넘은 비율(디바이스 합·
+# 호스트 벽시계·첫 궤적까지)과 p95 여유를 MLflow 에 남긴다.  STEADY_SKIP 은 정상 상태 수치에서
+# 뺄 앞 클립 수 (클럭이 오르고 할당자가 자라는 구간)
+DEADLINE_MS=""
+STEADY_SKIP=0
 # 보드 샘플러 주기 (Hz).  전력·GPU 클럭·over-current 카운터가 이 주기로, 온도 등은 그 1/5 로 돈다.
 # 10 이면 클립 에너지가 몇 % 안으로 잡히고, 2초 넘는 구간(디코드·expert)은 구간별로도 잡힌다
 SAMPLE_HZ=10
@@ -218,6 +223,8 @@ PROFILE_CLIPS="${OVERRIDE_PROFILE_CLIPS:-$PROFILE_CLIPS}"
 PROFILE_TRACE="${OVERRIDE_PROFILE_TRACE:-$PROFILE_TRACE}"
 FLOP_COUNT="${OVERRIDE_FLOP_COUNT:-$FLOP_COUNT}"
 ROOFLINE_PROBE="${OVERRIDE_ROOFLINE_PROBE:-$ROOFLINE_PROBE}"
+DEADLINE_MS="${OVERRIDE_DEADLINE_MS:-$DEADLINE_MS}"
+STEADY_SKIP="${OVERRIDE_STEADY_SKIP:-$STEADY_SKIP}"
 SAMPLE_HZ="${OVERRIDE_SAMPLE_HZ:-$SAMPLE_HZ}"
 CUDA_GRAPH_MAX_GRAPHS="${OVERRIDE_CUDA_GRAPH_MAX_GRAPHS:-$CUDA_GRAPH_MAX_GRAPHS}"
 SWEEP="${SWEEP:-}"
@@ -460,7 +467,9 @@ fi
 ARGS+=(--trace-level "$TRACE_LEVEL" --warmup "$WARMUP" --overhead-probe "$OVERHEAD_PROBE"
        --timing-repeats "$TIMING_REPEATS" --repeat-clips "$REPEAT_CLIPS"
        --memory-snapshot "$MEMORY_SNAPSHOT" --sample-hz "$SAMPLE_HZ"
-       --profile-clips "$PROFILE_CLIPS" --flop-count "$FLOP_COUNT")
+       --profile-clips "$PROFILE_CLIPS" --flop-count "$FLOP_COUNT"
+       --steady-skip "$STEADY_SKIP")
+[[ -n "$DEADLINE_MS" ]] && ARGS+=(--deadline-ms "$DEADLINE_MS")
 [[ "$PROFILE_TRACE" == "1" ]] && ARGS+=(--profile-trace)
 [[ "$ROOFLINE_PROBE" == "1" ]] && ARGS+=(--roofline-probe)
 

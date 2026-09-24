@@ -336,6 +336,53 @@ def test_profile_numbers_come_from_profile_rows_and_rate_the_profiler():
     assert not any(k.startswith("prof.") for k in TS.aggregate(rows[1:]))
 
 
+def test_a_line_needs_three_points_and_spread():
+    fit = TS.linear_fit([0, 1, 2, 3], [10.0, 12.0, 14.0, 16.0])
+    assert fit["slope"] == pytest.approx(2.0) and fit["intercept"] == pytest.approx(10.0)
+    assert fit["r2"] == pytest.approx(1.0) and fit["resid"] == pytest.approx(0.0, abs=1e-9)
+    assert TS.linear_fit([0, 1], [1.0, 2.0]) is None
+    assert TS.linear_fit([3, 3, 3], [1.0, 2.0, 3.0]) is None
+
+
+def test_tails_and_deadline_misses():
+    rows = [row(clip_index=i, t_total_ms=t, t_wall_ms=t + 10.0, t_first_traj_ms=t - 5.0)
+            for i, t in enumerate([100.0, 200.0, 300.0, 400.0])]
+    out = TS.aggregate(rows, deadline_ms=290.0)
+    assert out["t_total_ms_max"] == 400.0
+    assert out["t_total_ms_iqr"] == pytest.approx(150.0)
+    # Two of four over the line on the device total and on the wall; the first
+    # trajectory, 5 ms sooner, still misses twice.
+    assert out["deadline.miss_rate_total"] == 0.5 and out["deadline.miss_rate_wall"] == 0.5
+    assert out["deadline.miss_rate_first_traj"] == 0.5
+    assert out["deadline.margin_p95_ms"] == pytest.approx(290.0 - np.percentile(
+        [95.0, 195.0, 295.0, 395.0], 95))
+    assert "deadline.miss_rate_total" not in TS.aggregate(rows)
+
+
+def test_steady_state_leaves_out_the_first_clips_in_run_order():
+    rows = [row(clip_index=i, t_total_ms=t, t_wall_ms=t)
+            for i, t in [(1, 100.0), (0, 900.0), (2, 110.0), (3, 90.0)]]
+    out = TS.aggregate(rows, steady_skip=1)
+    assert out["steady.n"] == 3.0 and out["steady.t_total_ms"] == pytest.approx(100.0)
+    assert out["steady.t_total_ms_cv"] == pytest.approx(10.0 / 100.0)
+    assert "steady.n" not in TS.aggregate(rows)
+
+
+def test_decode_growth_expert_drift_and_the_cost_of_a_step():
+    rows = [row(decode_step_ms=[10.0, 11.0, 12.0, 13.0], expert_step_ms=[40.0, 30.0, 30.0, 30.0],
+                n_decode_steps=n, t_total_ms=1000.0 + 50.0 * n) for n in (10, 20, 40)]
+    out = TS.aggregate(rows)
+    assert out["decode.fit_slope_ms"] == pytest.approx(1.0)
+    assert out["decode.fit_intercept_ms"] == pytest.approx(10.0)
+    assert out["decode.fit_r2"] == pytest.approx(1.0)
+    # The first Euler step is left out; the rest are flat.
+    assert out["expert.step_slope_ms"] == pytest.approx(0.0, abs=1e-9)
+    assert out["expert.step_cv"] == pytest.approx(0.0, abs=1e-9)
+    assert out["latency.fit_slope_ms_per_step"] == pytest.approx(50.0)
+    assert out["latency.fit_intercept_ms"] == pytest.approx(1000.0)
+    assert set(out) <= set(TS.AGGREGATE_KEYS)
+
+
 def test_layer_numbers_are_the_attention_share_and_per_step_time():
     rows = [row(n_layer_spans=100, layer_attn_ms_decode=30.0, layer_block_ms_decode=100.0,
                 layer_mlp_ms_decode=60.0, n_decode_steps=10, layer_attn_ms_expert=40.0,

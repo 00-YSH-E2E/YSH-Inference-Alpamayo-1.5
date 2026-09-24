@@ -755,6 +755,15 @@ AGGREGATE_KEYS = (
     "prof.lead_ms_p50_decode", "prof.lead_ms_p50_expert", "prof.sync_api_ms",
     *(f"prof.cat_share_{c}" for c in CATEGORIES), "prof.overhead_pct",
     *RL.AGGREGATE_KEYS,
+    "t_total_ms_std", "t_total_ms_iqr", "t_total_ms_max", "t_wall_ms_std", "t_wall_ms_iqr",
+    "t_wall_ms_max", "t_first_traj_ms_max",
+    "deadline.miss_rate_total", "deadline.miss_rate_wall", "deadline.miss_rate_first_traj",
+    "deadline.margin_p95_ms",
+    "steady.n", "steady.t_total_ms", "steady.t_total_ms_p95", "steady.t_total_ms_cv",
+    "steady.t_wall_ms",
+    "decode.fit_intercept_ms", "decode.fit_slope_ms", "decode.fit_r2", "decode.fit_resid_ms",
+    "expert.step_slope_ms", "expert.step_cv",
+    "latency.fit_slope_ms_per_step", "latency.fit_intercept_ms", "latency.fit_r2",
 )
 
 
@@ -1074,8 +1083,93 @@ def _profile(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
     return out
 
 
+def linear_fit(x: Iterable[float], y: Iterable[float]) -> dict[str, float] | None:
+    """Least-squares line through the points: intercept, slope, R^2 and the
+    residuals' standard deviation. None below three points or with no spread
+    in x -- a line through two points fits perfectly and says nothing."""
+    x, y = np.asarray(list(x), dtype=float), np.asarray(list(y), dtype=float)
+    if x.size < 3 or np.ptp(x) == 0.0:
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    resid = y - (intercept + slope * x)
+    total = float(np.sum((y - y.mean()) ** 2))
+    return {"intercept": float(intercept), "slope": float(slope),
+            "r2": 1.0 - float(np.sum(resid ** 2)) / total if total > 0.0 else None,
+            "resid": float(np.std(resid, ddof=2)) if x.size > 2 else None}
+
+
+def _distribution(rows: list[Mapping[str, Any]], deadline_ms: float | None,
+                  steady_skip: int) -> dict[str, float | None]:
+    """Tails, deadline misses, jitter and growth over the main passes.
+
+    A mean hides the passes a real-time budget is about: the worst ones, and
+    the ones over the line. The deadline is judged three ways -- device total,
+    host wall, and time to the first trajectory, which is the one a planner
+    waits on. Steady state drops the first ``steady_skip`` clips, where clocks
+    ramp and the allocator grows. The decode fit says how much each step
+    slows as the cache grows, and its residual what is left as jitter; the
+    Euler steps after the first should be flat, so their slope is drift.
+    Across clips, total latency against decode steps is what one more
+    reasoning token costs end to end -- the confounder a shorter reasoning
+    brings to any latency comparison.
+    """
+    out: dict[str, float | None] = {}
+    for key in ("t_total_ms", "t_wall_ms"):
+        values = _values(rows, key)
+        if len(values) >= 2:
+            out[f"{key}_std"] = float(np.std(values, ddof=1))
+            q1, q3 = np.percentile(values, [25, 75])
+            out[f"{key}_iqr"] = float(q3 - q1)
+        if values:
+            out[f"{key}_max"] = float(max(values))
+    first = _values(rows, "t_first_traj_ms")
+    if first:
+        out["t_first_traj_ms_max"] = float(max(first))
+    if deadline_ms:
+        for key, name in (("t_total_ms", "total"), ("t_wall_ms", "wall"),
+                          ("t_first_traj_ms", "first_traj")):
+            values = _values(rows, key)
+            if values:
+                out[f"deadline.miss_rate_{name}"] = float(np.mean(
+                    [v > deadline_ms for v in values]))
+        if first:
+            out["deadline.margin_p95_ms"] = float(deadline_ms - np.percentile(first, 95))
+    if steady_skip:
+        ordered = sorted(rows, key=lambda r: float(r["clip_index"])
+                         if is_number(r.get("clip_index")) else 0.0)
+        steady = ordered[steady_skip:]
+        out["steady.n"] = float(len(steady))
+        totals = _values(steady, "t_total_ms")
+        if totals:
+            out["steady.t_total_ms"] = float(np.mean(totals))
+            out["steady.t_total_ms_p95"] = float(np.percentile(totals, 95))
+            if len(totals) >= 2 and np.mean(totals) > 0.0:
+                out["steady.t_total_ms_cv"] = float(np.std(totals, ddof=1) / np.mean(totals))
+        out["steady.t_wall_ms"] = _mean(_values(steady, "t_wall_ms"))
+    fits = [f for s in _arrays(rows, "decode_step_ms") if (f := linear_fit(range(len(s)), s))]
+    if fits:
+        out["decode.fit_intercept_ms"] = _mean([f["intercept"] for f in fits])
+        out["decode.fit_slope_ms"] = _mean([f["slope"] for f in fits])
+        out["decode.fit_r2"] = _mean([f["r2"] for f in fits if f["r2"] is not None])
+        out["decode.fit_resid_ms"] = _mean([f["resid"] for f in fits if f["resid"] is not None])
+    later = [s[1:] for s in _arrays(rows, "expert_step_ms") if len(s) >= 4]
+    drift = [f["slope"] for s in later if (f := linear_fit(range(len(s)), s))]
+    out["expert.step_slope_ms"] = _mean(drift)
+    out["expert.step_cv"] = _mean([float(np.std(s, ddof=1) / np.mean(s)) for s in later
+                                   if np.mean(s) > 0.0])
+    points = [(float(r["n_decode_steps"]), float(r["t_total_ms"])) for r in rows
+              if is_number(r.get("n_decode_steps")) and is_number(r.get("t_total_ms"))]
+    across = linear_fit([p[0] for p in points], [p[1] for p in points])
+    if across:
+        out["latency.fit_slope_ms_per_step"] = across["slope"]
+        out["latency.fit_intercept_ms"] = across["intercept"]
+        out["latency.fit_r2"] = across["r2"]
+    return out
+
+
 def aggregate(rows: Iterable[Mapping[str, Any]], model: Mapping[str, Any] | None = None,
-              peaks: Mapping[str, float] | None = None) -> dict[str, float]:
+              peaks: Mapping[str, float] | None = None, deadline_ms: float | None = None,
+              steady_skip: int = 0) -> dict[str, float]:
     """Run-level numbers for MLflow, from the main measured rows only.
 
     Restricting to measured rows is a fix, not a nicety: the averaging this
@@ -1217,5 +1311,6 @@ def aggregate(rows: Iterable[Mapping[str, Any]], model: Mapping[str, Any] | None
     out.update(_board(rows))
     out.update(_step(rows))
     out.update(_layer(rows))
+    out.update(_distribution(rows, deadline_ms, steady_skip))
 
     return {k: float(v) for k, v in out.items() if v is not None and math.isfinite(v)}

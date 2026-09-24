@@ -276,6 +276,13 @@ def parse_args() -> argparse.Namespace:
                         "the bandwidth of a GEMV, a read, a copy and the KV concatenation "
                         "(~10 s). The efficiency numbers then say how close each segment "
                         "came to its roof.")
+    p.add_argument("--deadline-ms", type=float, default=None,
+                   help="A latency budget to report against: the share of main passes over "
+                        "it (device total, host wall, time to the first trajectory) and the "
+                        "p95 margin under it. Reporting only; nothing is dropped.")
+    p.add_argument("--steady-skip", type=int, default=0,
+                   help="Leave the first N clips out of the steady-state numbers, where "
+                        "clocks ramp and the allocator grows. The headline means keep them.")
     p.add_argument("--profile-trace", action="store_true",
                    help="Also keep each profile pass's Chrome trace, gzipped, next to the run "
                         "(local only; open it in Perfetto).")
@@ -751,6 +758,12 @@ def main() -> None:
         "timing_repeats": args.timing_repeats,
         "repeat_clips": args.repeat_clips,
         "memory_snapshot": args.memory_snapshot,
+        "profile_clips": args.profile_clips,
+        "profile_trace": args.profile_trace,
+        "flop_count": args.flop_count,
+        "roofline_probe": args.roofline_probe,
+        "deadline_ms": args.deadline_ms,
+        "steady_skip": args.steady_skip,
         "sample_hz": args.sample_hz,
         "torch_disable_native_jit": os.environ.get("TORCH_DISABLE_NATIVE_JIT"),
         "torch_version": torch.__version__,
@@ -1235,7 +1248,9 @@ def main() -> None:
         # the per-row averaging this replaces took 0.0 from any pass whose
         # timing failed, and reported it as a pass that took no time.
         try:
-            run.metrics(TS.aggregate(timing_rows, model=work, peaks=peaks))
+            run.metrics(TS.aggregate(timing_rows, model=work, peaks=peaks,
+                                     deadline_ms=args.deadline_ms,
+                                     steady_skip=args.steady_skip))
         except Exception as exc:  # a lost metric batch must not lose the run's link
             print(f"[timing] aggregate metrics not recorded: {exc}", file=sys.stderr)
         # Measured during the loop, so it could not be among the parameters
