@@ -27,6 +27,7 @@ what the numbers mean on the board the runs happen on.
 
 from __future__ import annotations
 
+import pathlib
 import time
 
 import pytest
@@ -144,3 +145,28 @@ def test_power_mode_is_read_once():
     first = TH.power_mode()
     assert TH.power_mode() is first
     assert TH.power_mode.cache_info().hits >= 1
+
+
+def test_a_zone_that_fails_with_typeerror_is_skipped_not_fatal(monkeypatch, tmp_path):
+    """Thor's GPU zone raises TypeError, not OSError, while the GPU is powered off.
+
+    Before this was caught, one such zone discarded the whole reading, and in
+    the sampler thread every sample was lost without a word.
+    """
+    for name, temp in (("cpu-thermal", "41000"), ("gpu-thermal", None)):
+        zone = tmp_path / name
+        zone.mkdir()
+        (zone / "type").write_text(name + "\n")
+        (zone / "temp").write_text(temp or "0")
+    monkeypatch.setattr(TH, "_ZONE_TYPES", sorted(str(p / "type") for p in tmp_path.iterdir()))
+
+    real = pathlib.Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        if self.parent.name == "gpu-thermal" and self.name == "temp":
+            raise TypeError("can't concat NoneType to bytes")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", read_text)
+    assert TH.read_temps() == {"cpu-thermal": 41.0}
+

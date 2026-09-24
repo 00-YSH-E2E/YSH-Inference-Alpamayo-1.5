@@ -65,7 +65,12 @@ def read_temps() -> dict[str, float]:
             name = pathlib.Path(type_path).read_text().strip()
             raw = pathlib.Path(type_path.replace("/type", "/temp")).read_text()
             out[name] = int(raw) / 1000.0
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
+            # TypeError is not hypothetical. On Thor the GPU powers off when no
+            # CUDA context exists, and reading gpu-thermal then fails inside
+            # CPython's buffered reader with "can't concat NoneType to bytes"
+            # rather than an OSError. Uncaught, it discarded every zone of the
+            # sample -- and, in the sampler thread, the whole sample silently.
             continue
     return out
 
@@ -83,7 +88,8 @@ def read_power_w() -> dict[str, float]:
             volts = int((path.parent / f"in{channel}_input").read_text()) / 1000.0
             amps = int((path.parent / f"curr{channel}_input").read_text()) / 1000.0
             out[name] = volts * amps
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
+            # Same failure as read_temps: a rail read while its domain is off.
             continue
     return out
 
