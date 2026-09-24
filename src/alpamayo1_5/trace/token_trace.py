@@ -52,11 +52,15 @@ checkpoint:
 from __future__ import annotations
 
 import contextlib
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
+
+from alpamayo1_5.trace import timing_math
+from alpamayo1_5.trace.timing_math import TimingResult
 
 # Resolved from nvidia/Alpamayo-1.5-10B. Overridable because a fine-tuned
 # checkpoint may extend the vocabulary.
@@ -110,47 +114,45 @@ class TokenTrace:
         }
 
 
-@dataclass
-class SegmentTiming:
-    """Wall-clock split of one inference, in milliseconds."""
+#: The timing record. Kept under its old name for callers written against it.
+SegmentTiming = TimingResult
 
-    vision_ms: float = 0.0
-    prefill_ms: float = 0.0
-    decode_ms: float = 0.0
-    postgen_ms: float = 0.0
-    expert_ms: float = 0.0
-    total_ms: float = 0.0
-    #: ``total_ms`` minus the five named segments. Vision, prefill and decode all
-    #: run inside the generate span, so the named parts never summed to the total
-    #: and nothing said by how much. Recording the remainder makes the split
-    #: self-checking: the six add up, or the instrumentation is wrong.
-    other_ms: float = 0.0
-    n_vision_calls: int = 0
-    n_decode_steps: int = 0
-    n_expert_calls: int = 0
-    #: False means no timing was taken at all (no CUDA, or no events recorded).
-    #: Without this, an unmeasured run reports 0.0 ms and reads as "took no
-    #: time" rather than "never measured" -- a plausible number is worse than
-    #: a missing one, because it gets averaged into a comparison.
-    measured: bool = False
 
-    def as_dict(self) -> dict[str, float]:
-        return {
-            "t_vision_ms": self.vision_ms,
-            "t_prefill_ms": self.prefill_ms,
-            "t_decode_ms": self.decode_ms,
-            "t_postgen_ms": self.postgen_ms,
-            "t_expert_ms": self.expert_ms,
-            "t_total_ms": self.total_ms,
-            "t_other_ms": self.other_ms,
-            # Decode is batched over K rows and runs until the *last* row stops,
-            # so a per-row token count is the wrong denominator for it. This is
-            # the right one, and it was being computed and thrown away.
-            "n_decode_steps": self.n_decode_steps,
-            "n_vision_calls": self.n_vision_calls,
-            "n_expert_calls": self.n_expert_calls,
-            "timing_measured": self.measured,
-        }
+class _EventPool:
+    """CUDA timing events, reused across marks and across passes.
+
+    Creating an event per mark is an allocation on the decode path, and the
+    deeper trace levels place hundreds of marks per step. Events are taken in
+    order and handed back all at once when the next pass installs, which is
+    safe because ``finalize`` has read every event of a pass before the next
+    one starts. A pass that never finalized (it raised) loses its events to the
+    next one, and says so.
+    """
+
+    def __init__(self) -> None:
+        self._events: list[Any] = []
+        self._next = 0
+        self.owner: Any = None
+
+    def acquire(self, owner: Any) -> None:
+        if self.owner is not None and self.owner is not owner:
+            print("[token_trace] a previous pass never finalized; its events are reused")
+        self.owner = owner
+        self._next = 0
+
+    def release(self, owner: Any) -> None:
+        if self.owner is owner:
+            self.owner = None
+
+    def take(self) -> Any:
+        if self._next == len(self._events):
+            self._events.append(torch.cuda.Event(enable_timing=True))
+        event = self._events[self._next]
+        self._next += 1
+        return event
+
+
+_POOL = _EventPool()
 
 
 def _reduce_logits(logits_step: torch.Tensor, chosen: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -182,12 +184,20 @@ class InferenceTracer:
         if special_token_ids:
             self.ids.update(special_token_ids)
         self.trace: TokenTrace | None = None
-        self.timing = SegmentTiming()
+        self.timing = TimingResult()
         self._x0: Any = None
         self._handles: list[Any] = []
         self._saved: dict[str, Any] = {}
-        self._events: dict[str, list] = {}
+        #: ``(bucket, kind, event, perf_counter)`` in the order the host saw them.
+        self._marks: list[tuple[str, str, Any, float]] = []
         self._enabled = False
+        self._wall_start: float | None = None
+        self._start_unix: float | None = None
+        self._alloc0: tuple[int, int] | None = None
+        self._graph0: dict[str, int] | None = None
+        self._runner: Any = None
+        self._capture_ms = 0.0
+        self._in_capture = False
 
     # -- installation ------------------------------------------------------
     def __enter__(self) -> "InferenceTracer":
@@ -198,18 +208,49 @@ class InferenceTracer:
         self._remove()
 
     def _mark(self, bucket: str, kind: str) -> None:
-        if not torch.cuda.is_available():
+        # A mark inside a graph capture would record a timing event into the
+        # captured graph. Capture brackets its own work; nothing inside it is
+        # a span of this pass.
+        if self._in_capture or not torch.cuda.is_available():
             return
-        event = torch.cuda.Event(enable_timing=True)
+        event = _POOL.take()
         event.record()
-        self._events.setdefault(bucket, []).append((kind, event))
+        # Stamped after record() so both clocks bracket the same instant.
+        # About 50ns, which is why it can sit on the decode path without
+        # becoming the thing it is measuring.
+        self._marks.append((bucket, kind, event, time.perf_counter()))
+
+    def _set_attr(self, obj: Any, name: str, value: Any) -> None:
+        """Shadow ``obj.name`` on the instance, remembering how to undo it.
+
+        Restoring by assignment would leave an instance attribute behind that
+        was never there -- a bound method pinning its object -- so the undo
+        deletes what was added and reassigns only what was already present.
+        """
+        had = name in vars(obj)
+        self._saved.setdefault("attrs", []).append((obj, name, had, vars(obj).get(name)))
+        setattr(obj, name, value)
 
     def _install(self) -> None:
         if self._enabled:
             return
         self._enabled = True
-        self._events.clear()
-        self.timing = SegmentTiming()
+        self._marks.clear()
+        self.timing = TimingResult()
+        if torch.cuda.is_available():
+            _POOL.acquire(self)
+        self._wall_start = time.perf_counter()
+        self._start_unix = time.time()
+        # Deltas, not absolutes. Peak memory is deliberately *not* reset
+        # here: the runner resets it once per run and reads the global peak
+        # for vram_peak_gb, so resetting per clip would quietly redefine
+        # that metric as the peak of the last clip.
+        self._alloc0 = self._alloc_counters()
+        self._runner = self._graph_runner()
+        self._graph0 = self._graph_counters()
+        self._capture_ms = 0.0
+        if self._runner is not None and hasattr(self._runner, "_capture"):
+            self._set_attr(self._runner, "_capture", self._wrap_capture(self._runner._capture))
 
         vlm = self.model.vlm
         inner = getattr(vlm, "model", None)
@@ -245,7 +286,9 @@ class InferenceTracer:
         if proj is not None:
             self._handles.append(proj.register_forward_pre_hook(self._capture_x0))
 
-        # Trajectory head: one call per Euler step.
+        # Trajectory head: one call per Euler step. With graphs on, the hooks
+        # still fire: the runner replaces forward, and module hooks wrap the
+        # call rather than the function.
         expert = getattr(self.model, "expert", None)
         if expert is not None:
             self._handles.append(
@@ -255,14 +298,77 @@ class InferenceTracer:
                 expert.register_forward_hook(lambda *_: self._mark("expert", "end"))
             )
 
-        self._saved["generate"] = vlm.generate
-        vlm.generate = self._wrap_generate(vlm.generate)
+        self._set_attr(vlm, "generate", self._wrap_generate(vlm.generate))
 
         diffusion = getattr(self.model, "diffusion", None)
         if diffusion is not None and hasattr(diffusion, "sample"):
-            self._saved["sample"] = diffusion.sample
-            self._saved["diffusion"] = diffusion
-            diffusion.sample = self._wrap_sample(diffusion.sample)
+            self._set_attr(diffusion, "sample", self._wrap_sample(diffusion.sample))
+
+    # -- counters ----------------------------------------------------------
+    @staticmethod
+    def _alloc_counters() -> tuple[int, int] | None:
+        """Allocator totals ``(allocations, retries)``, or None when unreadable.
+
+        Both are monotonic over the process, so only a delta across one
+        inference means anything. Retries matter more than the count: each one
+        is the allocator failing, flushing its cache and trying again, and that
+        stall lands in whichever segment was unlucky. None rather than zeros
+        when there is nothing to read -- zero allocations is a plausible
+        measurement, and a plausible number is worse than a missing one.
+        """
+        if not torch.cuda.is_available():
+            return None
+        try:
+            stats = torch.cuda.memory_stats()
+        except Exception:
+            return None
+        return (
+            int(stats.get("allocation.all.allocated", 0)),
+            int(stats.get("num_alloc_retries", 0)),
+        )
+
+    def _graph_runner(self) -> Any:
+        """The expert's CUDA-graph runner, if one is installed.
+
+        The attribute is set on both the model and the expert, and which one
+        is present depends on how the graph was enabled. The model is checked
+        first: that is the documented entry point.
+        """
+        runner = getattr(self.model, "_diffusion_expert_cuda_graph", None)
+        if runner is None:
+            runner = getattr(
+                getattr(self.model, "expert", None), "_diffusion_expert_cuda_graph", None
+            )
+        return runner
+
+    def _graph_counters(self) -> dict[str, int] | None:
+        """The runner's tallies, or None when no runner is installed.
+
+        The runner kept these since it was written and nothing ever read them,
+        so a run could not say whether its steps replayed or fell back to eager
+        -- and a mean over both describes neither.
+        """
+        runner = self._runner if self._runner is not None else self._graph_runner()
+        if runner is None:
+            return None
+        try:
+            return dict(runner.stats)
+        except Exception:
+            return None
+
+    def _wrap_capture(self, original: Any) -> Any:
+        """Time the runner's capture and keep marks out of it."""
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            started = time.perf_counter()
+            self._in_capture = True
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self._in_capture = False
+                self._capture_ms += (time.perf_counter() - started) * 1000.0
+
+        return wrapper
 
     def _remove(self) -> None:
         if not self._enabled:
@@ -270,10 +376,14 @@ class InferenceTracer:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
-        if "generate" in self._saved:
-            self.model.vlm.generate = self._saved.pop("generate")
-        if "sample" in self._saved:
-            self._saved.pop("diffusion").sample = self._saved.pop("sample")
+        for obj, name, had, value in reversed(self._saved.pop("attrs", [])):
+            if had:
+                setattr(obj, name, value)
+            else:
+                try:
+                    delattr(obj, name)
+                except AttributeError:
+                    pass
         self._enabled = False
 
     # -- wrappers ----------------------------------------------------------
@@ -371,63 +481,37 @@ class InferenceTracer:
         )
 
     # -- results -----------------------------------------------------------
-    def finalize(self) -> SegmentTiming:
+    def finalize(self) -> TimingResult:
         """Resolve recorded events into segment times. Call once, after inference."""
-        timing = SegmentTiming()
-        if not torch.cuda.is_available() or not self._events:
-            self.timing = timing
-            return timing
-        torch.cuda.synchronize()  # the only sync -- inside a hook it would distort decode
-
-        def spans(bucket: str) -> list[tuple[Any, Any]]:
-            marks = self._events.get(bucket, [])
-            out = []
-            pending = None
-            for kind, event in marks:
-                if kind == "start":
-                    pending = event
-                elif pending is not None:
-                    out.append((pending, event))
-                    pending = None
-            return out
-
-        def total(pairs: list[tuple[Any, Any]]) -> float:
-            return float(sum(a.elapsed_time(b) for a, b in pairs))
-
-        vision = spans("vision")
-        lm = spans("lm")
-        expert = spans("expert")
-        diffusion = spans("diffusion")
-        generate = spans("generate")
-
-        timing.n_vision_calls = len(vision)
-        timing.vision_ms = total(vision)
-        if lm:
-            # The first language-model call is the prefill; the rest are decode.
-            timing.prefill_ms = total(lm[:1])
-            timing.decode_ms = total(lm[1:])
-            timing.n_decode_steps = len(lm) - 1
-        timing.n_expert_calls = len(expert)
-        timing.expert_ms = total(diffusion) if diffusion else total(expert)
-
-        # Between generate returning and the trajectory head starting there is
-        # real host work -- per-sample Python loops that force device syncs.
-        # Split into three and it lands in the wrong bucket.
-        if generate and diffusion:
-            gap = generate[0][1].elapsed_time(diffusion[0][0])
-            timing.postgen_ms = float(max(gap, 0.0))
-        if generate:
-            timing.total_ms = total(generate) + timing.postgen_ms + timing.expert_ms
-            # What the named segments do not account for: logits processors,
-            # sampling, stopping criteria, KV-cache management. Clamped at zero
-            # because a negative remainder means the spans overlap, which is a
-            # bug in the marks rather than negative time spent.
-            named = (timing.vision_ms + timing.prefill_ms + timing.decode_ms
-                     + timing.postgen_ms + timing.expert_ms)
-            timing.other_ms = float(max(timing.total_ms - named, 0.0))
-        timing.measured = True
-        self.timing = timing
-        return timing
+        alloc1 = self._alloc_counters()
+        graph1 = self._graph_counters()
+        records: list[timing_math.Record] = []
+        wall_end = None
+        if torch.cuda.is_available() and self._marks:
+            torch.cuda.synchronize()  # the only sync -- inside a hook it would distort decode
+            # An end anchor on the device. Every event's time is taken relative
+            # to it, which puts all marks on one device axis, and the host time
+            # read right after it completes is what later maps device times onto
+            # the host clock the board sampler uses.
+            anchor = torch.cuda.Event(enable_timing=True)
+            anchor.record()
+            anchor.synchronize()
+            wall_end = time.perf_counter()
+            records = [(bucket, kind, -float(event.elapsed_time(anchor)), host)
+                       for bucket, kind, event, host in self._marks]
+        self.timing = timing_math.resolve(
+            records,
+            wall_start_s=self._wall_start if records else None,
+            wall_end_s=wall_end,
+            start_unix_s=self._start_unix,
+            alloc_before=self._alloc0,
+            alloc_after=alloc1,
+            graph_before=self._graph0,
+            graph_after=graph1,
+            capture_ms=self._capture_ms,
+        )
+        _POOL.release(self)
+        return self.timing
 
 
 @contextlib.contextmanager

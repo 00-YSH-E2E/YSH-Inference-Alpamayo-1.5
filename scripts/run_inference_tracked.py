@@ -70,6 +70,7 @@ from alpamayo1_5.load_physical_aiavdataset import load_physical_aiavdataset  # n
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5  # noqa: E402
 from alpamayo1_5.trace import metrics as M  # noqa: E402
 from alpamayo1_5.trace import thermal as TH  # noqa: E402
+from alpamayo1_5.trace import timing_schema as TS  # noqa: E402
 from alpamayo1_5.trace import writer as W  # noqa: E402
 from alpamayo1_5.trace.token_trace import DEFAULT_SPECIAL_IDS, trace_inference  # noqa: E402
 
@@ -165,6 +166,14 @@ def parse_args() -> argparse.Namespace:
                         "val,test. Keeps evaluation clips out of any training run.")
     p.add_argument("--model", default=MODEL_REPO)
     p.add_argument("--attn", default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
+    # The graph runner has been in the tree, tested, and documented in the
+    # README since it was written, and nothing here ever turned it on -- so
+    # every recorded run measures the eager path and the replayed path has
+    # never been measured at all. A flag is what makes it an axis.
+    p.add_argument("--cuda-graph", action="store_true",
+                   help="Replay the diffusion expert with exact-shape CUDA graphs.")
+    p.add_argument("--cuda-graph-max-graphs", type=int, default=4,
+                   help="Distinct input signatures to keep captured (default 4).")
     p.add_argument("--variant", default="Vanilla", help="Vanilla, Pruned-24L, INT8 ...")
     p.add_argument("--data-spec", default="Cam-4")
     p.add_argument("--machine", default=None,
@@ -288,8 +297,16 @@ def clip_seed(seed: int, clip_id: str) -> int:
     return seed ^ int(digest, 16)
 
 
-def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple[list[dict], dict]:
-    """Inference for one clip. Returns one row per sample, plus per-clip extras."""
+def run_clip(
+    model, processor, avdi, clip_id: str, args, out_dir: Path
+) -> tuple[list[dict], dict, dict]:
+    """Inference for one clip.
+
+    Returns one row per sample, the per-clip extras, and the pass's timing row.
+    The sample rows carry only the legacy timing keys -- the predictions table
+    is frozen at schema 3 -- and everything else the tracer measured goes to
+    the timing table, one row per pass rather than repeated K times.
+    """
     data = load_physical_aiavdataset(
         clip_id, t0_us=args.t0_us, avdi=avdi, maybe_stream=args.allow_stream
     )
@@ -329,7 +346,7 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
                 diffusion_kwargs=diffusion_kwargs,
                 return_extra=True,
             )
-    timing = tracer.timing.as_dict()
+    timing = tracer.timing
     trace = tracer.trace
 
     pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2]  # [K, T, 2]
@@ -355,7 +372,7 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
             "hist_rot": hist_rot,
             "cot": cot_texts[k] if k < len(cot_texts) else "",
             "meta_action": meta_actions[k] if k < len(meta_actions) else None,
-            **timing,
+            **timing.legacy(),
         }
         if trace is not None and k < trace.token_ids.shape[0]:
             row.update(trace.sample(k))
@@ -407,7 +424,7 @@ def run_clip(model, processor, avdi, clip_id: str, args, out_dir: Path) -> tuple
         extras.get("net_heading_abs_deg", 0.0), extras.get("lateral_offset_abs_m", 0.0)
     )
     extras["pred_xy"] = pred_xy
-    return rows, extras
+    return rows, extras, timing.row()
 
 
 def main() -> None:
@@ -440,8 +457,13 @@ def main() -> None:
         "split": args.split,
         "x0_from": args.x0_from,
         "attn_impl": args.attn,
+        "cuda_graph": args.cuda_graph,
+        "cuda_graph_max_graphs": args.cuda_graph_max_graphs if args.cuda_graph else None,
         "dtype": "bfloat16",
         "t0_us": args.t0_us,
+        # Latency is only comparable within one table version and one tracer.
+        "timing_schema_version": TS.TIMING_SCHEMA_VERSION,
+        "tracer_version": TS.TRACER_VERSION,
         "torch_disable_native_jit": os.environ.get("TORCH_DISABLE_NATIVE_JIT"),
         "torch_version": torch.__version__,
         "data_cache": args.data_cache,
@@ -470,6 +492,14 @@ def main() -> None:
         model = Alpamayo1_5.from_pretrained(
             args.model, dtype=torch.bfloat16, attn_implementation=args.attn
         ).to("cuda").eval()
+        if args.cuda_graph:
+            # After .to("cuda").eval(): the runner refuses a CPU or training
+            # model, and refusing is the right behaviour -- a graph captured
+            # in train mode would replay dropout.
+            model.enable_diffusion_expert_cuda_graph(
+                max_batch_size=args.num_traj_samples,
+                max_graphs=args.cuda_graph_max_graphs,
+            )
         args.x0_table = None
         if args.x0_from:
             import inspect
@@ -535,7 +565,37 @@ def main() -> None:
             "run_id": run_id, "variant": args.variant, "date": date,
             "machine": machine, "clips": clips, "params": params,
         }
-        rows, per_clip, gt_rows = [], [], []
+        rows, per_clip, gt_rows, timing_rows = [], [], [], []
+        # Repeated on every timing row, for the same reason the config columns
+        # repeat on every prediction row: runs concatenate, and a latency number
+        # is only comparable with one taken under the same conditions -- which
+        # is a stricter set than for accuracy (machine and power mode matter).
+        import transformers
+
+        timing_base = {
+            "timing_schema_version": TS.TIMING_SCHEMA_VERSION,
+            "tracer_version": TS.TRACER_VERSION,
+            "run_id": run_id,
+            "variant": args.variant,
+            "git_commit": config["git_commit"],
+            "machine": machine,
+            "power_mode": TH.power_mode(),
+            "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
+            "cuda_runtime": torch.version.cuda,
+            "attn_impl": args.attn,
+            "dtype": "bfloat16",
+            "model": args.model,
+            "data_spec": args.data_spec,
+            "num_traj_samples": args.num_traj_samples,
+            "inference_step": args.inference_step,
+            "max_new_tokens": args.max_generation_length,
+            "cuda_graph": args.cuda_graph,
+            "cuda_graph_max_graphs": args.cuda_graph_max_graphs if args.cuda_graph else None,
+            "trace_level": "basic",
+            "sample_hz": 2.0,
+            "warmup": 0,
+        }
         # Throttling moves latency without moving anything else, and after the
         # run there is no way to tell that from a regression.
         #
@@ -549,9 +609,15 @@ def main() -> None:
         with thermal.sampling():
             for i, clip_id in enumerate(clips):
                 started = time.perf_counter()
-                clip_rows, extras = run_clip(model, processor, avdi, clip_id, args, out_dir)
+                clip_rows, extras, timing_row = run_clip(
+                    model, processor, avdi, clip_id, args, out_dir
+                )
                 rows.extend(clip_rows)
                 per_clip.append(extras)
+                timing_rows.append({
+                    **timing_base, **timing_row, "clip_id": clip_id, "t0_us": args.t0_us,
+                    "clip_index": i, "row_kind": "main", "pass_index": 0,
+                })
                 if extras.get("gt_xy") is not None:
                     gt_rows.append({"clip_id": clip_id, "t0_us": args.t0_us, "gt_xy": extras["gt_xy"]})
                 if not args.no_samples and i < MAX_SAMPLE_IMAGES:
@@ -569,7 +635,8 @@ def main() -> None:
                 if args.flush_every and done % args.flush_every == 0 and done < len(clips):
                     W.write_run(out_dir, rows, config,
                                 {**identity, "partial": True, "n_clips_done": done},
-                                gt=gt_rows if args.include_gt else None, per_clip=per_clip)
+                                gt=gt_rows if args.include_gt else None, per_clip=per_clip,
+                                timing=timing_rows)
                 reading = thermal.sample()
                 print(
                     f"[{i + 1}/{len(clips)}] {clip_id[:8]} "
@@ -619,7 +686,8 @@ def main() -> None:
         meta["power_mode"] = thermal.mode
         print(f"\n{thermal.verdict()}")
         W.write_run(out_dir, rows, config, meta,
-                    gt=gt_rows if args.include_gt else None, per_clip=per_clip)
+                    gt=gt_rows if args.include_gt else None, per_clip=per_clip,
+                    timing=timing_rows)
         print(f"\nrun directory: {out_dir}")
 
         # Archive before the tracking short-circuit below. --no-track means "do
@@ -723,14 +791,21 @@ def main() -> None:
         if per_token:
             run.metric("ms_per_generated_token", float(np.mean(per_token)))
 
-        for key in ("t_vision_ms", "t_prefill_ms", "t_decode_ms", "t_postgen_ms",
-                    "t_expert_ms", "t_other_ms", "t_total_ms"):
-            value = mean_present(key)
-            if value is not None:
-                run.metric(key, value)
         # How many clips the timings above actually rest on. Without it a mean
         # over 3 measured clips out of 100 looks like a mean over 100.
         run.metric("n_timed_clips", float(len(per_step)))
+        # Everything else about latency, from the timing table: the legacy
+        # spans, tails, the host clock, per-step shapes, allocator and graph
+        # counters. One batched request -- the tracking server is a
+        # single-worker box and each metric call is a round trip -- and the key
+        # set is declared in timing_schema.AGGREGATE_KEYS rather than swept off
+        # whatever a run happened to compute. Only measured main passes count:
+        # the per-row averaging this replaces took 0.0 from any pass whose
+        # timing failed, and reported it as a pass that took no time.
+        try:
+            run.metrics(TS.aggregate(timing_rows))
+        except Exception as exc:  # a lost metric batch must not lose the run's link
+            print(f"[timing] aggregate metrics not recorded: {exc}", file=sys.stderr)
         # Breakdown by scene: fixed cardinality, and it answers the question
         # actually being asked -- does the model give up on curves? The previous
         # code wrote a metric key per clip UUID, which put 100 keys in a 148-key

@@ -20,6 +20,7 @@ Layout, one directory per run (see :func:`run_dir_name`)::
     out/Alpamayo-1.5_Cam-4_Vanilla_100clip_k6-temp0.6_thor_26.09.01_39581f9b/
     ├── predictions.parquet   one row per (clip_id, t0_us, sample_k): raw output
     ├── per_clip.parquet      one row per clip: situation label and its metrics
+    ├── timing.parquet        one row per inference pass: where the time went
     ├── run.json              run-level metadata and the constants needed to
     │                         recompute anything offline
     ├── gt.parquet            logged future -- local only, never uploaded
@@ -45,6 +46,12 @@ definitions will change -- freezing them here would mean re-running inference
 whenever a definition moves, and would leave stale columns that still look
 authoritative.
 
+``timing.parquet`` is versioned apart from the other two (see
+``timing_schema``). Latency is compared under stricter rules than accuracy --
+never across machines, power modes or instrumentation depth -- and its columns
+grow with every new instrument. Kept in the predictions table, each new
+instrument would have cut new runs off from every older one.
+
 The logged future is the one deliberate exception: it is recoverable from
 ``(clip_id, t0_us)``, so it goes to ``gt.parquet`` for local convenience and is
 excluded from upload.
@@ -67,6 +74,8 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+
+from alpamayo1_5.trace import timing_schema as TS
 
 # Bump when a column is added, removed or changes meaning. Concatenating runs
 # with different schema versions is the failure this exists to make visible.
@@ -314,6 +323,31 @@ def write_per_clip(
     return path
 
 
+def write_timing(out_dir: Path, rows: list[dict]) -> Path | None:
+    """One row per inference pass, typed by the registry in ``timing_schema``.
+
+    Written through pyarrow with the explicit schema rather than through
+    pandas: pandas infers a column that is null in every row as null-typed, and
+    a null-typed column refuses to concatenate with the same column typed in
+    another run -- which is exactly the situation of an instrument that was off
+    in one run and on in the next.
+    """
+    if not rows:
+        return None
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    unknown = sorted({k for r in rows for k in TS.unknown_keys(r)})
+    if unknown:
+        # Dropped rather than raised: a typo in instrumentation must not cost a
+        # run. The tests build rows strictly, so it cannot reach a commit.
+        print(f"[timing] undeclared columns dropped: {', '.join(unknown)}")
+    table = pa.Table.from_pylist([TS.coerce_row(r) for r in rows], schema=TS.pa_schema())
+    path = Path(out_dir) / "timing.parquet"
+    pq.write_table(table, path, compression="zstd")
+    return path
+
+
 def write_run(
     out_dir: Path,
     samples: list[dict],
@@ -321,8 +355,9 @@ def write_run(
     meta: dict,
     gt: list[dict] | None = None,
     per_clip: list[dict] | None = None,
+    timing: list[dict] | None = None,
 ) -> Path:
-    """Write predictions.parquet, per_clip.parquet, run.json and (locally) gt.parquet.
+    """Write predictions/per_clip/timing parquet, run.json and (locally) gt.parquet.
 
     ``meta`` carries what an offline reader needs and cannot derive:
     action-space normalization constants (they differ per checkpoint, and using
@@ -337,9 +372,18 @@ def write_run(
     frame.to_parquet(out_dir / "predictions.parquet", index=False, compression="zstd")
     if per_clip:
         write_per_clip(out_dir, per_clip, config)
+    if timing:
+        write_timing(out_dir, timing)
 
     payload = dict(meta)
     payload["schema_version"] = SCHEMA_VERSION
+    if timing:
+        payload["timing"] = {
+            **dict(payload.get("timing", {})),
+            "schema_version": TS.TIMING_SCHEMA_VERSION,
+            "tracer_version": TS.TRACER_VERSION,
+            "n_rows": len(timing),
+        }
     payload["array_shapes"] = {k: list(v) for k, v in _ARRAY_SHAPES.items()}
     payload["n_rows"] = int(len(frame))
     payload["columns"] = list(frame.columns)
@@ -359,7 +403,7 @@ def upload_paths(out_dir: Path) -> list[Path]:
     """Files that go to Hugging Face. ``gt.parquet`` is deliberately absent."""
     out_dir = Path(out_dir)
     paths = [out_dir / "predictions.parquet", out_dir / "per_clip.parquet",
-             out_dir / "run.json"]
+             out_dir / "timing.parquet", out_dir / "run.json"]
     samples = out_dir / "samples"
     if samples.is_dir():
         paths.extend(sorted(samples.glob("*.png")))
@@ -380,4 +424,23 @@ def load_runs(root: Path | str, pattern: str = "*/predictions.parquet") -> pd.Da
     versions = {int(f["schema_version"].iloc[0]) for f in frames if len(f)}
     if len(versions) > 1:
         raise ValueError(f"schema versions differ across runs: {sorted(versions)}")
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_timing(root: Path | str, pattern: str = "*/timing.parquet") -> pd.DataFrame:
+    """Concatenate every run's timing table under ``root``.
+
+    Refuses to mix table versions, for the same reason :func:`load_runs` does.
+    Whether two runs may be *compared* on latency is a stricter question --
+    same machine, power mode, driver and tracer -- and is answered by the
+    comparison gate, not here.
+    """
+    files = sorted(Path(root).glob(pattern))
+    if not files:
+        return pd.DataFrame()
+    frames = [pd.read_parquet(f) for f in files]
+    versions = {int(f["timing_schema_version"].dropna().iloc[0])
+                for f in frames if len(f) and f["timing_schema_version"].notna().any()}
+    if len(versions) > 1:
+        raise ValueError(f"timing schema versions differ across runs: {sorted(versions)}")
     return pd.concat(frames, ignore_index=True)

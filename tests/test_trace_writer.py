@@ -315,3 +315,96 @@ def test_load_runs_refuses_to_mix_schema_versions(tmp_path, monkeypatch):
 
 def test_load_runs_with_no_runs_is_empty_not_an_error(tmp_path):
     assert W.load_runs(tmp_path).empty
+
+
+# -- the predictions table is frozen; timing lives beside it ---------------
+#: Every column build_rows produced at schema 3, in order. New measurement
+#: goes to timing.parquet; a change here cuts new runs off from the whole
+#: schema-3 corpus they are compared against, so it has to be a decision.
+_SCHEMA_3_COLUMNS = [
+    "schema_version", "run_id", "variant", "git_commit", "clip_id", "t0_us", "sample_k",
+    "pred_xy", "x0", "pred_rot", "hist_xy", "hist_rot", "cot", "meta_action",
+    "token_ids", "token_logprob", "token_entropy", "n_generated_tokens", "n_cot_tokens",
+    "eos_missing", "prompt_len", "t_vision_ms", "t_prefill_ms", "t_decode_ms",
+    "t_postgen_ms", "t_expert_ms", "t_other_ms", "t_total_ms", "n_decode_steps",
+    "n_vision_calls", "n_expert_calls", "timing_measured",
+]
+
+
+def test_predictions_schema_is_frozen_at_v3():
+    frame = W.build_rows([sample()], {"run_id": "r"})
+    assert W.SCHEMA_VERSION == 3
+    assert list(frame.columns) == _SCHEMA_3_COLUMNS
+
+
+def timing_row(clip: str = "c1", **extra):
+    from alpamayo1_5.trace import timing_schema as TS
+
+    row = {"timing_schema_version": TS.TIMING_SCHEMA_VERSION,
+           "tracer_version": TS.TRACER_VERSION, "run_id": "r", "clip_id": clip,
+           "row_kind": "main", "pass_index": 0, "timing_measured": True,
+           "t_total_ms": 100.0, "t_wall_ms": 120.0,
+           "expert_step_ms": [30.0, 20.0, 20.0]}
+    row.update(extra)
+    return row
+
+
+def test_timing_round_trip_keeps_list_columns(tmp_path):
+    path = W.write_timing(tmp_path, [timing_row(), timing_row("c2")])
+    frame = pd.read_parquet(path)
+    assert list(frame["clip_id"]) == ["c1", "c2"]
+    assert list(frame["expert_step_ms"].iloc[0]) == [30.0, 20.0, 20.0]
+
+
+def test_a_column_null_in_every_row_keeps_its_type(tmp_path):
+    """An instrument that was off in one run and on in the next must still
+    concatenate. pandas would have inferred the all-null column as null-typed."""
+    import pyarrow.parquet as pq
+
+    path = W.write_timing(tmp_path, [timing_row(graph_replays=None)])
+    schema = pq.read_schema(path)
+    assert str(schema.field("graph_replays").type) == "int32"
+    assert str(schema.field("expert_step_host_ms").type) == "list<element: float>"
+
+
+def test_undeclared_timing_keys_are_dropped_not_fatal(tmp_path):
+    frame = pd.read_parquet(W.write_timing(tmp_path, [timing_row(not_a_column=1.0)]))
+    assert "not_a_column" not in frame.columns
+
+
+def test_write_run_writes_timing_and_names_its_version(tmp_path):
+    import json
+
+    from alpamayo1_5.trace import timing_schema as TS
+
+    W.write_run(tmp_path, [sample()], {"run_id": "r"}, {}, timing=[timing_row()])
+    assert (tmp_path / "timing.parquet").exists()
+    meta = json.loads((tmp_path / "run.json").read_text())
+    assert meta["timing"]["schema_version"] == TS.TIMING_SCHEMA_VERSION
+    assert meta["timing"]["tracer_version"] == TS.TRACER_VERSION
+    assert meta["schema_version"] == 3
+
+
+def test_two_runs_of_timing_concatenate(tmp_path):
+    for name in ("run_a", "run_b"):
+        (tmp_path / name).mkdir()
+        W.write_timing(tmp_path / name, [timing_row(run_id=name)])
+    frame = W.load_timing(tmp_path)
+    assert sorted(frame["run_id"].unique()) == ["run_a", "run_b"]
+
+
+def test_load_timing_refuses_to_mix_versions(tmp_path):
+    for name, version in (("old", 1), ("new", 2)):
+        (tmp_path / name).mkdir()
+        W.write_timing(tmp_path / name, [timing_row(timing_schema_version=version)])
+    with pytest.raises(ValueError, match="timing schema versions differ"):
+        W.load_timing(tmp_path)
+
+
+def test_upload_paths_include_timing(tmp_path):
+    (tmp_path / "timing.parquet").touch()
+    (tmp_path / "run.json").touch()
+    (tmp_path / "gt.parquet").touch()
+    names = {p.name for p in W.upload_paths(tmp_path)}
+    assert "timing.parquet" in names
+    assert "gt.parquet" not in names

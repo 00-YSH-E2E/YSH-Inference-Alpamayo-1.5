@@ -1,0 +1,268 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 YSH-research
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Turn the tracer's marks into the numbers a timing row carries.
+
+The tracer does as little as possible while the model runs: it records a CUDA
+event and a host timestamp at each mark and nothing else. After one final
+synchronize it converts every event to a device time on a common axis, and
+hands the result here as plain floats.
+
+That split is deliberate. Everything below is arithmetic -- pairing starts
+with ends, attributing spans, subtracting remainders -- and it is where the
+bugs in a timing split live. As plain Python it runs in CI, where torch is not
+installed, against synthetic marks whose right answer is known.
+
+A record is ``(bucket, kind, device_ms, host_s)``:
+
+* ``bucket`` names what was marked (``vision``, ``lm``, ``expert``,
+  ``diffusion``, ``generate``);
+* ``kind`` is ``start`` or ``end``;
+* ``device_ms`` is the event's device time relative to a common anchor, so the
+  difference of two is the device time between them;
+* ``host_s`` is ``perf_counter`` when the mark was recorded -- which is when
+  the work was *enqueued*, not when it ran.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping
+
+Record = tuple[str, str, float, float]
+Span = tuple[float, float, float, float]  # device start, device end, host start, host end
+
+
+@dataclass
+class TimingResult:
+    """Everything one traced pass measured. ``None`` means "not measured"."""
+
+    # The legacy split. Same definitions as every earlier run.
+    vision_ms: float | None = None
+    prefill_ms: float | None = None
+    decode_ms: float | None = None
+    postgen_ms: float | None = None
+    expert_ms: float | None = None
+    total_ms: float | None = None
+    other_ms: float | None = None
+    n_vision_calls: int = 0
+    n_decode_steps: int = 0
+    n_expert_calls: int = 0
+    measured: bool = False
+
+    wall_ms: float | None = None
+    compute_span_ms: float | None = None
+    start_unix_s: float | None = None
+    start_host_s: float | None = None
+
+    vision_call_ms: list[float] = field(default_factory=list)
+    decode_step_ms: list[float] = field(default_factory=list)
+    decode_step_host_ms: list[float] = field(default_factory=list)
+    expert_step_ms: list[float] = field(default_factory=list)
+    expert_step_host_ms: list[float] = field(default_factory=list)
+
+    n_cuda_allocs: int | None = None
+    n_alloc_retries: int | None = None
+
+    graph_captures: int | None = None
+    graph_replays: int | None = None
+    graph_fallbacks: int | None = None
+    graph_n_graphs: int | None = None
+    graph_capture_ms: float | None = None
+    graph_mode: str | None = None
+
+    def legacy(self) -> dict[str, Any]:
+        """The keys ``predictions.parquet`` carries, with their schema-3 meaning."""
+        return {
+            "t_vision_ms": self.vision_ms,
+            "t_prefill_ms": self.prefill_ms,
+            "t_decode_ms": self.decode_ms,
+            "t_postgen_ms": self.postgen_ms,
+            "t_expert_ms": self.expert_ms,
+            "t_other_ms": self.other_ms,
+            "t_total_ms": self.total_ms,
+            "n_vision_calls": self.n_vision_calls,
+            "n_decode_steps": self.n_decode_steps,
+            "n_expert_calls": self.n_expert_calls,
+            "timing_measured": self.measured,
+        }
+
+    def row(self) -> dict[str, Any]:
+        """Everything for the timing row. Lists are copied: a reader that trims
+        its copy must not trim the record."""
+        out = self.legacy()
+        out.update({
+            "t_wall_ms": self.wall_ms,
+            "t_compute_span_ms": self.compute_span_ms,
+            "t_start_unix_s": self.start_unix_s,
+            "t_start_host_s": self.start_host_s,
+            "vision_call_ms": list(self.vision_call_ms),
+            "decode_step_ms": list(self.decode_step_ms),
+            "decode_step_host_ms": list(self.decode_step_host_ms),
+            "expert_step_ms": list(self.expert_step_ms),
+            "expert_step_host_ms": list(self.expert_step_host_ms),
+            "n_cuda_allocs": self.n_cuda_allocs,
+            "n_alloc_retries": self.n_alloc_retries,
+            "graph_captures": self.graph_captures,
+            "graph_replays": self.graph_replays,
+            "graph_fallbacks": self.graph_fallbacks,
+            "graph_n_graphs": self.graph_n_graphs,
+            "graph_capture_ms": self.graph_capture_ms,
+            "graph_mode": self.graph_mode,
+        })
+        return out
+
+
+def span_pairs(records: Iterable[Record], bucket: str) -> list[Span]:
+    """Pair each ``start`` with the next ``end`` of the same bucket, in order.
+
+    An ``end`` with no open ``start`` is ignored, and a ``start`` that never
+    closes is dropped: either means a mark was lost, and a half span has no
+    duration worth reporting.
+    """
+    out: list[Span] = []
+    pending: tuple[float, float] | None = None
+    for b, kind, device_ms, host_s in records:
+        if b != bucket:
+            continue
+        if kind == "start":
+            pending = (device_ms, host_s)
+        elif kind == "end" and pending is not None:
+            out.append((pending[0], device_ms, pending[1], host_s))
+            pending = None
+    return out
+
+
+def _device(spans: list[Span]) -> list[float]:
+    return [float(end - start) for start, end, _, _ in spans]
+
+
+def _host(spans: list[Span]) -> list[float]:
+    return [float((end - start) * 1000.0) for _, _, start, end in spans]
+
+
+def graph_mode(captures: int | None, replays: int | None, fallbacks: int | None) -> str | None:
+    """Which path a pass's expert steps took. ``None`` when no runner was installed.
+
+    A capture step is also counted as a replay by the runner, so ``capture``
+    means "captured at least once, never fell back".
+    """
+    if captures is None or replays is None or fallbacks is None:
+        return None
+    if fallbacks and (replays or captures):
+        return "mixed"
+    if fallbacks:
+        return "fallback"
+    if captures:
+        return "capture"
+    if replays:
+        return "replay"
+    return "none"
+
+
+def _delta(after: Mapping[str, int] | None, before: Mapping[str, int] | None,
+           key: str) -> int | None:
+    if after is None or before is None:
+        return None
+    return max(int(after.get(key, 0)) - int(before.get(key, 0)), 0)
+
+
+def resolve(
+    records: list[Record],
+    *,
+    wall_start_s: float | None = None,
+    wall_end_s: float | None = None,
+    start_unix_s: float | None = None,
+    alloc_before: tuple[int, int] | None = None,
+    alloc_after: tuple[int, int] | None = None,
+    graph_before: Mapping[str, int] | None = None,
+    graph_after: Mapping[str, int] | None = None,
+    capture_ms: float | None = None,
+) -> TimingResult:
+    """Attribute the marks of one pass.
+
+    The legacy definitions are kept exactly, so ``predictions.parquet`` goes on
+    meaning what it meant:
+
+    * the first language-model call is prefill, every later one is decode;
+    * expert time is the diffusion span when it was marked, else the sum of
+      the Euler steps;
+    * postgen is the device gap from generate's end to the diffusion start;
+    * total is the generate span plus postgen plus expert, and ``other`` is
+      what the named spans leave of it, floored at zero -- a negative
+      remainder means overlapping marks, not negative time.
+    """
+    result = TimingResult(start_unix_s=start_unix_s, start_host_s=wall_start_s)
+
+    runner = graph_after is not None and graph_before is not None
+    if runner:
+        result.graph_captures = _delta(graph_after, graph_before, "captures")
+        result.graph_replays = _delta(graph_after, graph_before, "replays")
+        result.graph_fallbacks = _delta(graph_after, graph_before, "eager_fallbacks")
+        result.graph_n_graphs = int(graph_after.get("graphs", 0))
+        result.graph_capture_ms = float(capture_ms or 0.0)
+    result.graph_mode = graph_mode(
+        result.graph_captures, result.graph_replays, result.graph_fallbacks)
+
+    if alloc_before is not None and alloc_after is not None:
+        result.n_cuda_allocs = max(alloc_after[0] - alloc_before[0], 0)
+        result.n_alloc_retries = max(alloc_after[1] - alloc_before[1], 0)
+
+    if not records:
+        return result
+
+    vision = span_pairs(records, "vision")
+    lm = span_pairs(records, "lm")
+    expert = span_pairs(records, "expert")
+    diffusion = span_pairs(records, "diffusion")
+    generate = span_pairs(records, "generate")
+
+    result.vision_call_ms = _device(vision)
+    result.n_vision_calls = len(vision)
+    result.vision_ms = float(sum(result.vision_call_ms))
+    result.prefill_ms = float(sum(_device(lm[:1])))
+    result.decode_step_ms = _device(lm[1:])
+    result.decode_step_host_ms = _host(lm[1:])
+    result.decode_ms = float(sum(result.decode_step_ms))
+    result.n_decode_steps = max(len(lm) - 1, 0)
+
+    result.expert_step_ms = _device(expert)
+    result.expert_step_host_ms = _host(expert)
+    result.n_expert_calls = len(expert)
+    # The diffusion span also covers the sampler's arithmetic between steps,
+    # which the per-step sum does not. Prefer it for the aggregate; keep the
+    # steps for the shape.
+    result.expert_ms = (float(sum(_device(diffusion))) if diffusion
+                        else float(sum(result.expert_step_ms)))
+
+    postgen = 0.0
+    if generate and diffusion:
+        postgen = max(diffusion[0][0] - generate[0][1], 0.0)
+    result.postgen_ms = float(postgen)
+    if generate:
+        result.total_ms = float(sum(_device(generate))) + result.postgen_ms + result.expert_ms
+        named = (result.vision_ms + result.prefill_ms + result.decode_ms
+                 + result.postgen_ms + result.expert_ms)
+        result.other_ms = float(max(result.total_ms - named, 0.0))
+    else:
+        result.total_ms = None
+        result.other_ms = None
+
+    result.compute_span_ms = (result.vision_ms + result.prefill_ms
+                              + result.decode_ms + result.expert_ms)
+    if wall_start_s is not None and wall_end_s is not None:
+        result.wall_ms = float((wall_end_s - wall_start_s) * 1000.0)
+    result.measured = True
+    return result
