@@ -53,12 +53,12 @@ import numpy as np
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 4
+TIMING_SCHEMA_VERSION = 5
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
 #: comparable on latency even when every other condition matches.
-TRACER_VERSION = 3
+TRACER_VERSION = 4
 
 CHANGELOG = {
     1: "Initial table: legacy spans, host wall clock, per-call arrays, allocator and "
@@ -70,6 +70,9 @@ CHANGELOG = {
     "Tracer 3 hooks the VLM forward and lm_head.",
     4: "Measurement protocol: overhead_probe, timing_repeats and repeat_clips conditions, "
     "pass_output_match. Warmup, probe and repeat passes are rows of their own kind.",
+    5: "Host side: the clip's stages outside the call (data, tokenization, copies, metrics, "
+    "figures), the spans before generate and after the head, first trajectory, thread CPU "
+    "per segment, context switches, RSS. Tracer 4 marks the call and stamps thread CPU.",
 }
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
@@ -264,8 +267,63 @@ PROTOCOL = _cols("condition", (
      "False means the passes were not replicates, and their timing differences are not noise."),
 ), since=4)
 
+#: The clip outside the model call, host clock. Main passes only: an extra pass
+#: reuses the prepared inputs and has no stages of its own.
+HOST = _cols("host", (
+    ("data_load_ms", "f64", "ms", "L", "Reading the clip from the cache, cameras included."),
+    ("data_ego_ms", "f64", "ms", "L", "Of which: fetching the egomotion feature."),
+    ("data_cam_fetch_ms", "f64", "ms", "L", "Of which: fetching the four camera features."),
+    ("data_cam_decode_ms", "f64", "ms", "L",
+     "Of which: decoding the frames on the CPU (PyAV, one thread)."),
+    ("msg_build_ms", "f64", "ms", "L", "Building the chat message around the frames."),
+    ("preprocess_ms", "f64", "ms", "L",
+     "The processor: image resize and patching plus text tokenization. With the copies and "
+     "trajectory tokenization this is the preprocessing component of NVIDIA's own analysis."),
+    ("preprocess_image_ms", "f64", "ms", "L", "Of which: the image processor."),
+    ("preprocess_text_ms", "f64", "ms", "L", "Of which: everything else -- the tokenizer."),
+    ("h2d_ms", "f64", "ms", "L", "Copying the inputs to the GPU (pageable, so it blocks)."),
+    ("model_call_ms", "f64", "ms", "L", "The main pass, host clock around the call."),
+    ("extra_passes_ms", "f64", "ms", "N", "Probe and repeat passes over this clip."),
+    ("result_cpu_ms", "f64", "ms", "L", "Bringing trajectories and text back to the host."),
+    ("metrics_ms", "f64", "ms", "L", "Displacement, kinematics, diversity, scene labels."),
+    ("render_ms", "f64", "ms", "L", "The sample figure, for clips that get one."),
+    ("flush_ms", "f64", "ms", "L", "Rewriting the run directory, on clips that flush."),
+    ("clip_wall_ms", "f64", "ms", "L", "The clip from its first stage to its last."),
+    ("clip_other_ms", "f64", "ms", "L", "The clip's wall clock that no stage accounts for."),
+), since=5)
+
+#: Inside the call but outside generate and the head, and what the CPU did.
+PASS_HOST = _cols("pass_host", (
+    ("t_pre_generate_ms", "f64", "ms", "L",
+     "Device clock from the call to generate: input deep copy and trajectory tokenization."),
+    ("t_pre_generate_host_ms", "f64", "ms", "L", "The same span, host clock."),
+    ("t_tail_ms", "f64", "ms", "L",
+     "Device clock from the head's end to the call's end: action-to-trajectory and text "
+     "extraction."),
+    ("t_action_to_traj_ms", "f64", "ms", "L", "Converting actions to the trajectory."),
+    ("t_first_traj_ms", "f64", "ms", "L",
+     "Device clock from the call to the trajectory existing -- what a planner waits for."),
+    ("t_fuse_traj_host_ms", "f64", "ms", "L", "Trajectory tokenization, host clock."),
+    ("t_expand_inputs_host_ms", "f64", "ms", "L",
+     "generate's K-fold copy of the inputs, pixels included, host clock."),
+    ("t_rope_index_host_ms", "f64", "ms", "L", "Rope index construction, a host loop per row."),
+    ("cpu_pass_ms", "f64", "ms", "N", "Main-thread CPU time over the call."),
+    ("cpu_pre_generate_ms", "f64", "ms", "N", "Main-thread CPU time before generate."),
+    ("cpu_vision_ms", "f64", "ms", "N", "Main-thread CPU time in the vision span."),
+    ("cpu_prefill_ms", "f64", "ms", "N", "Main-thread CPU time in the prefill span."),
+    ("cpu_decode_ms", "f64", "ms", "N", "Main-thread CPU time in the decode spans."),
+    ("cpu_postgen_ms", "f64", "ms", "N", "Main-thread CPU time between generate and the head."),
+    ("cpu_expert_ms", "f64", "ms", "N", "Main-thread CPU time in the head."),
+    ("cpu_tail_ms", "f64", "ms", "N", "Main-thread CPU time after the head."),
+    ("proc_cpu_ms", "f64", "ms", "N", "Process CPU time over the call, every thread."),
+    ("ctx_vol", "i32", "", "N", "Voluntary context switches of the main thread in the call."),
+    ("ctx_invol", "i32", "", "L",
+     "Involuntary ones: the thread was runnable and the scheduler took the core away."),
+    ("rss_bytes", "i64", "B", "L", "Process resident set at the end of the call."),
+), since=5)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
-                            + TRACE + GENERATE + PROTOCOL)
+                            + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -381,6 +439,14 @@ AGGREGATE_KEYS = (
     "trace.overhead_pct", "trace.overhead_lo", "trace.overhead_hi", "trace.overhead_n",
     "cold_start_ms", "cold_start_excess_ms", "latency_cv", "latency_cv_n",
     "timing.n_extra_rows", "pass.output_mismatch_sum",
+    "host.data_load_ms", "host.data_ego_ms", "host.data_cam_fetch_ms", "host.data_cam_decode_ms",
+    "host.msg_build_ms", "host.preprocess_ms", "host.preprocess_image_ms",
+    "host.preprocess_text_ms", "host.h2d_ms", "host.model_call_ms", "host.result_cpu_ms",
+    "host.metrics_ms", "host.render_ms", "host.flush_ms", "host.clip_wall_ms",
+    "host.clip_wall_ms_p95", "host.clip_other_ms", "host.paper_preprocess_ms",
+    "t_pre_generate_ms", "t_tail_ms", "t_action_to_traj_ms", "t_first_traj_ms",
+    "t_first_traj_ms_p95", "host.cpu_pass_ms", "host.cpu_decode_ms", "host.cpu_expert_ms",
+    "host.ctx_invol", "host.rss_max_gb",
 )
 
 
@@ -588,5 +654,28 @@ def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     out["lm_head_step_ms"] = _mean([h for a in _arrays(rows, "lm_head_step_ms") for h in a])
     violations = _values(rows, "trace_span_violations")
     out["trace.span_violations_sum"] = float(sum(violations)) if violations else None
+
+    for col in HOST:
+        if col.name != "extra_passes_ms":
+            out[f"host.{col.name}"] = _mean(_values(rows, col.name))
+    walls = _values(rows, "clip_wall_ms")
+    out["host.clip_wall_ms_p95"] = float(np.percentile(walls, 95)) if walls else None
+    # NVIDIA's latency analysis of Alpamayo counts preprocessing as one
+    # component: tokenizing images and text, and the trajectory history. The
+    # same boundary here, so the two can be put side by side.
+    paper = [sum(float(r[k]) for k in ("msg_build_ms", "preprocess_ms", "h2d_ms",
+                                         "t_fuse_traj_host_ms"))
+             for r in rows if all(is_number(r.get(k)) for k in (
+                 "msg_build_ms", "preprocess_ms", "h2d_ms", "t_fuse_traj_host_ms"))]
+    out["host.paper_preprocess_ms"] = _mean(paper)
+    for key in ("t_pre_generate_ms", "t_tail_ms", "t_action_to_traj_ms", "t_first_traj_ms"):
+        out[key] = _mean(_values(rows, key))
+    first = _values(rows, "t_first_traj_ms")
+    out["t_first_traj_ms_p95"] = float(np.percentile(first, 95)) if first else None
+    for key in ("cpu_pass_ms", "cpu_decode_ms", "cpu_expert_ms"):
+        out[f"host.{key}"] = _mean(_values(rows, key))
+    out["host.ctx_invol"] = _mean(_values(rows, "ctx_invol"))
+    rss = _values(rows, "rss_bytes")
+    out["host.rss_max_gb"] = max(rss) / 1e9 if rss else None
 
     return {k: float(v) for k, v in out.items() if v is not None and math.isfinite(v)}

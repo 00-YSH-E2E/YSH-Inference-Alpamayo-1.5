@@ -52,6 +52,8 @@ checkpoint:
 from __future__ import annotations
 
 import contextlib
+import os
+import resource
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -176,6 +178,40 @@ def _reduce_logits(logits_step: torch.Tensor, chosen: torch.Tensor) -> tuple[tor
     return chosen_logp, entropy
 
 
+def _process_stats() -> dict[str, Any] | None:
+    """Process CPU, the main thread's context switches, and resident memory.
+
+    Read outside the timed spans (at install and finalize), never at a mark:
+    a getrusage and a /proc read are cheap, but not free, and the point of the
+    marks is to cost next to nothing.
+    """
+    try:
+        times = os.times()
+        usage = resource.getrusage(resource.RUSAGE_THREAD)
+        with open("/proc/self/statm") as handle:
+            resident_pages = int(handle.read().split()[1])
+        return {
+            "cpu_s": times.user + times.system,
+            "nvcsw": usage.ru_nvcsw,
+            "nivcsw": usage.ru_nivcsw,
+            "rss_bytes": resident_pages * os.sysconf("SC_PAGE_SIZE"),
+        }
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _process_delta(before: dict[str, Any] | None,
+                   after: dict[str, Any] | None) -> dict[str, Any] | None:
+    if before is None or after is None:
+        return None
+    return {
+        "proc_cpu_ms": (after["cpu_s"] - before["cpu_s"]) * 1000.0,
+        "ctx_vol": max(after["nvcsw"] - before["nvcsw"], 0),
+        "ctx_invol": max(after["nivcsw"] - before["nivcsw"], 0),
+        "rss_bytes": after["rss_bytes"],
+    }
+
+
 class InferenceTracer:
     """Records token statistics and segment timing for calls made inside the block.
 
@@ -198,8 +234,11 @@ class InferenceTracer:
         self._x0: Any = None
         self._handles: list[Any] = []
         self._saved: dict[str, Any] = {}
-        #: ``(bucket, kind, event, perf_counter)`` in the order the host saw them.
-        self._marks: list[tuple[str, str, Any, float]] = []
+        #: ``(bucket, kind, event, perf_counter, thread_time)`` in host order.
+        self._marks: list[tuple[str, str, Any, float, float]] = []
+        #: Host milliseconds inside wrapped host-side functions, by name.
+        self._host_ms: dict[str, float] = {}
+        self._process0: dict[str, Any] | None = None
         self._enabled = False
         self._wall_start: float | None = None
         self._start_unix: float | None = None
@@ -217,8 +256,9 @@ class InferenceTracer:
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        if self.level == "off":
-            self._mark("call", "end")
+        # Brackets the call at every level: the spans before generate and after
+        # the head, and the time to the first trajectory, are measured from it.
+        self._mark("call", "end")
         self._remove()
 
     def _mark(self, bucket: str, kind: str) -> None:
@@ -230,9 +270,11 @@ class InferenceTracer:
         entered = time.perf_counter()
         event = _POOL.take()
         event.record()
-        # Stamped after record() so both clocks bracket the same instant.
+        # Stamped after record() so both clocks bracket the same instant. The
+        # thread's CPU time rides along: against the host clock it separates a
+        # busy host from one that was waiting or descheduled.
         stamp = time.perf_counter()
-        self._marks.append((bucket, kind, event, stamp))
+        self._marks.append((bucket, kind, event, stamp, time.thread_time()))
         # What the mark itself cost the host. Summed per pass, it is the
         # instrument's own share of the wall clock -- a number the recording
         # rules require and that no end-to-end comparison can recover later.
@@ -255,6 +297,7 @@ class InferenceTracer:
         self._enabled = True
         self._marks.clear()
         self._hook_s = 0.0
+        self._host_ms = {}
         self.timing = TimingResult()
         if torch.cuda.is_available():
             _POOL.acquire(self)
@@ -265,6 +308,7 @@ class InferenceTracer:
         # for vram_peak_gb, so resetting per clip would quietly redefine
         # that metric as the peak of the last clip.
         self._alloc0 = self._alloc_counters()
+        self._process0 = _process_stats()
         self._runner = self._graph_runner()
         self._graph0 = self._graph_counters()
         self._capture_ms = 0.0
@@ -349,6 +393,25 @@ class InferenceTracer:
         if diffusion is not None and hasattr(diffusion, "sample"):
             self._set_attr(diffusion, "sample", self._wrap_sample(diffusion.sample))
 
+        # Host-side work around generate that no module hook sees: every one is
+        # called through its instance, so an instance attribute intercepts it.
+        # fuse_traj_tokens runs before generate, the K-fold input copy and the
+        # rope index inside it, action_to_traj after the head.
+        for obj, name, key in (
+            (self.model, "fuse_traj_tokens", "fuse_traj"),
+            (vlm, "_expand_inputs_for_generation", "expand_inputs"),
+            (inner, "get_rope_index", "rope_index"),
+        ):
+            if obj is not None and callable(getattr(obj, name, None)):
+                self._set_attr(obj, name, self._wrap_host(getattr(obj, name), key))
+        space = getattr(self.model, "action_space", None)
+        if space is not None and callable(getattr(space, "action_to_traj", None)):
+            self._set_attr(space, "action_to_traj",
+                           self._wrap_host(space.action_to_traj, "action_to_traj", "a2t"))
+
+        # Last, so the call's span starts where the model's work does.
+        self._mark("call", "start")
+
     # -- counters ----------------------------------------------------------
     @staticmethod
     def _alloc_counters() -> tuple[int, int] | None:
@@ -400,6 +463,23 @@ class InferenceTracer:
             return dict(runner.stats)
         except Exception:
             return None
+
+    def _wrap_host(self, original: Any, key: str, bucket: str | None = None) -> Any:
+        """Time a host-side function; optionally mark it on the device as well."""
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if bucket is not None:
+                self._mark(bucket, "start")
+            started = time.perf_counter()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self._host_ms[key] = (self._host_ms.get(key, 0.0)
+                                      + (time.perf_counter() - started) * 1000.0)
+                if bucket is not None:
+                    self._mark(bucket, "end")
+
+        return wrapper
 
     def _wrap_capture(self, original: Any) -> Any:
         """Time the runner's capture and keep marks out of it."""
@@ -547,8 +627,8 @@ class InferenceTracer:
             anchor.record()
             anchor.synchronize()
             wall_end = time.perf_counter()
-            records = [(bucket, kind, -float(event.elapsed_time(anchor)), host)
-                       for bucket, kind, event, host in self._marks]
+            records = [(bucket, kind, -float(event.elapsed_time(anchor)), host, cpu)
+                       for bucket, kind, event, host, cpu in self._marks]
         self.timing = timing_math.resolve(
             records,
             wall_start_s=self._wall_start if records else None,
@@ -560,6 +640,8 @@ class InferenceTracer:
             graph_after=graph1,
             capture_ms=self._capture_ms,
             hook_ms=self._hook_s * 1000.0,
+            host_ms=self._host_ms,
+            process=_process_delta(self._process0, _process_stats()),
         )
         _POOL.release(self)
         return self.timing

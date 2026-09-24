@@ -233,3 +233,14 @@ def test_protocol_numbers_come_from_extra_passes():
     assert out["timing.n_extra_rows"] == 3.0
     # And none of the extra passes enters the latency means.
     assert out["t_wall_ms"] == 20000.0
+
+
+def test_host_stages_and_the_paper_boundary_are_aggregated():
+    out = TS.aggregate([row(data_load_ms=2200.0, msg_build_ms=5.0, preprocess_ms=200.0,
+                            h2d_ms=15.0, t_fuse_traj_host_ms=3.0, clip_wall_ms=16000.0,
+                            t_first_traj_ms=14000.0, rss_bytes=30e9, ctx_invol=7)])
+    assert out["host.data_load_ms"] == 2200.0
+    assert out["host.paper_preprocess_ms"] == pytest.approx(223.0)
+    assert out["t_first_traj_ms"] == 14000.0
+    assert out["host.rss_max_gb"] == pytest.approx(30.0)
+    assert set(out) <= set(TS.AGGREGATE_KEYS)

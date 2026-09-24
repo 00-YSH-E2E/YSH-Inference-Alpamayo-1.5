@@ -68,6 +68,7 @@ import physical_ai_av  # noqa: E402
 from alpamayo1_5 import helper  # noqa: E402
 from alpamayo1_5.load_physical_aiavdataset import load_physical_aiavdataset  # noqa: E402
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5  # noqa: E402
+from alpamayo1_5.trace import host_stages as HS  # noqa: E402
 from alpamayo1_5.trace import metrics as M  # noqa: E402
 from alpamayo1_5.trace import thermal as TH  # noqa: E402
 from alpamayo1_5.trace import timing_schema as TS  # noqa: E402
@@ -351,16 +352,25 @@ def prepare_clip(processor, avdi, clip_id: str, args) -> tuple[dict, dict, dict]
     probe, the repeats -- reuse these inputs rather than decoding the video
     again. The model deep-copies what it is given, so the inputs survive a pass.
     """
+    # Each stage adds to the clip's clock (host_stages); outside a clip -- the
+    # warmup -- there is no clock and nothing is recorded.
+    started = time.perf_counter()
     data = load_physical_aiavdataset(
         clip_id, t0_us=args.t0_us, avdi=avdi, maybe_stream=args.allow_stream
     )
+    HS.add_since("data_load_ms", started)
+    started = time.perf_counter()
     messages = helper.create_message(
         frames=data["image_frames"].flatten(0, 1), camera_indices=data["camera_indices"]
     )
+    HS.add_since("msg_build_ms", started)
+    started = time.perf_counter()
     inputs = processor.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=False,
         continue_final_message=True, return_dict=True, return_tensors="pt",
     )
+    HS.add_since("preprocess_ms", started)
+    started = time.perf_counter()
     model_inputs = helper.to_device(
         {
             "tokenized_data": inputs,
@@ -369,6 +379,7 @@ def prepare_clip(processor, avdi, clip_id: str, args) -> tuple[dict, dict, dict]
         },
         "cuda",
     )
+    HS.add_since("h2d_ms", started)
     diffusion_kwargs = {"temperature": args.diffusion_temperature}
     if args.inference_step is not None:
         diffusion_kwargs["inference_step"] = args.inference_step
@@ -430,12 +441,15 @@ def run_clip(
     other measurement goes to the timing table.
     """
     data, model_inputs, diffusion_kwargs = prepare_clip(processor, avdi, clip_id, args)
+    started = time.perf_counter()
     pred_xyz, pred_rot, extra, tracer = infer(
         model, clip_id, model_inputs, diffusion_kwargs, args, args.trace_level
     )
+    HS.add_since("model_call_ms", started)
     timing = tracer.timing
     trace = tracer.trace
 
+    started = time.perf_counter()
     pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2]  # [K, T, 2]
     gt = data.get("ego_future_xyz")
     gt_xy = gt.cpu()[0, 0, :, :2].numpy() if gt is not None else None
@@ -464,6 +478,8 @@ def run_clip(
         if trace is not None and k < trace.token_ids.shape[0]:
             row.update(trace.sample(k))
         rows.append(row)
+    HS.add_since("result_cpu_ms", started)
+    started = time.perf_counter()
 
     # t0_us belongs to the clip, not to the run: the pairing key across runs is
     # (clip_id, t0_us), and it is degenerate only for as long as nobody sweeps
@@ -511,15 +527,19 @@ def run_clip(
         extras.get("net_heading_abs_deg", 0.0), extras.get("lateral_offset_abs_m", 0.0)
     )
     extras["pred_xy"] = pred_xy
+    HS.add_since("metrics_ms", started)
 
     timing_rows = [{**timing.row(), "row_kind": "main", "pass_index": 0,
                     "trace_level": args.trace_level}]
+    started = time.perf_counter()
     for index, (kind, level) in enumerate(extra_passes, start=1):
         xyz, _, _, other = infer(model, clip_id, model_inputs, diffusion_kwargs, args, level)
         timing_rows.append({
             **other.timing.row(), "row_kind": kind, "pass_index": index, "trace_level": level,
             "pass_output_match": bool(torch.equal(xyz, pred_xyz)),
         })
+    if extra_passes:
+        HS.add_since("extra_passes_ms", started)
     return rows, extras, timing_rows
 
 
@@ -593,9 +613,11 @@ def main() -> None:
     }
 
     def execute(run: mlp.Run | None) -> None:
-        avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
+        # Wrapped so the data load splits into the ego fetch, the camera fetches
+        # and the CPU frame decode -- the last of which is most of it.
+        avdi = HS.wrap_dataset(physical_ai_av.PhysicalAIAVDatasetInterface(
             cache_dir=args.data_cache, revision=args.dataset_revision
-        )
+        ))
         load_kwargs = {"dtype": torch.bfloat16, "attn_implementation": args.attn}
         if args.model_revision:
             # Load the snapshot the coordinate names, not whatever main is today.
@@ -629,7 +651,8 @@ def main() -> None:
                 for cid, g in t.groupby("clip_id")
             }
             print(f"[x0] {len(args.x0_table)} clips of teacher noise from {args.x0_from}")
-        processor = helper.get_processor(model.tokenizer)
+        # Wrapped so tokenization splits into its image half and its text half.
+        processor = HS.wrap_processor(helper.get_processor(model.tokenizer))
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
@@ -741,6 +764,8 @@ def main() -> None:
                       f"{time.perf_counter() - started:.1f}s")
             for i, clip_id in enumerate(clips):
                 started = time.perf_counter()
+                clock = HS.StageClock()
+                HS.CURRENT.clock = clock
                 clip_rows, extras, clip_timing = run_clip(
                     model, processor, avdi, clip_id, args, out_dir,
                     extra_passes=extra_passes_for(i, args),
@@ -750,14 +775,18 @@ def main() -> None:
                 for timing_row in clip_timing:
                     timing_rows.append({**timing_base, **timing_row, "clip_id": clip_id,
                                         "t0_us": args.t0_us, "clip_index": i})
+                # The main pass is the clip's first row; its host stages are
+                # complete only once the figure and the flush below are done.
+                main_row = timing_rows[-len(clip_timing)]
                 if extras.get("gt_xy") is not None:
                     gt_rows.append({"clip_id": clip_id, "t0_us": args.t0_us, "gt_xy": extras["gt_xy"]})
                 if not args.no_samples and i < MAX_SAMPLE_IMAGES:
-                    render_sample(
-                        {**extras, "pred_xy": extras["pred_xy"]},
-                        extras["data"],
-                        out_dir / "samples" / f"{clip_id}.png",
-                    )
+                    with clock.span("render_ms"):
+                        render_sample(
+                            {**extras, "pred_xy": extras["pred_xy"]},
+                            extras["data"],
+                            out_dir / "samples" / f"{clip_id}.png",
+                        )
                 extras.pop("data", None)  # frames are large; do not hold them for the whole run
                 # A partial run directory is a valid one. It carries every row
                 # finished so far and a run.json that says it is partial, so a
@@ -765,10 +794,14 @@ def main() -> None:
                 # still read what completed. The final write below replaces it.
                 done = i + 1
                 if args.flush_every and done % args.flush_every == 0 and done < len(clips):
-                    W.write_run(out_dir, rows, config,
-                                {**identity, "partial": True, "n_clips_done": done},
-                                gt=gt_rows if args.include_gt else None, per_clip=per_clip,
-                                timing=timing_rows)
+                    with clock.span("flush_ms"):
+                        W.write_run(out_dir, rows, config,
+                                    {**identity, "partial": True, "n_clips_done": done},
+                                    gt=gt_rows if args.include_gt else None, per_clip=per_clip,
+                                    timing=timing_rows)
+                main_row.update(clock.row(
+                    clip_wall_ms=(time.perf_counter() - clock.started) * 1000.0))
+                HS.CURRENT.clock = None
                 reading = thermal.sample()
                 print(
                     f"[{i + 1}/{len(clips)}] {clip_id[:8]} "

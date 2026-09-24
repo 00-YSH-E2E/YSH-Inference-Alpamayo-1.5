@@ -25,7 +25,7 @@ with ends, attributing spans, subtracting remainders -- and it is where the
 bugs in a timing split live. As plain Python it runs in CI, where torch is not
 installed, against synthetic marks whose right answer is known.
 
-A record is ``(bucket, kind, device_ms, host_s)``:
+A record is ``(bucket, kind, device_ms, host_s[, cpu_s])``:
 
 * ``bucket`` names what was marked (``vision``, ``lm``, ``expert``,
   ``diffusion``, ``generate``);
@@ -33,7 +33,8 @@ A record is ``(bucket, kind, device_ms, host_s)``:
 * ``device_ms`` is the event's device time relative to a common anchor, so the
   difference of two is the device time between them;
 * ``host_s`` is ``perf_counter`` when the mark was recorded -- which is when
-  the work was *enqueued*, not when it ran.
+  the work was *enqueued*, not when it ran;
+* ``cpu_s``, optional, is the main thread's CPU time at the mark.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
-Record = tuple[str, str, float, float]
+Record = tuple  # (bucket, kind, device_ms, host_s) or with cpu_s appended
 Span = tuple[float, float, float, float]  # device start, device end, host start, host end
 
 
@@ -88,6 +89,20 @@ class TimingResult:
     postgen_model_ms: float | None = None
     trace_n_marks: int | None = None
     trace_hook_host_ms: float | None = None
+
+    pre_generate_ms: float | None = None
+    pre_generate_host_ms: float | None = None
+    tail_ms: float | None = None
+    action_to_traj_ms: float | None = None
+    first_traj_ms: float | None = None
+    fuse_traj_host_ms: float | None = None
+    expand_inputs_host_ms: float | None = None
+    rope_index_host_ms: float | None = None
+    cpu_ms: dict[str, float] = field(default_factory=dict)
+    proc_cpu_ms: float | None = None
+    ctx_vol: int | None = None
+    ctx_invol: int | None = None
+    rss_bytes: int | None = None
 
     gen_preamble_ms: float | None = None
     lm_head_ms: float | None = None
@@ -151,8 +166,26 @@ class TimingResult:
             "lm_head_step_ms": list(self.lm_head_step_ms),
             "decode_gap_ms": list(self.decode_gap_ms),
             "trace_span_violations": self.span_violations,
+            "t_pre_generate_ms": self.pre_generate_ms,
+            "t_pre_generate_host_ms": self.pre_generate_host_ms,
+            "t_tail_ms": self.tail_ms,
+            "t_action_to_traj_ms": self.action_to_traj_ms,
+            "t_first_traj_ms": self.first_traj_ms,
+            "t_fuse_traj_host_ms": self.fuse_traj_host_ms,
+            "t_expand_inputs_host_ms": self.expand_inputs_host_ms,
+            "t_rope_index_host_ms": self.rope_index_host_ms,
+            **{f"cpu_{name}_ms": self.cpu_ms.get(name) for name in CPU_SEGMENTS},
+            "proc_cpu_ms": self.proc_cpu_ms,
+            "ctx_vol": self.ctx_vol,
+            "ctx_invol": self.ctx_invol,
+            "rss_bytes": self.rss_bytes,
         })
         return out
+
+
+#: The segments main-thread CPU time is split into.
+CPU_SEGMENTS = ("pass", "pre_generate", "vision", "prefill", "decode", "postgen", "expert",
+                "tail")
 
 
 def span_pairs(records: Iterable[Record], bucket: str) -> list[Span]:
@@ -164,7 +197,7 @@ def span_pairs(records: Iterable[Record], bucket: str) -> list[Span]:
     """
     out: list[Span] = []
     pending: tuple[float, float] | None = None
-    for b, kind, device_ms, host_s in records:
+    for b, kind, device_ms, host_s, *_ in records:
         if b != bucket:
             continue
         if kind == "start":
@@ -207,6 +240,68 @@ def _delta(after: Mapping[str, int] | None, before: Mapping[str, int] | None,
     if after is None or before is None:
         return None
     return max(int(after.get(key, 0)) - int(before.get(key, 0)), 0)
+
+
+def _cpu_pairs(records: Iterable[Record], bucket: str) -> list[tuple[float, float]]:
+    """Main-thread CPU time at each start and end of ``bucket``, paired in order."""
+    out: list[tuple[float, float]] = []
+    pending: float | None = None
+    for r in records:
+        if r[0] != bucket or len(r) < 5 or r[4] is None:
+            continue
+        if r[1] == "start":
+            pending = r[4]
+        elif pending is not None:
+            out.append((pending, r[4]))
+            pending = None
+    return out
+
+
+def _split_host(result: TimingResult, records: list[Record], generate: list[Span],
+                diffusion: list[Span]) -> None:
+    """The call outside generate and the head, and main-thread CPU per segment.
+
+    The call is bracketed by its own marks, so the spans before generate
+    (deep copy, trajectory tokenization) and after the head (action to
+    trajectory, text extraction) are measured rather than left inside wall.
+    """
+    call = span_pairs(records, "call")
+    a2t = span_pairs(records, "a2t")
+    if call and generate:
+        result.pre_generate_ms = float(max(generate[0][0] - call[0][0], 0.0))
+        result.pre_generate_host_ms = float(max((generate[0][2] - call[0][2]) * 1000.0, 0.0))
+    if call and diffusion:
+        result.tail_ms = float(max(call[-1][1] - diffusion[-1][1], 0.0))
+    if a2t:
+        result.action_to_traj_ms = float(sum(_device(a2t)))
+        if call:
+            result.first_traj_ms = float(a2t[-1][1] - call[0][0])
+
+    cpu = {name: _cpu_pairs(records, name)
+           for name in ("call", "generate", "vision", "lm", "diffusion")}
+    ms: dict[str, float] = {}
+
+    def total(pairs: list[tuple[float, float]]) -> float:
+        return float(sum(end - start for start, end in pairs) * 1000.0)
+
+    if cpu["call"]:
+        ms["pass"] = total(cpu["call"])
+    if cpu["vision"]:
+        ms["vision"] = total(cpu["vision"])
+    if cpu["lm"]:
+        ms["prefill"] = total(cpu["lm"][:1])
+        ms["decode"] = total(cpu["lm"][1:])
+    if cpu["diffusion"]:
+        ms["expert"] = total(cpu["diffusion"])
+    # The gaps between spans: call start to generate start, generate end to
+    # the head's start, the head's end to the call's end.
+    if cpu["call"] and cpu["generate"]:
+        ms["pre_generate"] = max((cpu["generate"][0][0] - cpu["call"][0][0]) * 1000.0, 0.0)
+    if cpu["generate"] and cpu["diffusion"]:
+        ms["postgen"] = max((cpu["diffusion"][0][0] - cpu["generate"][0][1]) * 1000.0, 0.0)
+    if cpu["diffusion"] and cpu["call"]:
+        ms["tail"] = max((cpu["call"][-1][1] - cpu["diffusion"][-1][1]) * 1000.0, 0.0)
+    result.cpu_ms = ms
 
 
 def _split_generate(result: TimingResult, records: list[Record], generate: list[Span],
@@ -264,6 +359,8 @@ def resolve(
     graph_after: Mapping[str, int] | None = None,
     capture_ms: float | None = None,
     hook_ms: float | None = None,
+    host_ms: Mapping[str, float] | None = None,
+    process: Mapping[str, Any] | None = None,
 ) -> TimingResult:
     """Attribute the marks of one pass.
 
@@ -293,6 +390,16 @@ def resolve(
     if alloc_before is not None and alloc_after is not None:
         result.n_cuda_allocs = max(alloc_after[0] - alloc_before[0], 0)
         result.n_alloc_retries = max(alloc_after[1] - alloc_before[1], 0)
+
+    if process:
+        result.proc_cpu_ms = process.get("proc_cpu_ms")
+        result.ctx_vol = process.get("ctx_vol")
+        result.ctx_invol = process.get("ctx_invol")
+        result.rss_bytes = process.get("rss_bytes")
+    if host_ms:
+        result.fuse_traj_host_ms = host_ms.get("fuse_traj")
+        result.expand_inputs_host_ms = host_ms.get("expand_inputs")
+        result.rope_index_host_ms = host_ms.get("rope_index")
 
     if not records:
         return result
@@ -351,6 +458,7 @@ def resolve(
                                                 0.0))
 
     _split_generate(result, records, generate, wall_start_s)
+    _split_host(result, records, generate, diffusion)
 
     spans = [v for v in (result.vision_ms, result.prefill_ms, result.decode_ms,
                          result.expert_ms) if v is not None]

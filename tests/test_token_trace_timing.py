@@ -138,6 +138,7 @@ class _Model:
         # An instance attribute, like a sampler set on an object: removal must
         # restore it rather than delete it.
         self.diffusion = types.SimpleNamespace(sample=self._sample)
+        self.action_space = types.SimpleNamespace(action_to_traj=lambda x: x * 2.0)
 
     def _sample(self, **kwargs):
         x = torch.randn(4, 256, device="cuda")
@@ -149,7 +150,7 @@ class _Model:
     def run(self) -> None:
         ids = torch.ones(1, 5, dtype=torch.long, device="cuda")
         self.vlm.generate(input_ids=ids)
-        self.diffusion.sample()
+        self.action_space.action_to_traj(self.diffusion.sample())
 
 
 needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -175,8 +176,8 @@ def test_a_traced_pass_fills_both_clocks_and_every_array():
     assert tracer.trace.x0.shape == (4, 256)
     # Tracer 2 accounts for itself: its logits pass, its marks, their host cost.
     # vision 2 + lm 6 + vlm 6 + lm_head 6 + generate 2 + consume 2 + diffusion 2
-    # + expert 8.
-    assert t.trace_n_marks == 34
+    # + expert 8 + call 2 + a2t 2.
+    assert t.trace_n_marks == 38
     assert t.trace_consume_ms is not None and t.trace_consume_ms >= 0.0
     assert t.postgen_model_ms <= t.postgen_ms
     assert t.trace_hook_host_ms > 0.0
@@ -187,6 +188,12 @@ def test_a_traced_pass_fills_both_clocks_and_every_array():
     parts = t.gen_preamble_ms + t.lm_head_ms + t.vlm_glue_ms + t.gen_loop_ms
     assert parts == pytest.approx(t.other_ms, abs=1e-3)
     assert 0.0 < t.ttft_ms <= t.wall_ms
+    # Tracer 4 brackets the call and stamps the thread's CPU time.
+    assert t.pre_generate_ms >= 0.0 and t.tail_ms >= 0.0
+    assert 0.0 < t.first_traj_ms <= t.wall_ms
+    assert t.action_to_traj_ms >= 0.0
+    assert t.cpu_ms["pass"] > 0.0
+    assert t.rss_bytes > 0 and t.ctx_vol is not None
 
 
 @needs_gpu

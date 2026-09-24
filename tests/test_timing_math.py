@@ -209,3 +209,53 @@ def test_spans_that_were_never_marked_are_absent_not_zero():
     assert t.vision_ms is None and t.prefill_ms is None and t.decode_ms is None
     assert t.expert_ms is None and t.postgen_ms is None and t.total_ms is None
     assert t.compute_span_ms is None
+
+
+# -- the call's own span, and the CPU (table 5) ----------------------------------
+def host_pass():
+    """call 0-200 with cpu stamps; generate 20-100; diffusion 110-170; a2t 175-185."""
+    spans = (("call", 0, 200), ("generate", 20, 100), ("lm", 30, 50), ("lm", 60, 70),
+             ("diffusion", 110, 170), ("a2t", 175, 185))
+    out = []
+    for bucket, start, end in spans:
+        # CPU runs at half the host clock here, so every CPU figure is half.
+        out.append((bucket, "start", float(start), start / 1000.0, start / 2000.0))
+        out.append((bucket, "end", float(end), end / 1000.0, end / 2000.0))
+    return sorted(out, key=lambda r: (r[2], r[1] == "start"))
+
+
+def test_the_call_brackets_what_generate_and_the_head_leave_out():
+    t = TM.resolve(host_pass())
+    assert t.pre_generate_ms == pytest.approx(20.0)
+    assert t.pre_generate_host_ms == pytest.approx(20.0)
+    assert t.tail_ms == pytest.approx(30.0)
+    assert t.action_to_traj_ms == pytest.approx(10.0)
+    assert t.first_traj_ms == pytest.approx(185.0)
+
+
+def test_cpu_time_is_split_by_segment():
+    cpu = TM.resolve(host_pass()).cpu_ms
+    assert cpu["pass"] == pytest.approx(100.0)
+    assert cpu["pre_generate"] == pytest.approx(10.0)
+    assert cpu["prefill"] == pytest.approx(10.0)
+    assert cpu["decode"] == pytest.approx(5.0)
+    assert cpu["postgen"] == pytest.approx(5.0)
+    assert cpu["expert"] == pytest.approx(30.0)
+    assert cpu["tail"] == pytest.approx(15.0)
+
+
+def test_four_field_records_still_resolve_without_cpu():
+    t = TM.resolve(one_pass())
+    assert t.cpu_ms == {} and t.total_ms is not None
+
+
+def test_host_and_process_figures_pass_through():
+    t = TM.resolve(host_pass(), host_ms={"fuse_traj": 1.5, "expand_inputs": 4.0},
+                   process={"proc_cpu_ms": 90.0, "ctx_vol": 3, "ctx_invol": 1,
+                            "rss_bytes": 2 ** 30})
+    row = t.row()
+    assert row["t_fuse_traj_host_ms"] == 1.5 and row["t_expand_inputs_host_ms"] == 4.0
+    assert row["t_rope_index_host_ms"] is None
+    assert (row["ctx_vol"], row["ctx_invol"], row["rss_bytes"]) == (3, 1, 2 ** 30)
+    assert row["cpu_pass_ms"] == pytest.approx(100.0)
+    assert not TS.unknown_keys(row)
