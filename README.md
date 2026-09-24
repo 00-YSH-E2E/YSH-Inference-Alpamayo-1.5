@@ -352,6 +352,25 @@ second launch fails at once instead of quietly contaminating the first.
 trajectory head through CUDA graphs. Whether each step replayed or fell back to
 eager is recorded per pass in `timing.parquet`.
 
+**What a run measures is in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)** —
+every column of `timing.parquet`, `thermal.parquet`, `layers.parquet` and
+`kernels.parquet`, every MLflow key, and the settings that turn each on. It is
+rendered from the registry in `src/alpamayo1_5/trace/timing_schema.py`, so it
+cannot drift from the code. In short: every pass is timed on both clocks and cut
+into segments; `TRACE_LEVEL=step|layer` goes inside the steps and the layers;
+`PROFILE_CLIPS`, `FLOP_COUNT` and `ROOFLINE_PROBE` add a torch.profiler pass, a
+counted pass and the board's peaks; the board is sampled at `SAMPLE_HZ` for
+energy, clocks and throttling. Extra passes never enter a latency mean, and
+`predictions.parquet` stays at schema 3.
+
+To compare latency between runs — same machine, power mode, driver, software,
+trace level and tracer, or it refuses:
+
+```bash
+python scripts/compare_sweep.py --runs-root "$OUT_ROOT" --match '*_k*' \
+    --axis num_traj_samples --baseline 1 --timing
+```
+
 To run several configurations, edit the axes at the top of `scripts/run_sweep.sh`
 and run that instead. It is hydra's `--multirun` idea — list values on an axis
 and the combinations all run:
@@ -491,18 +510,28 @@ Launched from a different repo, a run records that repo's commit instead.
 | `scripts/run_sweep.sh` | Several configurations in one command. N runs sharing a `sweep` tag, not one run with N results |
 | `scripts/smoke_inference.py` | Does the model load and produce a trajectory on this board? No recording |
 | `scripts/ml_platform_track.py` | The recording helper. A byte-identical copy of `examples/ml_platform_track.py` in the ML_Platform repo — that one is canonical |
-| `src/alpamayo1_5/trace/token_trace.py` | Per-token logprob and entropy, CUDA-event timing split |
+| `scripts/compare_sweep.py` | Paired comparison of finished runs: accuracy, or latency with `--timing` |
+| `src/alpamayo1_5/trace/token_trace.py` | Per-token logprob and entropy; the tracer's marks at every level |
+| `src/alpamayo1_5/trace/timing_schema.py` | The registry: every timing column, its type and unit, and the MLflow aggregates |
+| `src/alpamayo1_5/trace/timing_math.py` | Marks to a timing row: segments, both clocks, steps, layers |
+| `src/alpamayo1_5/trace/host_stages.py` | The host stages around the model call |
+| `src/alpamayo1_5/trace/profile_parse.py` | A profile pass's trace to kernels, true idle, launches and SDPA backends |
+| `src/alpamayo1_5/trace/roofline.py` | Analytic FLOPs and bytes per segment, efficiency against the roof |
+| `src/alpamayo1_5/trace/flop_count.py` | The work model read off the model, the counted pass, the board's peaks |
+| `src/alpamayo1_5/trace/compare.py` | The pairing gates and the paired statistics behind `compare_sweep.py` |
 | `src/alpamayo1_5/trace/metrics.py` | ADE/FDE, kinematic feasibility, scene classification, token quality |
-| `src/alpamayo1_5/trace/thermal.py` | Jetson temperature and rail power, read from sysfs |
-| `src/alpamayo1_5/trace/writer.py` | The run directory: schema, versioning, what may be uploaded |
+| `src/alpamayo1_5/trace/thermal.py` | The board sampler: rails, clocks, over-current counters, temperatures |
+| `src/alpamayo1_5/trace/writer.py` | The run directory: schemas, versioning, what may be uploaded |
+| `src/alpamayo1_5/trace/measurements_doc.py` | Renders docs/MEASUREMENTS.md from the registry |
 
 ## Tests
 
 ```bash
-pytest                    # 52 tests, no GPU required
+pytest                    # no GPU required; the GPU tests skip without one
 ```
 
-They cover the displacement arithmetic, the run-directory schema and the
-recording rules — the parts that fail silently rather than loudly. CI runs the
-same set. **Green in CI does not mean green on Thor:** nothing there exercises
-the model, the CUDA-event timing, or thermal reading on real hardware.
+They cover the displacement arithmetic, the run-directory schema, the timing
+arithmetic and the recording rules — the parts that fail silently rather than
+loudly. CI runs the same set without torch. **Green in CI does not mean green on
+Thor:** the tracer, the profiler and counted passes, and the board sampler run
+only in the GPU tests and in a real run.

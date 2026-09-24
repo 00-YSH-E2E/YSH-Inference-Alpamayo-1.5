@@ -4,9 +4,17 @@
 changing:
 
 - **Anything under `src/alpamayo1_5/trace/`, `scripts/`, `tests/` or `.github/`**
-  belongs to this fork. Open an issue or PR *here*. `pytest` must pass (52 tests,
-  no GPU needed) and `ruff check --line-length 100` must be clean on those paths;
-  CI enforces both, and `pre-commit install` runs the same checks locally.
+  belongs to this fork. Open an issue or PR *here*. `pytest` must pass (no GPU
+  needed; the GPU tests skip) and `ruff check --line-length 100` must be clean on
+  those paths; CI enforces both, and `pre-commit install` runs the same checks
+  locally.
+- **A new measurement** is a column declared in
+  `src/alpamayo1_5/trace/timing_schema.py` — with its type, unit, direction and
+  the version that added it — never a key added to a row on the side: the
+  writer drops undeclared keys. Adding columns bumps `TIMING_SCHEMA_VERSION`
+  with a changelog line; `predictions.parquet` stays at its frozen schema. Then
+  regenerate the page: `python -m alpamayo1_5.trace.measurements_doc >
+  docs/MEASUREMENTS.md` (a test fails until you do).
 - **Anything else** is upstream [NVlabs/alpamayo1.5](https://github.com/NVlabs/alpamayo1.5)
   code. Fixes belong there — nobody watching this repo can merge them into the
   model everyone else uses. Upstream's rules follow below and are unmodified.

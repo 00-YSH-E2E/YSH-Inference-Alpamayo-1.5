@@ -145,8 +145,8 @@ IDENTITY = _cols("identity", (
     ("t0_us", "i64", "us", "N", "Sample timestamp within the clip."),
     ("clip_index", "i32", "", "N", "Position of the clip in the run's clip list."),
     ("row_kind", "s", "", "N",
-     "main | warmup | probe | repeat | profile | memsnap. Only main rows feed predictions "
-     "and latency aggregates."),
+     "main | warmup | probe | repeat | memsnap | flops | profile. Only main rows feed "
+     "predictions and latency aggregates."),
     ("pass_index", "i16", "", "N",
      "0 for a clip's main pass; extra passes over the same clip count up from 1."),
     ("t_start_unix_s", "f64", "s", "N", "Wall-clock time the pass started, Unix seconds."),

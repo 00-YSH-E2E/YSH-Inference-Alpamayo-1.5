@@ -351,6 +351,23 @@ def write_timing(out_dir: Path, rows: list[dict]) -> Path | None:
     return path
 
 
+_THERMAL_COLUMNS = (
+    ("thermal_schema_version", "i16", "This table's version."),
+    ("run_id", "s", "The run."),
+    ("tick", "i32", "The sampler's tick; the slow sensors read on every fifth, at most."),
+    ("t_host_s", "f64", "perf_counter at the reading -- the clock the tracer's host marks use."),
+    ("t_unix_s", "f64", "Wall-clock time at the reading."),
+    ("read_ms", "f32", "What the tick's reads took."),
+    ("clip_index", "i32", "The clip running then; null between clips."),
+    ("phase", "s", "What the runner was doing: idle, warmup, load, infer, post, extra, "
+                   "between."),
+    ("sensor", "s", "Which reading: power.<rail>, freq.gpu, freq.emc, freq.cpu_<policy>, "
+                    "oc.oc<n>, cool.<device>, fan.*, util.gpu, and the thermal zones."),
+    ("value", "f64", "The reading."),
+    ("unit", "s", "Its unit."),
+)
+
+
 def write_thermal(out_dir: Path, thermal: Any, run_id: str | None = None) -> Path | None:
     """The board sampler's full series, long format: one row per sensor reading.
 
@@ -368,12 +385,7 @@ def write_thermal(out_dir: Path, thermal: Any, run_id: str | None = None) -> Pat
     from alpamayo1_5.trace import thermal as TH
 
     n = len(table["tick"])
-    schema = pa.schema([
-        ("thermal_schema_version", pa.int16()), ("run_id", pa.string()),
-        ("tick", pa.int32()), ("t_host_s", pa.float64()), ("t_unix_s", pa.float64()),
-        ("read_ms", pa.float32()), ("clip_index", pa.int32()), ("phase", pa.string()),
-        ("sensor", pa.string()), ("value", pa.float64()), ("unit", pa.string()),
-    ])
+    schema = pa.schema([(name, _arrow(kind)) for name, kind, _ in _THERMAL_COLUMNS])
     columns = {"thermal_schema_version": [TH.THERMAL_SCHEMA_VERSION] * n,
                "run_id": [run_id] * n, **table}
     path = Path(out_dir) / "thermal.parquet"
@@ -381,11 +393,29 @@ def write_thermal(out_dir: Path, thermal: Any, run_id: str | None = None) -> Pat
     return path
 
 
+#: The join to a timing row, first in every long table after its version.
+_JOIN = (
+    ("run_id", "s", "The run."),
+    ("clip_id", "s", "The clip."),
+    ("clip_index", "i32", "Its position in the run."),
+    ("row_kind", "s", "The pass's kind, as in timing.parquet."),
+    ("pass_index", "i16", "The pass's index on the clip, as in timing.parquet."),
+    ("timing_schema_version", "i16", "timing.parquet's version when this was written."),
+    ("tracer_version", "i16", "The tracer's version when this was written."),
+)
+
 _LAYER_COLUMNS = (
-    ("layers_schema_version", "i16"), ("run_id", "s"), ("clip_id", "s"), ("clip_index", "i32"),
-    ("row_kind", "s"), ("pass_index", "i16"), ("timing_schema_version", "i16"),
-    ("tracer_version", "i16"), ("stack", "s"), ("phase", "s"), ("call_index", "i16"),
-    ("layer", "i16"), ("part", "s"), ("device_ms", "f32"), ("host_ms", "f32"),
+    ("layers_schema_version", "i16", "This table's version."),
+    *_JOIN,
+    ("stack", "s", "vision, lm or expert."),
+    ("phase", "s", "vision, prefill, decode or expert: the language model's call 0 is the "
+                   "prefill."),
+    ("call_index", "i16", "The stack's n-th call in the pass: a decode or Euler step."),
+    ("layer", "i16", "The layer's index in its stack."),
+    ("part", "s", "attn, mlp, or block -- the whole layer, so block - attn - mlp is its norms "
+                  "and residuals."),
+    ("device_ms", "f32", "The span on the device clock."),
+    ("host_ms", "f32", "The span on the host clock."),
 )
 
 
@@ -402,12 +432,26 @@ def write_layers(out_dir: Path, rows: list[dict]) -> Path | None:
 
 
 _KERNEL_COLUMNS = (
-    ("kernels_schema_version", "i16"), ("run_id", "s"), ("clip_id", "s"), ("clip_index", "i32"),
-    ("row_kind", "s"), ("pass_index", "i16"), ("timing_schema_version", "i16"),
-    ("tracer_version", "i16"), ("kind", "s"), ("segment", "s"), ("step_index", "i16"),
-    ("name", "s"), ("op", "s"), ("category", "s"), ("stream", "i32"), ("start_us", "f64"),
-    ("dur_us", "f32"), ("launch_us", "f32"), ("lead_us", "f32"), ("grid_size", "i64"),
-    ("block_size", "i32"), ("regs_per_thread", "i16"), ("smem_bytes", "i32"),
+    ("kernels_schema_version", "i16", "This table's version."),
+    *_JOIN,
+    ("kind", "s", "kernel, memcpy or memset."),
+    ("segment", "s", "The host segment whose code launched it (profile_parse.SEGMENTS)."),
+    ("step_index", "i16", "The decode, Euler or vision call it was launched in; null "
+                          "elsewhere."),
+    ("name", "s", "The kernel's name."),
+    ("op", "s", "The innermost op that launched it; null for none."),
+    ("category", "s", "What it did (profile_parse.CATEGORIES): from the op, SDPA first, "
+                      "else from the name."),
+    ("stream", "i32", "The CUDA stream."),
+    ("start_us", "f64", "Its start, microseconds from the call's start."),
+    ("dur_us", "f32", "Its duration."),
+    ("launch_us", "f32", "Its launch call's duration on the host, blocking included."),
+    ("lead_us", "f32", "From the launch call's return to its start. Near zero, the device "
+                       "was waiting on the host."),
+    ("grid_size", "i64", "Blocks in the grid."),
+    ("block_size", "i32", "Threads per block."),
+    ("regs_per_thread", "i16", "Registers per thread."),
+    ("smem_bytes", "i32", "Shared memory per block."),
 )
 
 
@@ -423,7 +467,14 @@ def write_kernels(out_dir: Path, rows: list[dict]) -> Path | None:
                        TS.KERNELS_SCHEMA_VERSION, rows)
 
 
-def _write_long(path: Path, columns: tuple[tuple[str, str], ...], version: int,
+def _arrow(kind: str) -> Any:
+    import pyarrow as pa
+
+    return {"i16": pa.int16(), "i32": pa.int32(), "i64": pa.int64(), "f32": pa.float32(),
+            "f64": pa.float64(), "s": pa.string()}[kind]
+
+
+def _write_long(path: Path, columns: tuple[tuple[str, str, str], ...], version: int,
                 rows: list[dict]) -> Path | None:
     """A long table with an explicit schema; its first column is its version."""
     if not rows:
@@ -431,10 +482,8 @@ def _write_long(path: Path, columns: tuple[tuple[str, str], ...], version: int,
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    types = {"i16": pa.int16(), "i32": pa.int32(), "i64": pa.int64(), "f32": pa.float32(),
-             "f64": pa.float64(), "s": pa.string()}
-    schema = pa.schema([(name, types[kind]) for name, kind in columns])
-    first, rest = columns[0][0], [name for name, _ in columns[1:]]
+    schema = pa.schema([(name, _arrow(kind)) for name, kind, _ in columns])
+    first, rest = columns[0][0], [name for name, _, _ in columns[1:]]
     table = pa.Table.from_pylist([{first: version, **{k: r.get(k) for k in rest}} for r in rows],
                                  schema=schema)
     pq.write_table(table, path, compression="zstd")
