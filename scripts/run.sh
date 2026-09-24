@@ -67,6 +67,10 @@ SEED=42                                  # 클립마다 추론 직전에 건다.
                                          # → 같은 초기 노이즈.  paired 비교의 전제다
 MAX_GENERATION_LENGTH=256                # 상한일 뿐. 실측 CoT 는 6~14 토큰이다
 MODEL="nvidia/Alpamayo-1.5-10B"
+# 허브 체크포인트의 리비전.  비우면 러너가 정한다 — 기본 모델이면 이 기계 캐시의 스냅숏 sha,
+# 다른 허브 모델이면 main 을 기록 시점에 sha 로 푼다.  좌표에 @main 이 남으면 내일 다른 커밋을
+# 가리키므로 (기록 규약 §10), 다른 허브 모델을 쓸 때는 40자리 sha 를 적는다
+MODEL_REVISION=""
 # ──────────────────────────────────────────────────────────────────────────
 
 INFERENCE_STEP=10                        # Euler 적분 스텝.  ⚠️ 비우면 열이 null 로 남아
@@ -153,6 +157,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # 거기에 ${VAR:-기본값} 을 쓰면 읽기 어려워지고, 무엇이 기본값인지 흐려진다.
 VARIANT="${OVERRIDE_VARIANT:-$VARIANT}"
 MODEL="${OVERRIDE_MODEL:-$MODEL}"
+MODEL_REVISION="${OVERRIDE_MODEL_REVISION:-$MODEL_REVISION}"
 # 클립 목록은 **비교 축이 아니라 실험의 경계**다. 한 sweep 안에서 바뀌면 arm 마다
 # 다른 클립을 보게 되어 paired 비교가 성립하지 않으므로 SWEEP_ 축은 두지 않는다.
 # 대신 오버라이드는 둔다 — 같은 sweep 을 다른 세트로 한 번 더 돌리는 건 별개의 실험이고,
@@ -385,6 +390,7 @@ ARGS=(
 [[ -n "${LABEL:-}" ]]      && ARGS+=(--label "$LABEL")
 [[ -n "$INFERENCE_STEP" ]] && ARGS+=(--inference-step "$INFERENCE_STEP")
 [[ -n "$X0_FROM" ]]        && ARGS+=(--x0-from "$X0_FROM")
+[[ -n "$MODEL_REVISION" ]] && ARGS+=(--model-revision "$MODEL_REVISION")
 # 클립을 직접 지정했으면 목록과 개수 제한은 뜻이 없다
 if [[ ${#CLIP_IDS[@]} -gt 0 ]]; then
   for c in "${CLIP_IDS[@]}"; do ARGS+=(--clip-id "$c"); done

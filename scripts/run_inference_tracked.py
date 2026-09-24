@@ -130,6 +130,31 @@ _BUCKET_METRICS = ("min_ade", "mean_ade", "min_fde", "sample_gain", "diversity_f
 # of the experiment definition, not an environment detail.
 DATASET_REVISION = "b719eea7f0a63619ef51ec7f54178af0937ef050"
 
+# The same for the checkpoint: the snapshot this machine's cache holds. The
+# recording rules forbid `@main` as a coordinate -- tomorrow it names another
+# commit -- and until now both coordinates were recorded as `@main` and resolved
+# to whatever main was at record time, which is not necessarily what was read.
+# Applied only to MODEL_REPO: another hub checkpoint has its own history, and
+# NVIDIA's sha would not name anything in it.
+MODEL_REVISION = "7aba8293c09993f2e125c6819df05d7fa3e873ea"
+
+
+def resolve_model_revision(model: str, revision: str | None) -> str | None:
+    """The revision to load and to record. None: a local directory, or a hub
+    checkpoint whose revision nobody pinned (the tracker resolves `@main` then)."""
+    if Path(model).is_dir():
+        return None
+    if revision:
+        return revision
+    return MODEL_REVISION if model == MODEL_REPO else None
+
+
+def model_coordinate(model: str, revision: str | None) -> str:
+    """``model_source`` as the recording rules want it: a path, or a hub id at a sha."""
+    if Path(model).is_dir():
+        return f"path:{model}"
+    return f"hf:{model}@{revision or 'main'}"
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -165,6 +190,9 @@ def parse_args() -> argparse.Namespace:
                    help="Comma-separated subset of the clip list's `split` column, e.g. "
                         "val,test. Keeps evaluation clips out of any training run.")
     p.add_argument("--model", default=MODEL_REPO)
+    p.add_argument("--model-revision", default=None,
+                   help="Hub revision to load and record. Defaults to MODEL_REVISION for the "
+                        "default model; other hub ids fall back to resolving main.")
     p.add_argument("--attn", default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
     # The graph runner has been in the tree, tested, and documented in the
     # README since it was written, and nothing here ever turned it on -- so
@@ -436,15 +464,21 @@ def main() -> None:
         )
     clips = resolve_clips(args)
     date = datetime.now(timezone.utc).astimezone().strftime("%y.%m.%d")
+    args.model_revision = resolve_model_revision(args.model, args.model_revision)
 
     params = {
         "model": args.model,
+        "model_revision": args.model_revision,
         "variant": args.variant,
         "data_spec": args.data_spec,
         "n_clips": len(clips),
         "num_traj_samples": args.num_traj_samples,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        # Never passed, so generate runs without a top-k warper. Recorded because
+        # "unset" and "unrecorded" read the same, and a later run that sets it
+        # would otherwise look comparable.
+        "top_k": None,
         "max_generation_length": args.max_generation_length,
         "inference_step": args.inference_step,
         "seed": args.seed,
@@ -489,9 +523,11 @@ def main() -> None:
         avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
             cache_dir=args.data_cache, revision=args.dataset_revision
         )
-        model = Alpamayo1_5.from_pretrained(
-            args.model, dtype=torch.bfloat16, attn_implementation=args.attn
-        ).to("cuda").eval()
+        load_kwargs = {"dtype": torch.bfloat16, "attn_implementation": args.attn}
+        if args.model_revision:
+            # Load the snapshot the coordinate names, not whatever main is today.
+            load_kwargs["revision"] = args.model_revision
+        model = Alpamayo1_5.from_pretrained(args.model, **load_kwargs).to("cuda").eval()
         if args.cuda_graph:
             # After .to("cuda").eval(): the runner refuses a CPU or training
             # model, and refusing is the right behaviour -- a graph captured
@@ -725,12 +761,16 @@ def main() -> None:
         # means the run's metric namespace is decided by whatever metrics.py
         # last returned: add a key there and every future run silently grows a
         # column, drop one and old runs have a column new ones lack.
+        #
+        # TS.is_number rather than isinstance(v, (int, float)): the latter skips
+        # np.float32 silently -- a metric computed with numpy never reached MLflow
+        # and was not even named in the warning below -- and accepts True as 1.
         for key in _CLIP_METRICS:
-            values = [c[key] for c in per_clip if isinstance(c.get(key), (int, float))]
+            values = [float(c[key]) for c in per_clip if TS.is_number(c.get(key))]
             if values:
                 run.metric(key, float(np.mean(values)))
         unrecorded = sorted(
-            {k for c in per_clip for k, v in c.items() if isinstance(v, (int, float))}
+            {k for c in per_clip for k, v in c.items() if TS.is_number(v)}
             - set(_CLIP_METRICS)
             - _CLIP_COORDS
         )
@@ -762,6 +802,13 @@ def main() -> None:
             value = mean_present(key)
             if value is not None:
                 run.metric(f"{key}_mean", value)
+        # The share of samples that ran to max_new_tokens without the end
+        # marker. The recording rules require it: a compressed model that stops
+        # closing its reasoning gets slower and worse at once, and a mean token
+        # count hides it among the samples that did close.
+        missing = [bool(r["eos_missing"]) for r in rows if r.get("eos_missing") is not None]
+        if missing:
+            run.metric("eos_missing_rate", float(np.mean(missing)))
 
         # Latency. One decode span covers a whole clip's K samples, so the rows
         # of one clip share it -- averaging it against a single row's token
@@ -838,7 +885,7 @@ def main() -> None:
             """
             out: dict[str, float] = {"count": len(clips)}
             for name in _BUCKET_METRICS:
-                values = [c[name] for c in clips if isinstance(c.get(name), (int, float))]
+                values = [float(c[name]) for c in clips if TS.is_number(c.get(name))]
                 if values:
                     out[name] = float(np.mean(values))
             out["score"] = out.pop("min_ade", float("nan"))
@@ -887,8 +934,9 @@ def main() -> None:
                  f"-{len(clips)}clip-k{args.num_traj_samples}"
                  f"-temp{args.temperature:g}"
                  f"{'-' + args.label if args.label else ''}",
-        model=(f"path:{args.model}" if Path(args.model).is_dir() else f"hf:{args.model}@main"),
-        hf_datasets=[f"{DATASET_REPO}@main"],
+        model=model_coordinate(args.model, args.model_revision),
+        # The snapshot the data was actually read from, not main at record time.
+        hf_datasets=[f"{DATASET_REPO}@{args.dataset_revision}"],
         params=params,
         variant=args.variant,
         split=f"clips:{len(clips)}",
