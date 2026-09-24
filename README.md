@@ -333,6 +333,25 @@ $EDITOR scripts/run.sh     # VARIANT, MACHINE, LIMIT, NOTES ...
 ./scripts/run.sh
 ```
 
+**Facts that belong to a machine go in `.env`, not in `run.sh`.** The settings
+block is tracked, so editing its paths per machine leaves the tree dirty for
+good and every run recorded as `git_dirty`. `run.sh` sources an untracked `.env`
+from the repo root after its settings, so the precedence is sweep override >
+`.env` > tracked default. On the Thor:
+
+```bash
+cp scripts/env.thor.example .env      # python, data cache, output root, no proxy
+```
+
+**One run at a time.** Two runs sharing the GPU inflate each other's latency —
+one overlap inflated a baseline by 6% before anyone noticed. `run.sh`,
+`run_sweep.sh` and `run_queue.sh` all hold `/tmp/alpamayo-inference.lock`, and a
+second launch fails at once instead of quietly contaminating the first.
+
+`CUDA_GRAPH=1` (or `SWEEP_CUDA_GRAPH=(0 1)` as a sweep axis) replays the
+trajectory head through CUDA graphs. Whether each step replayed or fell back to
+eager is recorded per pass in `timing.parquet`.
+
 To run several configurations, edit the axes at the top of `scripts/run_sweep.sh`
 and run that instead. It is hydra's `--multirun` idea — list values on an axis
 and the combinations all run:

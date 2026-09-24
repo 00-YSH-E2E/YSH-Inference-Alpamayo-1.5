@@ -31,6 +31,8 @@ SWEEP_SEED=()                     # 예: (42 43 44).  run-to-run 밴드.  시드
 SWEEP_T0_US=()                    # 예: (5100000 8100000).  클립 안 예측 시점.  유효 [1600000, 13600000]
 SWEEP_DIFFUSION_TEMPERATURE=()    # 예: (1.0 0.7 0.5).  확산 초기 노이즈 크기 — CoT 온도와 별개.
                                   # 스텝 수를 고정한 채 다양성만 줄이는 대조군 축
+SWEEP_CUDA_GRAPH=()               # 예: (0 1).  expert 를 CUDA graph 로 재생할까.  지연시간 축이라
+                                  # 정확도는 같아야 한다 — 다르면 그게 발견이다
 
 # 이번 sweep 의 축. 10 이 기준선이고 나머지가 그것과 짝지어 비교된다.
 #   기준선을 여기 **안 적었다.** 10 스텝 × 1181 클립은 이미 돌아서 디스크에 있고
@@ -87,6 +89,7 @@ RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; DIM=$'\033[2m'; BLD=$'\033[1m
 [[ ${#SWEEP_SEED[@]}              -eq 0 ]] && SWEEP_SEED=("$SEED")
 [[ ${#SWEEP_T0_US[@]}             -eq 0 ]] && SWEEP_T0_US=("$T0_US")
 [[ ${#SWEEP_DIFFUSION_TEMPERATURE[@]} -eq 0 ]] && SWEEP_DIFFUSION_TEMPERATURE=("$DIFFUSION_TEMPERATURE")
+[[ ${#SWEEP_CUDA_GRAPH[@]}        -eq 0 ]] && SWEEP_CUDA_GRAPH=("$CUDA_GRAPH")
 
 # 변형마다 체크포인트가 다른 경우는 조합이 아니라 짝이다. 길이가 같으면 짝으로 본다.
 PAIRED_MODEL=0
@@ -117,20 +120,22 @@ fi
 
 # 클립 수와 K·temperature 는 러너가 늘 이름에 넣는다. 여기서는 **그 밖의 축 중
 # 실제로 여러 값을 가진 것만** 꼬리에 더한다 — 안 변하는 값으로 이름을 늘리지 않는다.
-LABEL_S=0; LABEL_SEED=0; LABEL_T0=0; LABEL_DT=0
+LABEL_S=0; LABEL_SEED=0; LABEL_T0=0; LABEL_DT=0; LABEL_CG=0
 [[ ${#SWEEP_INFERENCE_STEP[@]}        -gt 1 ]] && LABEL_S=1
 [[ ${#SWEEP_SEED[@]}                  -gt 1 ]] && LABEL_SEED=1
 [[ ${#SWEEP_T0_US[@]}                 -gt 1 ]] && LABEL_T0=1
 [[ ${#SWEEP_DIFFUSION_TEMPERATURE[@]} -gt 1 ]] && LABEL_DT=1
+[[ ${#SWEEP_CUDA_GRAPH[@]}            -gt 1 ]] && LABEL_CG=1
 
 # 축이 여럿이면 꼬리도 여럿이다.  안 그러면 확산 온도만 다른 두 arm 이 **같은 디렉토리
 # 이름**을 갖는다 — 러너는 클립 수·K·CoT 온도만 이름에 넣기 때문이다.
-make_label() {  # $1=step $2=seed $3=t0_us $4=diffusion_temperature
+make_label() {  # $1=step $2=seed $3=t0_us $4=diffusion_temperature $5=cuda_graph
   local parts=()
   [[ "$LABEL_S"    == "1" && -n "$1" ]] && parts+=("s$1")
   [[ "$LABEL_SEED" == "1" ]]            && parts+=("seed$2")
   [[ "$LABEL_T0"   == "1" ]]            && parts+=("t$(( $3 / 100000 ))")     # 0.1초 단위: t51 = 5.1s
   [[ "$LABEL_DT"   == "1" ]]            && parts+=("dt$4")
+  [[ "$LABEL_CG"   == "1" ]]            && parts+=("cg$5")
   local IFS='-'; printf '%s' "${parts[*]}"
 }
 
@@ -146,7 +151,9 @@ for vi in "${!SWEEP_VARIANT[@]}"; do
           for sd in "${SWEEP_SEED[@]}"; do
             for t0us in "${SWEEP_T0_US[@]}"; do
               for dt in "${SWEEP_DIFFUSION_TEMPERATURE[@]}"; do
-                JOBS+=("${v}|${m}|${k}|${t}|${s}|${sd}|${t0us}|${dt}|$(make_label "$s" "$sd" "$t0us" "$dt")")
+                for cg in "${SWEEP_CUDA_GRAPH[@]}"; do
+                  JOBS+=("${v}|${m}|${k}|${t}|${s}|${sd}|${t0us}|${dt}|${cg}|$(make_label "$s" "$sd" "$t0us" "$dt" "$cg")")
+                done
               done
             done
           done
@@ -159,11 +166,11 @@ done
 TOTAL=${#JOBS[@]}
 echo
 echo "${BLD}── sweep: ${SWEEP_NAME} ─ ${TOTAL}개 조합 ──────────────────────${OFF}"
-printf "  %-3s %-12s %-4s %-5s %-5s %-5s %-8s %-5s %-16s %s\n" "#" "VARIANT" "K" "temp" "step" "seed" "t0_us" "dτ" "이름꼬리" "MODEL"
+printf "  %-3s %-12s %-4s %-5s %-5s %-5s %-8s %-5s %-3s %-16s %s\n" "#" "VARIANT" "K" "temp" "step" "seed" "t0_us" "dτ" "cg" "이름꼬리" "MODEL"
 i=0
 for job in "${JOBS[@]}"; do
-  IFS='|' read -r v m k t s sd t0us dt lb <<<"$job"; i=$((i+1))
-  printf "  %-3s %-12s %-4s %-5s %-5s %-5s %-8s %-5s %-16s %s\n" "$i" "$v" "$k" "$t" "${s:-기본}" "$sd" "$t0us" "$dt" "${lb:--}" "$m"
+  IFS='|' read -r v m k t s sd t0us dt cg lb <<<"$job"; i=$((i+1))
+  printf "  %-3s %-12s %-4s %-5s %-5s %-5s %-8s %-5s %-3s %-16s %s\n" "$i" "$v" "$k" "$t" "${s:-기본}" "$sd" "$t0us" "$dt" "$cg" "${lb:--}" "$m"
 done
 echo
 echo "  ${DIM}각각이 별개의 MLflow run 이 된다. sweep 태그로 묶인다.${OFF}"
@@ -180,6 +187,19 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
+# 한 번에 하나.  sweep 전체가 잠금을 쥐고, 조합마다 부르는 run.sh 는 그 안이라는 걸
+# ALPAMAYO_LOCK_HELD 로 알고 다시 잠그지 않는다 — 자식이 같은 파일을 또 잠그면 스스로 막힌다.
+# 조합 사이의 빈틈에 다른 run 이 끼어드는 것도 이것으로 막힌다.
+if [[ "${ALPAMAYO_LOCK_HELD:-0}" != "1" ]]; then
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "${RED}막힘${OFF}  다른 추론·sweep 이 돌고 있다 ($LOCK_FILE)." >&2
+    echo "        겹쳐 돌면 서로의 지연시간을 부풀린다 — 끝나길 기다린다." >&2
+    exit 1
+  fi
+  export ALPAMAYO_LOCK_HELD=1
+fi
+
 # ── 돌리기 ──────────────────────────────────────────────────────────────────
 # 비어 있을 수 있는 환경변수는 배열로 옮겨 둔다 (아래 env 주석 참고)
 CLIP_ENV=()
@@ -192,9 +212,9 @@ STARTED=$(date +%s)
 FAST_FAILS=0
 i=0
 for job in "${JOBS[@]}"; do
-  IFS='|' read -r v m k t s sd t0us dt lb <<<"$job"; i=$((i+1))
+  IFS='|' read -r v m k t s sd t0us dt cg lb <<<"$job"; i=$((i+1))
   echo
-  echo "${BLD}[$i/$TOTAL] ${v}  K=${k}  temp=${t}${s:+  step=$s}  seed=${sd}  t0=${t0us}  dτ=${dt}${lb:+  → $lb}${OFF}"
+  echo "${BLD}[$i/$TOTAL] ${v}  K=${k}  temp=${t}${s:+  step=$s}  seed=${sd}  t0=${t0us}  dτ=${dt}  cg=${cg}${lb:+  → $lb}${OFF}"
   echo "────────────────────────────────────────────────────────────"
   t_start=$(date +%s)
   # run.sh 를 그대로 다시 부른다 — 점검이 조합마다 돈다. 설정은 환경변수로 덮는다.
@@ -207,6 +227,7 @@ for job in "${JOBS[@]}"; do
   if env OVERRIDE_VARIANT="$v" OVERRIDE_MODEL="$m" OVERRIDE_NUM_TRAJ_SAMPLES="$k" \
      OVERRIDE_TEMPERATURE="$t" OVERRIDE_INFERENCE_STEP="$s" \
      OVERRIDE_SEED="$sd" OVERRIDE_T0_US="$t0us" OVERRIDE_DIFFUSION_TEMPERATURE="$dt" \
+     OVERRIDE_CUDA_GRAPH="$cg" \
      "${CLIP_ENV[@]}" SWEEP="$SWEEP_NAME" LABEL="$lb" \
      bash "$HERE/run.sh"; then
     RESULTS+=("${GRN}완료${OFF}|$v|$k|$t|$(( $(date +%s) - t_start ))초")

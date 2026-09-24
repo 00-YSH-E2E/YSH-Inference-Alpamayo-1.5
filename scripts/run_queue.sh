@@ -7,6 +7,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE/.."
 [[ $# -gt 0 ]] || { echo "사용법: $0 sweeps/A.sh [sweeps/B.sh ...]" >&2; exit 2; }
 mkdir -p logs
+# 큐 전체가 잠금을 한 번 쥔다 — sweep 사이의 빈틈에 다른 run 이 끼어들지 못하게.
+# 안쪽의 run_sweep.sh·run.sh 는 ALPAMAYO_LOCK_HELD 를 보고 다시 잠그지 않는다.
+LOCK_FILE="${LOCK_FILE:-/tmp/alpamayo-inference.lock}"
+exec 9>"$LOCK_FILE"
+flock -n 9 || { echo "다른 추론·sweep 이 돌고 있다 ($LOCK_FILE). 끝나길 기다린다." >&2; exit 1; }
+export ALPAMAYO_LOCK_HELD=1
 STARTED=$(date +%s); RESULTS=()
 for cfg in "$@"; do
   name="$(basename "$cfg" .sh)"; log="logs/queue_${name}_$(date +%m%d_%H%M).log"

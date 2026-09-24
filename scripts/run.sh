@@ -83,6 +83,18 @@ FORCE_LOCAL_SRC=1
 
 # 모델과 데이터 (MODEL 은 위 NVIDIA 블록에 있다)
 ATTN="sdpa"                              # Jetson 은 sdpa. flash_attention_2 는 aarch64 휠이 없다
+
+# 궤적 헤드(expert)를 CUDA graph 로 재생할까.  비교 축이다 (1 = 켬).
+#   그래프 러너는 레포에 있고 테스트도 있지만 지금까지 아무 run 도 켜지 않아서, 재생 경로는
+#   한 번도 측정된 적이 없다.  graph_mode·graph_fallbacks 가 timing.parquet 에 남는다.
+CUDA_GRAPH=0
+# 캡처해 둘 입력 모양 수.  KV 길이가 클립마다 달라서 작으면 대부분 eager 로 떨어지고,
+# 크면 그래프마다 프롬프트 KV 사본(K=6 에서 약 2.7 GB)을 잡는다 — 16 을 넘기면 경고한다.
+CUDA_GRAPH_MAX_GRAPHS=4
+
+# 한 번에 하나만.  두 run 이 겹치면 서로의 지연시간을 부풀린다 — 2026-09-01 에 실제로
+# 겹쳐서 기준선이 6% 부풀었다.  run·sweep·queue 가 전부 이 파일을 잠근다.
+LOCK_FILE="/tmp/alpamayo-inference.lock"
 DATA_SPEC="Cam-4"
 DATA_CACHE="/workspace/.hf_home/hub"     # HF 허브 캐시 루트 (cache_dir 로 그대로 넘어간다)
 OUT_ROOT="/workspace/runs"               # run 폴더가 생길 곳. 레포 밖에 둬서
@@ -117,6 +129,19 @@ INCLUDE_GT=1                             # 정답 궤적을 로컬에 남기기 
 # =============================================================================
 #  아래는 안 고쳐도 된다
 # =============================================================================
+# 기계마다 다른 사실(파이썬 경로·데이터 위치·호스트명·프록시)은 추적하지 않는 .env 에 둔다.
+# 위 설정 블록을 기계마다 고치면 워킹트리가 영원히 dirty 해지고, 모든 run 이 git_dirty 로 남는다.
+#   만드는 법:  cp scripts/env.thor.example .env      (.env 는 .gitignore 에 있다)
+# 여기(sourced 가드 앞)에 두는 이유:  run_sweep.sh 가 이 파일을 source 할 때도 적용되고,
+# 우선순위가  OVERRIDE_*(스윕) > .env(기계) > 위 설정(기본)  으로 잡힌다.
+_RUN_SH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_LOADED=0
+if [[ -r "$_RUN_SH_ROOT/.env" ]]; then
+  # shellcheck disable=SC1091
+  source "$_RUN_SH_ROOT/.env"
+  ENV_LOADED=1
+fi
+
 # run_sweep.sh 가 이 파일을 source 해서 위 설정을 기본값으로 가져간다. 설정을 두 곳에
 # 적어 두면 반드시 갈라지므로, 설정이 사는 곳은 여기 하나다.
 (return 0 2>/dev/null) && return 0
@@ -145,6 +170,8 @@ LIMIT="${OVERRIDE_LIMIT:-$LIMIT}"
 UPLOAD="${OVERRIDE_UPLOAD:-$UPLOAD}"
 TRACK="${OVERRIDE_TRACK:-$TRACK}"
 SAMPLES="${OVERRIDE_SAMPLES:-$SAMPLES}"
+CUDA_GRAPH="${OVERRIDE_CUDA_GRAPH:-$CUDA_GRAPH}"
+CUDA_GRAPH_MAX_GRAPHS="${OVERRIDE_CUDA_GRAPH_MAX_GRAPHS:-$CUDA_GRAPH_MAX_GRAPHS}"
 SWEEP="${SWEEP:-}"
 
 RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; DIM=$'\033[2m'; OFF=$'\033[0m'
@@ -177,6 +204,34 @@ else                                CLIPS_SHOWN="N"; fi
 NAME_TAIL="${CLIPS_SHOWN}clip_k${NUM_TRAJ_SAMPLES}-temp${TEMPERATURE}"
 [[ -n "${LABEL:-}" ]] && NAME_TAIL="${NAME_TAIL}-${LABEL}"
 ok "이름:  Alpamayo-1.5_${DATA_SPEC}_${VARIANT}_${NAME_TAIL}_${MACHINE_SHOWN}_$(date +%y.%m.%d)_<run_id>"
+
+# ── 기계 설정 ──────────────────────────────────────────────────────────────
+if [[ "$ENV_LOADED" == "1" ]]; then
+  ok "기계:  .env 적용 (PYTHON·DATA_CACHE·OUT_ROOT·프록시가 이 기계 값)"
+else
+  warn ".env 가 없다 — 위 설정 블록의 경로를 그대로 쓴다.  이 기계용이 아니면
+       cp scripts/env.thor.example .env  후 다시 돌린다"
+fi
+
+# ── 한 번에 하나 ───────────────────────────────────────────────────────────
+# 스윕·큐가 이미 잠갔으면 그 안에서 도는 것이니 다시 보지 않는다.
+if [[ "${ALPAMAYO_LOCK_HELD:-0}" != "1" ]]; then
+  if ! flock -n "$LOCK_FILE" true 2>/dev/null; then
+    fail "다른 추론이 돌고 있다 ($LOCK_FILE 가 잠겨 있다).
+       겹쳐 돌면 서로의 지연시간을 부풀린다 — 끝나길 기다리거나 그쪽을 멈춘다"
+  else
+    ok "잠금: $LOCK_FILE (비어 있음)"
+  fi
+fi
+
+# ── CUDA graph ─────────────────────────────────────────────────────────────
+if [[ "$CUDA_GRAPH" == "1" ]]; then
+  ok "그래프: expert 를 CUDA graph 로 재생 (최대 ${CUDA_GRAPH_MAX_GRAPHS}개 모양)"
+  if [[ "$CUDA_GRAPH_MAX_GRAPHS" -gt 16 ]]; then
+    warn "CUDA_GRAPH_MAX_GRAPHS=${CUDA_GRAPH_MAX_GRAPHS}.  그래프마다 프롬프트 KV 사본을
+       잡는다 (K=6 에서 약 2.7 GB).  통합 메모리를 다 먹을 수 있다"
+  fi
+fi
 
 # ── 소급 불가한 것들 ────────────────────────────────────────────────────────
 [[ -n "$NOTES" ]] || warn "NOTES 가 비었다. 6개월 뒤에 이 run 이 왜 있는지 알 수 없다"
@@ -342,6 +397,7 @@ fi
 [[ "$TRACK"        == "0" ]] && ARGS+=(--no-track)
 [[ "$SAMPLES"      == "0" ]] && ARGS+=(--no-samples)
 [[ "$INCLUDE_GT"   == "1" ]] && ARGS+=(--include-gt)
+[[ "$CUDA_GRAPH"   == "1" ]] && ARGS+=(--cuda-graph --cuda-graph-max-graphs "$CUDA_GRAPH_MAX_GRAPHS")
 
 [[ "$FORCE_LOCAL_SRC" == "1" ]] && export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 
@@ -349,4 +405,9 @@ echo
 echo "${DIM}${PYTHON} scripts/run_inference_tracked.py ${ARGS[*]}${OFF}"
 echo "────────────────────────────────────────────────────────────"
 echo
-exec "$PYTHON" scripts/run_inference_tracked.py "${ARGS[@]}"
+# 잠금을 쥔 채로 실행한다.  위 점검과 여기 사이에 누가 끼어들 수 있으므로
+# 점검만으로는 부족하다 — flock 은 잡을 수 없으면 바로 실패한다.
+if [[ "${ALPAMAYO_LOCK_HELD:-0}" == "1" ]]; then
+  exec "$PYTHON" scripts/run_inference_tracked.py "${ARGS[@]}"
+fi
+exec flock -n -E 75 "$LOCK_FILE" "$PYTHON" scripts/run_inference_tracked.py "${ARGS[@]}"
