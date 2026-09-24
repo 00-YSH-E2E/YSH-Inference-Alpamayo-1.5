@@ -71,6 +71,7 @@ _RUN_FILES = {
     "predictions": "predictions.parquet",
     "run_json": "run.json",
     "gt": "gt.parquet",
+    "timing": "timing.parquet",
 }
 
 # Config columns that must agree across arms for the pairing to mean anything.
@@ -125,9 +126,13 @@ DIVERSITY_COLUMNS = ("diversity_mean_m", "diversity_final_m", "diversity_max_m")
 # steps, dt0.5 is a diffusion temperature of 0.5, K16 is sixteen samples. The
 # value is recovered by stripping the alphabetic prefix, which is why prefixes
 # contain no digits.
+# Conditions that follow from the axis: sweeping CUDA graphs on and off also
+# switches whether a graph count applies, so it is exempt with its axis.
+_DEPENDENT = {"cuda_graph": ("cuda_graph_max_graphs",)}
+
 _AXIS_PREFIX = {
     "inference_step": "s", "diffusion_temperature": "dt", "num_traj_samples": "K",
-    "seed": "seed", "t0_us": "t", "temperature": "temp",
+    "seed": "seed", "t0_us": "t", "temperature": "temp", "cuda_graph": "cg",
 }
 
 
@@ -221,7 +226,7 @@ def discover_runs(root: Path | str, match: str = "*") -> pd.DataFrame:
         })
     columns = [
         "run_dir", "path", "has_per_clip", "has_predictions", "has_run_json",
-        "has_gt", "run_id", "variant", "machine", "date", "schema_version",
+        "has_gt", "has_timing", "run_id", "variant", "machine", "date", "schema_version",
         "step_declared", "seed", "num_traj_samples", "temperature",
         "n_clips_declared", "n_clips_listed",
     ]
@@ -1146,3 +1151,254 @@ def arm_colors(arms: Sequence[str]) -> dict[str, str]:
 def arm_markers(arms: Sequence[str]) -> dict[str, str]:
     """Stable marker per arm, so the figures survive being printed in grey."""
     return {a: _ARM_MARKERS[i % len(_ARM_MARKERS)] for i, a in enumerate(arms)}
+
+
+# --------------------------------------------------------------------------
+#  Latency: a stricter gate, the same paired arithmetic
+# --------------------------------------------------------------------------
+
+#: Everything that moves latency without being the axis. Accuracy survives a
+#: change of machine, driver or instrumentation; latency does not, so the
+#: latency gate refuses arms that differ in any of these. Two are about the
+#: instrument rather than the board: a deeper trace level costs more, and a
+#: different tracer version may mark different boundaries.
+TIMING_PAIRING = (
+    "machine", "power_mode", "nvidia_driver", "l4t_release", "torch_version",
+    "transformers_version", "cuda_runtime", "attn_impl", "dtype", "model", "data_spec",
+    "num_traj_samples", "inference_step", "max_new_tokens", "cuda_graph",
+    "cuda_graph_max_graphs", "trace_level", "sample_hz", "timing_schema_version",
+    "tracer_version",
+)
+
+#: Latency columns compared by default. ``ms_per_step`` is the decode time over
+#: its steps, derived on load: the architecture's cost per token, which a
+#: shorter reasoning does not flatter.
+TIMING_METRICS = (
+    "t_total_ms", "t_wall_ms", "t_first_traj_ms", "t_ttft_ms", "t_vision_ms", "t_prefill_ms",
+    "t_decode_ms", "ms_per_step", "t_postgen_ms", "t_expert_ms", "t_other_ms", "e_vin_j",
+)
+
+#: The segments a total is split into, for the share table (the paper's
+#: breakdown figures). They add up to ``t_total_ms`` by construction.
+TIMING_SEGMENTS = ("t_vision_ms", "t_prefill_ms", "t_decode_ms", "t_postgen_ms", "t_expert_ms",
+                   "t_other_ms")
+
+
+def load_timing(runs: pd.DataFrame, axis: str = "inference_step") -> pd.DataFrame:
+    """The main measured passes of every run with a timing table, one row per clip.
+
+    The arm comes from the axis column of the timing rows, where the runner
+    repeats its conditions, and from the run's params when the axis is not
+    one of them. ``has_probe`` and ``n_extra`` travel along, per run, for the
+    gate: a run without an overhead probe has latency no one can put an error
+    bar on.
+    """
+    frames: list[pd.DataFrame] = []
+    for r in runs.itertuples():
+        path = Path(r.path) / "timing.parquet"
+        if not path.exists():
+            continue
+        df = pd.read_parquet(path)
+        kinds = df.get("row_kind", pd.Series(dtype=object))
+        measured = df.get("timing_measured", pd.Series(True, index=df.index))
+        main = df[(kinds == "main") & measured.fillna(False).astype(bool)].copy()
+        if not len(main):
+            continue
+        main["run_dir"] = r.run_dir
+        main["has_probe"] = bool((kinds == "probe").any())
+        if axis in main.columns:
+            value = pd.to_numeric(main[axis].astype(object), errors="coerce")
+        else:
+            params = _read_run_json(Path(r.path) / _RUN_FILES["run_json"]).get("params", {})
+            value = pd.to_numeric(pd.Series([params.get(axis)] * len(main), index=main.index,
+                                            dtype=object), errors="coerce")
+        if axis == "inference_step" and "n_expert_calls" in main.columns:
+            # A null step count ran the default; the executed Euler steps say
+            # which, as they do for the accuracy comparison.
+            value = value.fillna(pd.to_numeric(main["n_expert_calls"], errors="coerce"))
+        main["step"] = value.astype(float)
+        frames.append(main)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    prefix = axis_prefix(axis)
+    out["arm"] = out["step"].map(lambda v: f"{prefix}{float(v):g}" if pd.notna(v) else None)
+    steps = pd.to_numeric(out.get("n_decode_steps"), errors="coerce")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["ms_per_step"] = pd.to_numeric(out.get("t_decode_ms"), errors="coerce") / steps.where(
+            steps > 0)
+    return out
+
+
+def timing_gate(timing: pd.DataFrame, axis: str = "inference_step",
+                allow_partial: bool = False) -> pd.DataFrame:
+    """Everything that must hold before two runs' latencies may be compared.
+
+    Stricter than :func:`gate`: same machine, power mode, driver, software,
+    trace level and tracer, not only the same sampling. Warnings cover what
+    blends two configurations into one number without failing outright -- a
+    CUDA graph that fell back to eager on some clips, throttling in one arm
+    and not the other, an arm with no overhead probe or no warmup.
+    """
+    rows: list[dict[str, Any]] = []
+    if not len(timing):
+        rows.append(_row("timing_rows", "fail", "no run has a timing table with a measured "
+                         "main pass -- runs made before timing.parquet cannot be compared"))
+        return pd.DataFrame(rows, columns=["check", "status", "detail", "arms", "n"])
+    unlabelled = sorted(timing.loc[timing["arm"].isna(), "run_dir"].unique())
+    if unlabelled:
+        rows.append(_row("arms", "fail", f"`{axis}` is not a number for: "
+                         f"{', '.join(unlabelled)}; the arm cannot be named", "", 0))
+        return pd.DataFrame(rows, columns=["check", "status", "detail", "arms", "n"])
+    arms = sorted(timing["arm"].unique(), key=lambda a: -arm_value(a))
+    per_arm = timing.groupby("arm")["run_dir"].nunique()
+    shared = sorted(a for a, n in per_arm.items() if n > 1)
+    if len(arms) < 2:
+        rows.append(_row("arms", "fail", f"only {len(arms)} arm -- nothing to compare it against",
+                         ", ".join(arms), len(arms)))
+    elif shared:
+        rows.append(_row("arms", "fail", f"several runs share arm(s) {', '.join(shared)} and "
+                         "would be averaged together", ", ".join(shared), len(arms)))
+    else:
+        rows.append(_row("arms", "ok", f"{len(arms)} arms along {axis}", ", ".join(arms),
+                         len(arms)))
+    by_arm = {a: g for a, g in timing.groupby("arm")}
+
+    disagree, absent = [], []
+    exempt = {axis, *_DEPENDENT.get(axis, ())}
+    for col in TIMING_PAIRING:
+        if col in exempt:
+            continue
+        if col not in timing.columns:
+            absent.append(col)
+            continue
+        vals = {a: sorted({repr(v) for v in g[col].unique()}) for a, g in by_arm.items()}
+        if len({v for vs in vals.values() for v in vs}) > 1:
+            disagree.append(f"{col}: " + ", ".join(f"{a}={'/'.join(v)}"
+                                                   for a, v in sorted(vals.items())))
+    if disagree:
+        rows.append(_row("conditions", "fail",
+                         "arms were timed under different conditions, so their latency "
+                         "difference is not the axis's -- " + "; ".join(disagree),
+                         ", ".join(arms)))
+    else:
+        rows.append(_row("conditions", "ok",
+                         f"{len(TIMING_PAIRING) - len(absent) - len(exempt & set(TIMING_PAIRING))} "
+                         "timing conditions identical across arms"
+                         + (f" ({', '.join(absent)} not recorded)" if absent else ""),
+                         ", ".join(arms)))
+
+    sets = {a: set(map(tuple, g[list(CLIP_KEY)].itertuples(index=False, name=None)))
+            for a, g in by_arm.items()}
+    common = set.intersection(*sets.values()) if sets else set()
+    ragged = {a: len(s) - len(common) for a, s in sets.items() if len(s) != len(common)}
+    if ragged:
+        rows.append(_row("clip_sets", "warn" if allow_partial else "fail",
+                         "arms do not cover the same clips; "
+                         + ", ".join(f"{a} has {n} the others lack" for a, n in ragged.items())
+                         + f". {len(common)} are common to all.", ", ".join(sorted(ragged)),
+                         len(common)))
+    else:
+        rows.append(_row("clip_sets", "ok", f"all arms cover the same {len(common)} clips",
+                         ", ".join(arms), len(common)))
+
+    fell_back = sorted(a for a, g in by_arm.items()
+                       if (pd.to_numeric(g.get("graph_fallbacks"), errors="coerce") > 0).any()
+                       or (g.get("graph_mode", pd.Series(dtype=object)) == "mixed").any())
+    rows.append(_row("graph_fallbacks", "warn" if fell_back else "ok",
+                     f"CUDA graphs fell back to eager in {', '.join(fell_back)}: those means "
+                     "blend two configurations" if fell_back else "no graph fell back to eager",
+                     ", ".join(fell_back or arms)))
+
+    throttled = {a: float((pd.to_numeric(g.get("throttle_state_max"), errors="coerce")
+                           .fillna(0) > 0).mean()) for a, g in by_arm.items()}
+    spread = max(throttled.values()) - min(throttled.values()) if throttled else 0.0
+    rows.append(_row("throttling", "warn" if spread > 0.1 else "ok",
+                     "clips with any throttling: " + ", ".join(
+                         f"{a}={v:.0%}" for a, v in sorted(throttled.items()))
+                     + (" -- uneven between arms, and throttling moves latency alone"
+                        if spread > 0.1 else ""), ", ".join(arms)))
+
+    unprobed = sorted(a for a, g in by_arm.items() if not g["has_probe"].any())
+    rows.append(_row("overhead_probe", "warn" if unprobed else "ok",
+                     f"no overhead probe in {', '.join(unprobed)}: the tracer's own cost is "
+                     "unmeasured there" if unprobed else "every arm measured its tracer's cost",
+                     ", ".join(unprobed or arms)))
+
+    cold = sorted(a for a, g in by_arm.items()
+                  if (pd.to_numeric(g.get("warmup"), errors="coerce").fillna(0) == 0).any())
+    rows.append(_row("warmup", "warn" if cold else "ok",
+                     f"no warmup in {', '.join(cold)}: the first clip carries the cold start"
+                     if cold else "every arm warmed up before its first clip",
+                     ", ".join(cold or arms)))
+
+    commits = sorted({str(c)[:8] for c in timing.get("git_commit", pd.Series(dtype=object))
+                      .dropna().unique()})
+    rows.append(_row("git_commit", "warn" if len(commits) > 1 else "ok",
+                     f"arms were run from different commits: {', '.join(commits)}"
+                     if len(commits) > 1 else f"one commit: {commits[0] if commits else '?'}",
+                     ", ".join(arms), len(commits)))
+    return pd.DataFrame(rows, columns=["check", "status", "detail", "arms", "n"])
+
+
+def segment_shares(timing: pd.DataFrame, arms: Sequence[str]) -> pd.DataFrame:
+    """Per arm, each segment's mean share of the total -- where the time goes."""
+    rows: list[dict[str, Any]] = []
+    for arm in arms:
+        g = timing[timing["arm"] == arm]
+        total = pd.to_numeric(g.get("t_total_ms"), errors="coerce")
+        for seg in TIMING_SEGMENTS:
+            if seg not in g.columns:
+                continue
+            share = pd.to_numeric(g[seg], errors="coerce") / total.where(total > 0)
+            rows.append({"arm": arm, "step": arm_value(arm), "segment": seg,
+                         "mean_ms": float(pd.to_numeric(g[seg], errors="coerce").mean()),
+                         "share": float(share.mean())})
+    return pd.DataFrame(rows)
+
+
+def axis_fits(timing: pd.DataFrame, arms: Sequence[str],
+              metrics: Sequence[str] = TIMING_METRICS) -> pd.DataFrame:
+    """A line through the arm means along the axis, per metric.
+
+    Along K, the slope is what one more sample costs and the intercept what
+    the pass costs before any; along the step count, what one more Euler step
+    costs. Three arms at least: a line through two says nothing about
+    whether the relation is a line.
+    """
+    from .timing_schema import linear_fit
+
+    rows: list[dict[str, Any]] = []
+    x = [arm_value(a) for a in arms]
+    for metric in metrics:
+        if metric not in timing.columns:
+            continue
+        y = [float(pd.to_numeric(timing.loc[timing["arm"] == a, metric], errors="coerce").mean())
+             for a in arms]
+        points = [(xi, yi) for xi, yi in zip(x, y, strict=True) if not math.isnan(yi)]
+        fit = linear_fit([p[0] for p in points], [p[1] for p in points])
+        if fit:
+            rows.append({"metric": metric, "n_arms": len(points), "intercept": fit["intercept"],
+                         "slope": fit["slope"], "r2": fit["r2"]})
+    return pd.DataFrame(rows)
+
+
+def timing_tables(timing: pd.DataFrame, arms: Sequence[str],
+                  metrics: Sequence[str] = TIMING_METRICS, n_boot: int = 10_000,
+                  seed: int = 0, level: float = 0.95) -> dict[str, Any]:
+    """Paired latency deltas with bootstrap intervals, segment shares, axis fits.
+
+    The deltas go through :func:`paired_matrix` and :func:`build_tables`, the
+    same arithmetic as accuracy: a clip's own length cancels, and a latency
+    metric is lower-is-better by default. A metric no arm recorded is left
+    out rather than failing the rest.
+    """
+    arms = list(arms)
+    present = [m for m in metrics if m in timing.columns
+               and pd.to_numeric(timing[m], errors="coerce").notna().any()]
+    X, index = paired_matrix(timing, metrics=present, arms=arms, strata=())
+    tables = build_tables(X, index, arms, present, n_boot=n_boot, seed=seed, strata=(),
+                          level=level)
+    return {"metrics": tables["metrics"], "shares": segment_shares(timing, arms),
+            "fits": axis_fits(timing, arms, present), "arms": arms, "n_clips": int(X.shape[0]),
+            "compared": present}

@@ -19,6 +19,10 @@
     python scripts/compare_sweep.py --runs-root /workspace/runs \\
         --match 'Alpamayo-1.5_Cam-4_Vanilla_1181clip_*' --baseline 10
 
+    # latency instead of accuracy, along K
+    python scripts/compare_sweep.py --runs-root /workspace/runs \\
+        --match '*_k*' --axis num_traj_samples --baseline 1 --timing
+
 Reads only; the run directories are never modified. Output goes to
 ``<runs-root>/_analysis/<name>_<date>_<hash>/`` -- under the runs root for the
 same reason ``run.sh`` puts runs there, outside the repo so results are not
@@ -80,6 +84,12 @@ def parse_args() -> argparse.Namespace:
                         "when they differ. An arm that died on the hard clips "
                         "scores best on what it finished, so this is a "
                         "deliberate choice, not a convenience.")
+    p.add_argument("--timing", action="store_true",
+                   help="Compare latency instead of accuracy: timing.parquet's main passes, "
+                        "behind a stricter gate -- same machine, power mode, driver, software, "
+                        "trace level and tracer -- with paired deltas, segment shares and a "
+                        "line along the axis (per sample along K, per step along steps).")
+    p.add_argument("--timing-metrics", default=",".join(C.TIMING_METRICS))
     p.add_argument("--out", default=None, help="Override the output directory.")
     p.add_argument("--dry-run", action="store_true",
                    help="Preflight and the gate, then stop before the bootstrap.")
@@ -90,6 +100,7 @@ def output_dir(args: argparse.Namespace, run_dirs: list[str]) -> Path:
     if args.out:
         return Path(args.out)
     key = json.dumps({"runs": sorted(run_dirs), "metrics": args.metrics,
+                      "timing": args.timing, "timing_metrics": args.timing_metrics,
                       "strata": args.strata, "n_boot": args.n_boot,
                       "seed": args.seed, "floor": args.min_stratum_clips,
                       "baseline": args.baseline, "partial": args.allow_partial},
@@ -109,25 +120,27 @@ def preflight(args: argparse.Namespace, runs: pd.DataFrame,
         notes.append((STOP, f"runs root does not exist: {root}"))
         return notes
 
-    usable = runs[runs["has_per_clip"]] if len(runs) else runs
+    have = "has_timing" if args.timing else "has_per_clip"
+    usable = runs[runs[have]] if len(runs) else runs
     if not len(runs):
         notes.append((STOP, f"no run directory under {root} matches {args.match!r}"))
     elif len(usable) < 2:
         listing = "\n         ".join(
             f"{r.run_dir}  per_clip={'yes' if r.has_per_clip else 'NO'}"
             f"  predictions={'yes' if r.has_predictions else 'NO'}"
+            f"  timing={'yes' if r.has_timing else 'NO'}"
             for r in runs.itertuples())
         notes.append((STOP, f"{len(usable)} of {len(runs)} matched directories are "
                             f"usable; two arms are the minimum.\n         {listing}"))
     else:
         notes.append((OK, f"{len(usable)} usable run"
                           f"{'s' if len(usable) != 1 else ''} of {len(runs)} matched"))
-        dead = runs[~runs["has_per_clip"]]
+        dead = runs[~runs[have]]
         if len(dead):
             notes.append((WARN, f"{len(dead)} matched directory(ies) have no "
-                                "per_clip.parquet and are excluded -- an "
-                                "interrupted run, not a missing arm: "
-                                + ", ".join(dead["run_dir"])))
+                                f"{have[4:]}.parquet and are excluded -- an "
+                                "interrupted run, or one made before the table existed, "
+                                "not a missing arm: " + ", ".join(dead["run_dir"])))
 
     missing_pred = usable[~usable["has_predictions"]] if len(usable) else usable
     if len(missing_pred):
@@ -215,12 +228,78 @@ def report(tables: dict, gate_table: pd.DataFrame) -> None:
         print(f"\n{len(warned)} gate warning(s) -- see gate.parquet")
 
 
+def report_timing(tables: dict, gate_table: pd.DataFrame) -> None:
+    """Latency's half-page: deltas against the baseline, the split, the line."""
+    metrics = tables["metrics"]
+    print("\n-- latency against the first arm (paired, lower is better) " + "-" * 12)
+    for metric in tables["compared"]:
+        rows = metrics[metrics["metric"] == metric]
+        print(f"  {metric}")
+        for r in rows.itertuples():
+            ci = f"[{r.delta_lo:+6.1f}, {r.delta_hi:+6.1f}]"
+            print(f"    {r.arm:<6} {r.mean:10.1f}  {r.delta_pct:+7.2f}%  {ci}"
+                  f"  {int(r.n_better):4d} faster / {int(r.n_worse):4d} slower")
+    shares = tables["shares"]
+    if len(shares):
+        print("\n-- where the time goes: share of t_total " + "-" * 30)
+        wide = shares.pivot_table(index="arm", columns="segment", values="share", sort=False)
+        print(wide.map(lambda v: f"{v:6.1%}").to_string())
+    fits = tables["fits"]
+    if len(fits):
+        print("\n-- a line along the axis, through the arm means " + "-" * 22)
+        for r in fits.itertuples():
+            print(f"  {r.metric:<16} {r.intercept:10.1f} + {r.slope:9.2f} per unit"
+                  f"   R2 {r.r2:.3f}   ({r.n_arms} arms)")
+    warned = gate_table[gate_table["status"] == "warn"]
+    if len(warned):
+        print(f"\n{len(warned)} gate warning(s) -- see timing_gate.parquet")
+
+
+def main_timing(args: argparse.Namespace, runs: pd.DataFrame, out: Path) -> int:
+    timing = C.load_timing(runs, axis=args.axis)
+    gate_table = C.timing_gate(timing, axis=args.axis, allow_partial=args.allow_partial)
+    print("\n-- latency gate " + "-" * 55)
+    for r in gate_table.itertuples():
+        marker = {"ok": OK, "warn": WARN, "fail": STOP}[r.status]
+        print(f"{marker}  {r.check:<16}{r.detail}")
+    print("-" * 71)
+    if (gate_table["status"] == "fail").any():
+        out.mkdir(parents=True, exist_ok=True)
+        gate_table.to_parquet(out / "timing_gate.parquet", index=False)
+        print(f"\nRefused. The gate table is at {out / 'timing_gate.parquet'}; latency\n"
+              "measured under different conditions still subtracts, and means nothing.")
+        return 1
+    if args.dry_run:
+        print("\n--dry-run: stopping before the bootstrap. Nothing written.")
+        return 0
+    arms = C.arm_order(timing, baseline=args.baseline)
+    tables = C.timing_tables(timing, arms, metrics=args.timing_metrics.split(","),
+                             n_boot=args.n_boot, seed=args.seed)
+    out.mkdir(parents=True, exist_ok=True)
+    gate_table.to_parquet(out / "timing_gate.parquet", index=False)
+    for name in ("metrics", "shares", "fits"):
+        if len(tables[name]):
+            tables[name].to_parquet(out / f"timing_{name}.parquet", index=False)
+    (out / "timing_analysis.json").write_text(json.dumps({
+        "axis": args.axis, "arms": arms, "baseline": arms[0], "metrics": tables["compared"],
+        "n_clips": tables["n_clips"], "n_boot": args.n_boot, "seed": args.seed,
+        "runs": sorted(timing["run_dir"].unique()),
+        "timing_schema_version": sorted({int(v) for v in timing["timing_schema_version"]}),
+    }, indent=2, ensure_ascii=False))
+    report_timing(tables, gate_table)
+    print(f"\nWritten to {out}")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     runs = C.discover_runs(args.runs_root, args.match)
-    out = output_dir(args, list(runs[runs["has_per_clip"]]["run_dir"]) if len(runs) else [])
+    have = "has_timing" if args.timing else "has_per_clip"
+    out = output_dir(args, list(runs[runs[have]]["run_dir"]) if len(runs) else [])
     if show(preflight(args, runs, out)):
         return 2
+    if args.timing:
+        return main_timing(args, runs, out)
 
     per_clip = C.load_per_clip(runs, axis=args.axis)
     arms = C.arm_order(per_clip, baseline=args.baseline)
