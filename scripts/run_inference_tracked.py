@@ -93,6 +93,11 @@ MAX_SAMPLE_IMAGES = 20  # representative figures per run, per the recording rule
 # Allocator history snapshots written this run (local files; see --memory-snapshot).
 _MEMSNAPS: list[str] = []
 
+# Where host-device synchronizations happened, over the run's main passes (trace
+# level step). run.json keeps the busiest sites: the code a sync-free decode
+# loop would have to change.
+_SYNC_SITES: dict[str, int] = {}
+
 # The key a pass's host-clock windows travel under from run_clip to the loop.
 # Popped before the row is stored: windows are how energy is attributed, not a
 # column.
@@ -484,6 +489,8 @@ def run_clip(
     TH.mark("post")
     timing = tracer.timing
     trace = tracer.trace
+    for site, count in timing.sync_sites.items():
+        _SYNC_SITES[site] = _SYNC_SITES.get(site, 0) + count
 
     started = time.perf_counter()
     pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2]  # [K, T, 2]
@@ -924,6 +931,8 @@ def main() -> None:
         meta["modules"] = inventory
         if _MEMSNAPS:
             meta["memory_snapshots"] = list(_MEMSNAPS)
+        if _SYNC_SITES:
+            meta["sync_sites"] = sorted(_SYNC_SITES.items(), key=lambda kv: -kv[1])[:30]
         # The recording rules want the tracer's cost in run.json as well as in
         # MLflow: it is what a reader needs to decide how far to trust any
         # latency here, and run.json is what survives without the tracker.

@@ -110,6 +110,9 @@ class TimingResult:
     #: board sampler's readings. Not a column: the energy computed from them is.
     windows: dict[str, tuple[float, float]] = field(default_factory=dict)
     anchor_lag_ms: float | None = None
+    #: Trace level step only: columns, and the sync sites (not a column).
+    step: dict[str, Any] = field(default_factory=dict)
+    sync_sites: dict[str, int] = field(default_factory=dict)
 
     gen_preamble_ms: float | None = None
     lm_head_ms: float | None = None
@@ -189,6 +192,7 @@ class TimingResult:
             **self.memory,
             **self.shapes,
             "anchor_lag_ms": self.anchor_lag_ms,
+            **self.step,
         })
         return out
 
@@ -399,6 +403,87 @@ def _host_windows(result: TimingResult, records: list[Record], lm: list[Span],
         result.anchor_lag_ms = float((host(call[0][0]) - call[0][2]) * 1000.0)
 
 
+#: Logits processor class -> column stem.
+_PROCESSORS = {"ExpertLogitsProcessor": "mask", "TemperatureLogitsWarper": "temperature",
+               "TopPLogitsWarper": "top_p"}
+SYNC_PHASES = ("pre_generate", "vision", "prefill", "decode", "gen_loop", "postgen", "consume",
+               "expert", "tail")
+
+
+def _within(spans: list[Span], outer: Span) -> float:
+    """Device time of the spans that start inside ``outer``."""
+    return float(sum(end - start for start, end, _, _ in spans if outer[0] <= start <= outer[1]))
+
+
+def _split_step(result: TimingResult, records: list[Record], lm: list[Span],
+                expert: list[Span], diffusion: list[Span], step: Mapping[str, Any]) -> None:
+    """Trace level step: what each Euler step and each decode step is made of.
+
+    KV concatenations are attributed to the forward they ran inside by device
+    time: the prefill's, each decode step's, each Euler step's.
+    """
+    out: dict[str, Any] = {}
+    kv = span_pairs(records, "kv_cat")
+    if lm:
+        out["kv_cat_ms_prefill"] = _within(kv, lm[0])
+        decode = [_within(kv, s) for s in lm[1:]]
+        out["decode_kv_cat_ms"] = decode
+        out["kv_cat_ms_decode"] = float(sum(decode))
+    per_euler = [_within(kv, s) for s in expert]
+    out["expert_kv_cat_ms"] = per_euler
+    out["kv_cat_ms_expert"] = float(sum(per_euler))
+    for phase in ("prefill", "decode", "expert"):
+        out[f"kv_cat_bytes_{phase}"] = int(step.get("kv_bytes", {}).get(phase, 0))
+    out["n_kv_cat_calls"] = int(step.get("kv_calls", 0))
+
+    in_proj, out_proj = span_pairs(records, "in_proj"), span_pairs(records, "out_proj")
+    out["expert_in_proj_ms"] = _device(in_proj)
+    out["expert_out_proj_ms"] = _device(out_proj)
+    rest = []
+    for i, done in enumerate(out_proj):
+        following = in_proj[i + 1][0] if i + 1 < len(in_proj) else (
+            diffusion[-1][1] if diffusion else None)
+        if following is not None:
+            rest.append(float(max(following - done[1], 0.0)))
+    out["expert_euler_rest_ms"] = rest
+
+    out["decode_logits_proc_ms"] = _device(span_pairs(records, "lp"))
+    out["decode_stop_ms"] = _device(span_pairs(records, "stop"))
+    totals = {stem: 0.0 for stem in (*_PROCESSORS.values(), "other")}
+    for bucket in sorted({r[0] for r in records if str(r[0]).startswith("lp:")}):
+        stem = _PROCESSORS.get(bucket[3:], "other")
+        totals[stem] += float(sum(_device(span_pairs(records, bucket))))
+    for stem, value in totals.items():
+        out[f"lp_{stem}_ms"] = value
+
+    lists = step.get("host_lists", {})
+    out["decode_prep_inputs_host_ms"] = list(lists.get("prep_inputs", []))
+    out["decode_update_kwargs_host_ms"] = list(lists.get("update_kwargs", []))
+    out["expert_crop_host_ms"] = list(lists.get("crop", []))
+
+    find_eos = float(sum(_device(span_pairs(records, "find_eos"))))
+    build_mask = float(sum(_device(span_pairs(records, "build_mask"))))
+    out["t_find_eos_ms"], out["t_build_mask_ms"] = find_eos, build_mask
+    if result.postgen_ms is not None:
+        out["t_postgen_rest_ms"] = float(max(
+            result.postgen_ms - (result.trace_consume_ms or 0.0) - find_eos - build_mask, 0.0))
+
+    parts = {name: float(sum(_device(span_pairs(records, bucket))))
+             for name, bucket in (("patch_embed", "v_patch"), ("blocks", "v_blocks"),
+                                  ("deepstack", "v_deepstack"), ("merger", "v_merger"))}
+    for name, value in parts.items():
+        out[f"t_vision_{name}_ms"] = value
+    if result.vision_ms is not None:
+        out["t_vision_rest_ms"] = float(max(result.vision_ms - sum(parts.values()), 0.0))
+
+    counts = step.get("sync_counts", {})
+    out["n_syncs_total"] = int(sum(counts.values()))
+    for phase in SYNC_PHASES:
+        out[f"n_syncs_{phase}"] = int(counts.get(phase, 0))
+    result.step = out
+    result.sync_sites = dict(step.get("sync_sites", {}))
+
+
 def _split_generate(result: TimingResult, records: list[Record], generate: list[Span],
                     wall_start_s: float | None) -> None:
     """Break the generate span's remainder into the four things it was made of.
@@ -458,6 +543,7 @@ def resolve(
     process: Mapping[str, Any] | None = None,
     memory: list[Mapping[str, Any]] | None = None,
     shapes: Mapping[str, Any] | None = None,
+    step: Mapping[str, Any] | None = None,
 ) -> TimingResult:
     """Attribute the marks of one pass.
 
@@ -563,6 +649,8 @@ def resolve(
     _split_generate(result, records, generate, wall_start_s)
     _split_host(result, records, generate, diffusion)
     _host_windows(result, records, lm, vision, diffusion, wall_start_s, wall_end_s)
+    if step is not None:
+        _split_step(result, records, lm, expert, diffusion, step)
 
     spans = [v for v in (result.vision_ms, result.prefill_ms, result.decode_ms,
                          result.expert_ms) if v is not None]

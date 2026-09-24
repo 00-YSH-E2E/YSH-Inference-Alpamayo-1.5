@@ -53,7 +53,7 @@ import numpy as np
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 8
+TIMING_SCHEMA_VERSION = 9
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
@@ -81,6 +81,9 @@ CHANGELOG = {
     8: "Board attribution per pass: energy per rail and per segment, power mean and peaks, "
     "coverage, GPU clock per segment, EMC minimum, over-current events, throttle state, "
     "junction peak, anchor lag.",
+    9: "Trace level step: per Euler step (projections, KV concatenation, crop, rest), per "
+    "decode step (logits processors, stopping, input preparation, KV concatenation), KV "
+    "totals and bytes, postgen and vision parts, synchronizations by phase.",
 }
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
@@ -420,9 +423,61 @@ BOARD_STATE = _cols("board", (
      "the GPU was still busy with earlier work and the window's start is less certain."),
 ), since=8)
 
+#: Trace level step only; null at the other levels.
+STEP = _cols("step", (
+    ("expert_in_proj_ms", "lf32", "ms", "L", "Each Euler step's action input projection."),
+    ("expert_out_proj_ms", "lf32", "ms", "L", "Each Euler step's action output projection."),
+    ("expert_kv_cat_ms", "lf32", "ms", "L",
+     "Each Euler step's KV concatenation: every layer appends the action tokens to the full "
+     "prompt cache, which is then cropped back."),
+    ("expert_crop_host_ms", "lf32", "ms", "L", "Each crop of the prompt cache, host clock."),
+    ("expert_euler_rest_ms", "lf32", "ms", "L",
+     "After each step's output projection until the next step starts: the sampler's own "
+     "arithmetic."),
+    ("decode_logits_proc_ms", "lf32", "ms", "L",
+     "Each generate step's logits processors: the trajectory-token mask, temperature, and a "
+     "full top-p sort over the vocabulary."),
+    ("decode_stop_ms", "lf32", "ms", "L", "Each generate step's stopping criteria."),
+    ("decode_prep_inputs_host_ms", "lf32", "ms", "L", "Each step's input preparation, host."),
+    ("decode_update_kwargs_host_ms", "lf32", "ms", "L", "Each step's kwargs update, host."),
+    ("decode_kv_cat_ms", "lf32", "ms", "L", "Each decode step's KV concatenation, all layers."),
+    ("kv_cat_ms_prefill", "f64", "ms", "L", "KV concatenation inside prefill."),
+    ("kv_cat_ms_decode", "f64", "ms", "L", "KV concatenation over the decode loop."),
+    ("kv_cat_ms_expert", "f64", "ms", "L", "KV concatenation over the head's steps."),
+    ("kv_cat_bytes_prefill", "i64", "B", "N", "Bytes the cache updates wrote in prefill."),
+    ("kv_cat_bytes_decode", "i64", "B", "N",
+     "Bytes the cache updates wrote over the decode loop -- about as much again was read."),
+    ("kv_cat_bytes_expert", "i64", "B", "N", "Bytes the cache updates wrote in the head."),
+    ("n_kv_cat_calls", "i32", "", "N", "Cache updates in the pass: layers x steps."),
+    ("lp_mask_ms", "f64", "ms", "L", "The trajectory-token mask, over the pass."),
+    ("lp_temperature_ms", "f64", "ms", "L", "The temperature warper, over the pass."),
+    ("lp_top_p_ms", "f64", "ms", "L", "The top-p warper's sort, over the pass."),
+    ("lp_other_ms", "f64", "ms", "L", "Any other logits processor, over the pass."),
+    ("t_find_eos_ms", "f64", "ms", "L", "Finding each row's end marker (a sync per row)."),
+    ("t_build_mask_ms", "f64", "ms", "L", "Building the head's positions and attention mask."),
+    ("t_postgen_rest_ms", "f64", "ms", "L", "postgen outside the tracer and those two."),
+    ("t_vision_patch_embed_ms", "f64", "ms", "L", "The vision tower's patch embedding."),
+    ("t_vision_blocks_ms", "f64", "ms", "L", "Its transformer blocks, first to last."),
+    ("t_vision_deepstack_ms", "f64", "ms", "L", "Its deepstack mergers."),
+    ("t_vision_merger_ms", "f64", "ms", "L", "Its final merger."),
+    ("t_vision_rest_ms", "f64", "ms", "L", "The vision span outside those parts."),
+    ("n_syncs_total", "i32", "", "L",
+     "Host-device synchronizations in the pass. Each stalls the host until the device "
+     "drains -- in a decode loop, what makes a step launch-bound."),
+    ("n_syncs_pre_generate", "i32", "", "L", "Synchronizations before generate."),
+    ("n_syncs_vision", "i32", "", "L", "Synchronizations in the vision tower."),
+    ("n_syncs_prefill", "i32", "", "L", "Synchronizations in prefill."),
+    ("n_syncs_decode", "i32", "", "L", "Synchronizations inside decode forwards."),
+    ("n_syncs_gen_loop", "i32", "", "L", "Synchronizations in generate between forwards."),
+    ("n_syncs_postgen", "i32", "", "L", "Synchronizations between generate and the head."),
+    ("n_syncs_consume", "i32", "", "L", "Synchronizations in the tracer's logits pass."),
+    ("n_syncs_expert", "i32", "", "L", "Synchronizations in the head."),
+    ("n_syncs_tail", "i32", "", "L", "Synchronizations after the head."),
+), since=9)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
                             + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST + MEMORY + SHAPES
-                            + BOARD + ENERGY + BOARD_STATE)
+                            + BOARD + ENERGY + BOARD_STATE + STEP)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -560,6 +615,16 @@ AGGREGATE_KEYS = (
     "throttle.oc3_events_sum", "throttle.oc3_events_per_clip", "throttle.clips_with_oc_frac",
     "throttle.state_max", "throttle.temp_tj_max_c", "throttle.corr_wall_gpu_mhz",
     "throttle.corr_wall_oc3", "trace.anchor_lag_ms",
+    "step.expert_in_proj_ms", "step.expert_out_proj_ms", "step.expert_kv_cat_ms",
+    "step.expert_crop_host_ms", "step.expert_euler_rest_ms", "step.decode_logits_proc_ms",
+    "step.decode_stop_ms", "step.decode_prep_inputs_host_ms", "step.decode_update_kwargs_host_ms",
+    "step.decode_kv_cat_ms", "step.lp_top_p_ms", "step.lp_mask_ms", "step.lp_temperature_ms",
+    "step.t_find_eos_ms", "step.t_build_mask_ms", "step.t_postgen_rest_ms",
+    "kv.cat_ms_decode", "kv.cat_ms_expert", "kv.cat_share_decode", "kv.cat_share_expert",
+    "kv.cat_gbps_decode", "kv.cat_gbps_expert",
+    "vision.patch_embed_ms", "vision.blocks_ms", "vision.deepstack_ms", "vision.merger_ms",
+    "sync.n_per_clip", "sync.n_per_decode_step", "sync.n_decode", "sync.n_gen_loop",
+    "sync.n_postgen", "sync.n_expert", "sync.n_vision", "sync.n_prefill",
 )
 
 
@@ -772,6 +837,50 @@ def _board(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
     return out
 
 
+def _pooled(rows: list[Mapping[str, Any]], key: str) -> float | None:
+    """Mean over every step of every clip -- a step is the unit, not a clip."""
+    return _mean([v for a in _arrays(rows, key) for v in a])
+
+
+def _step(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
+    """Trace level step's numbers, from the rows that have them."""
+    rows = [r for r in rows if r.get("n_syncs_total") is not None
+            or r.get("n_kv_cat_calls") is not None]
+    if not rows:
+        return {}
+    out: dict[str, float | None] = {}
+    for key in ("expert_in_proj_ms", "expert_out_proj_ms", "expert_kv_cat_ms",
+                "expert_crop_host_ms", "expert_euler_rest_ms", "decode_logits_proc_ms",
+                "decode_stop_ms", "decode_prep_inputs_host_ms", "decode_update_kwargs_host_ms",
+                "decode_kv_cat_ms"):
+        out[f"step.{key}"] = _pooled(rows, key)
+    for key in ("lp_top_p_ms", "lp_mask_ms", "lp_temperature_ms", "t_find_eos_ms",
+                "t_build_mask_ms", "t_postgen_rest_ms"):
+        out[f"step.{key}"] = _mean(_values(rows, key))
+    for phase, span in (("decode", "t_decode_ms"), ("expert", "t_expert_ms")):
+        cat = _values(rows, f"kv_cat_ms_{phase}")
+        out[f"kv.cat_ms_{phase}"] = _mean(cat)
+        shares = [float(r[f"kv_cat_ms_{phase}"]) / float(r[span]) for r in rows
+                  if is_number(r.get(f"kv_cat_ms_{phase}")) and is_number(r.get(span))
+                  and float(r[span]) > 0.0]
+        out[f"kv.cat_share_{phase}"] = _mean(shares)
+        # Written bytes, doubled for the read of the old cache, over the time.
+        rates = [2.0 * float(r[f"kv_cat_bytes_{phase}"]) / float(r[f"kv_cat_ms_{phase}"]) / 1e6
+                 for r in rows if is_number(r.get(f"kv_cat_bytes_{phase}"))
+                 and is_number(r.get(f"kv_cat_ms_{phase}")) and float(r[f"kv_cat_ms_{phase}"]) > 0]
+        out[f"kv.cat_gbps_{phase}"] = _mean(rates)
+    for part in ("patch_embed", "blocks", "deepstack", "merger"):
+        out[f"vision.{part}_ms"] = _mean(_values(rows, f"t_vision_{part}_ms"))
+    out["sync.n_per_clip"] = _mean(_values(rows, "n_syncs_total"))
+    per_step = [float(r["n_syncs_decode"] + r["n_syncs_gen_loop"]) / float(r["n_decode_steps"])
+                for r in rows if is_number(r.get("n_syncs_decode"))
+                and is_number(r.get("n_syncs_gen_loop")) and r.get("n_decode_steps")]
+    out["sync.n_per_decode_step"] = _mean(per_step)
+    for phase in ("decode", "gen_loop", "postgen", "expert", "vision", "prefill"):
+        out[f"sync.n_{phase}"] = _mean(_values(rows, f"n_syncs_{phase}"))
+    return out
+
+
 def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     """Run-level numbers for MLflow, from the main measured rows only.
 
@@ -909,5 +1018,6 @@ def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     out["vision.n_tokens"] = _mean(_values(rows, "n_vision_tokens"))
 
     out.update(_board(rows))
+    out.update(_step(rows))
 
     return {k: float(v) for k, v in out.items() if v is not None and math.isfinite(v)}

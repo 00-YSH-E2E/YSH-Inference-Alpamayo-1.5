@@ -296,3 +296,18 @@ def test_the_board_is_aggregated_per_clip_and_across_them():
 def test_a_correlation_needs_three_clips_that_moved():
     two = [row(t_wall_ms=1.0, gpu_mhz_mean=2.0), row(t_wall_ms=2.0, gpu_mhz_mean=1.0)]
     assert "throttle.corr_wall_gpu_mhz" not in TS.aggregate(two)
+
+
+def test_step_numbers_pool_steps_and_rate_the_concatenation():
+    rows = [row(n_syncs_total=180, n_syncs_decode=40, n_syncs_gen_loop=100, n_decode_steps=35,
+                kv_cat_ms_decode=700.0, t_decode_ms=3500.0, kv_cat_bytes_decode=int(80e9),
+                kv_cat_ms_expert=200.0, t_expert_ms=2800.0, kv_cat_bytes_expert=int(28e9),
+                decode_kv_cat_ms=[20.0, 20.0], n_kv_cat_calls=1600)]
+    out = TS.aggregate(rows)
+    assert out["kv.cat_share_decode"] == pytest.approx(0.2)
+    # 80 GB written and 80 GB read in 0.7 s.
+    assert out["kv.cat_gbps_decode"] == pytest.approx(2 * 80e9 / 0.7 / 1e9)
+    assert out["sync.n_per_decode_step"] == pytest.approx(4.0)
+    assert out["step.decode_kv_cat_ms"] == 20.0
+    assert set(out) <= set(TS.AGGREGATE_KEYS)
+    assert not any(k.startswith(("step.", "sync.")) for k in TS.aggregate([row(t_total_ms=1.0)]))

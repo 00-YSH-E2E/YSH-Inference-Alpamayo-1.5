@@ -326,3 +326,53 @@ def test_device_spans_are_mapped_onto_the_host_clock_through_the_anchor():
     assert w["expert"] == pytest.approx((99.85, 99.99))
     assert t.anchor_lag_ms == pytest.approx(10.0)
     assert "windows" not in t.row() and t.row()["anchor_lag_ms"] == pytest.approx(10.0)
+
+
+# -- trace level step (table 9) -----------------------------------------------------
+def step_pass():
+    """Two decode steps and two Euler steps, each with KV concatenations inside;
+    projections, logits processors, stopping, postgen and vision parts."""
+    return marks(
+        ("generate", 0, 100), ("vision", 2, 10), ("v_patch", 2, 3), ("v_blocks", 3, 8),
+        ("v_merger", 8, 9), ("lm", 11, 30), ("kv_cat", 12, 13),
+        ("lp", 31, 34), ("lp:TopPLogitsWarper", 32, 34), ("stop", 34, 35),
+        ("lm", 40, 50), ("kv_cat", 41, 43), ("lp", 51, 53), ("lp:TopPLogitsWarper", 51, 53),
+        ("lm", 60, 70), ("kv_cat", 61, 64),
+        ("find_eos", 102, 104), ("build_mask", 104, 107),
+        ("diffusion", 110, 170), ("in_proj", 111, 112), ("expert", 112, 130),
+        ("kv_cat", 113, 118), ("out_proj", 130, 131), ("in_proj", 135, 136),
+        ("expert", 136, 160), ("kv_cat", 137, 143), ("out_proj", 160, 161),
+    )
+
+
+def test_step_level_attributes_concatenation_to_its_step():
+    t = TM.resolve(step_pass(), step={
+        "kv_bytes": {"decode": 5000, "expert": 9000}, "kv_calls": 5,
+        "host_lists": {"prep_inputs": [0.2, 0.3], "crop": [0.1, 0.1]},
+        "sync_counts": {"gen_loop": 6, "consume": 2}, "sync_sites": {"utils.py:2843": 6}})
+    s = t.step
+    assert s["kv_cat_ms_prefill"] == pytest.approx(1.0)
+    assert s["decode_kv_cat_ms"] == pytest.approx([2.0, 3.0])
+    assert s["expert_kv_cat_ms"] == pytest.approx([5.0, 6.0])
+    assert s["kv_cat_bytes_expert"] == 9000 and s["n_kv_cat_calls"] == 5
+    assert s["expert_in_proj_ms"] == pytest.approx([1.0, 1.0])
+    # After step 1's output projection (131) to step 2's input (135); after the
+    # last one (161) to the diffusion end (170).
+    assert s["expert_euler_rest_ms"] == pytest.approx([4.0, 9.0])
+    assert s["decode_logits_proc_ms"] == pytest.approx([3.0, 2.0])
+    assert s["lp_top_p_ms"] == pytest.approx(4.0) and s["lp_mask_ms"] == 0.0
+    assert s["decode_stop_ms"] == pytest.approx([1.0])
+    assert s["decode_prep_inputs_host_ms"] == [0.2, 0.3]
+    assert s["t_find_eos_ms"] == pytest.approx(2.0) and s["t_build_mask_ms"] == pytest.approx(3.0)
+    assert s["t_postgen_rest_ms"] == pytest.approx(10.0 - 2.0 - 3.0)
+    assert s["t_vision_blocks_ms"] == pytest.approx(5.0)
+    assert s["t_vision_rest_ms"] == pytest.approx(8.0 - 1.0 - 5.0 - 1.0)
+    assert s["n_syncs_total"] == 8 and s["n_syncs_gen_loop"] == 6
+    assert t.sync_sites == {"utils.py:2843": 6}
+    assert not TS.unknown_keys(t.row())
+
+
+def test_below_step_level_there_is_nothing_of_it():
+    t = TM.resolve(one_pass())
+    assert t.step == {} and t.sync_sites == {}
+    assert t.row().get("n_syncs_total") is None

@@ -52,9 +52,12 @@ checkpoint:
 from __future__ import annotations
 
 import contextlib
+import functools
+import inspect
 import os
 import resource
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -174,7 +177,64 @@ def run_peak_bytes() -> int:
 #: pair of marks around the call, for the wall clock -- and exists so the cost
 #: of ``basic`` can be measured against it on the same clip. Deeper levels are
 #: added by the commits that implement them.
-TRACE_LEVELS = ("off", "basic")
+TRACE_LEVELS = ("off", "basic", "step")
+
+#: What torch's sync debug mode says when an operation synchronizes the host
+#: with the device. Checked against libc10_cuda in the pinned torch.
+_SYNC_MESSAGE = "called a synchronizing CUDA operation"
+
+#: Where the step level attributes a synchronization, by the mark that opens
+#: the phase. Decode steps alternate between "decode" (the forward) and
+#: "gen_loop" (everything generate does between forwards).
+_PHASE_AFTER = {
+    ("generate", "start"): "gen_loop", ("vision", "start"): "vision",
+    ("vision", "end"): "prefill", ("lm", "end"): "gen_loop",
+    ("generate", "end"): "postgen", ("consume", "start"): "consume",
+    ("consume", "end"): "postgen", ("diffusion", "start"): "expert",
+    ("diffusion", "end"): "tail",
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _timed_lists() -> tuple[type, type]:
+    """generate's processor and stopping lists, with every member marked.
+
+    generate looks ``__call__`` up on the class, so an instance attribute
+    cannot intercept it; a subclass returned from the instance-wrapped
+    ``_get_logits_processor`` can. The loop mirrors LogitsProcessorList's own,
+    signature check included, so what runs is unchanged.
+    """
+    from transformers.generation.logits_process import LogitsProcessorList
+    from transformers.generation.stopping_criteria import StoppingCriteriaList
+
+    class TimedProcessors(LogitsProcessorList):
+        tracer: Any = None
+
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+            tracer = self.tracer
+            tracer._mark("lp", "start")
+            for processor in self:
+                bucket = f"lp:{type(processor).__name__}"
+                tracer._mark(bucket, "start")
+                if len(inspect.signature(processor.__call__).parameters) > 2:
+                    scores = processor(input_ids, scores, **kwargs)
+                else:
+                    scores = processor(input_ids, scores)
+                tracer._mark(bucket, "end")
+            tracer._mark("lp", "end")
+            return scores
+
+    class TimedStopping(StoppingCriteriaList):
+        tracer: Any = None
+
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+            self.tracer._mark("stop", "start")
+            try:
+                return super().__call__(input_ids, scores, **kwargs)
+            finally:
+                self.tracer._mark("stop", "end")
+
+    return TimedProcessors, TimedStopping
 
 
 def _reduce_logits(logits_step: torch.Tensor, chosen: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -269,6 +329,16 @@ class InferenceTracer:
         #: Shapes read off hook arguments: the KV cache the head attends to, the images.
         self._shapes: dict[str, Any] = {}
         self._lm_calls = 0
+        # Step level only.
+        self._phase_now = "pre_generate"
+        self._kv_bytes: dict[str, int] = {}
+        self._kv_calls = 0
+        self._host_lists: dict[str, list[float]] = {}
+        self._sync_counts: dict[str, int] = {}
+        self._sync_sites: dict[str, int] = {}
+        self._sync_prev_mode: Any = None
+        self._warn_ctx: Any = None
+        self._seen_caches: set[int] = set()
         self._enabled = False
         self._wall_start: float | None = None
         self._start_unix: float | None = None
@@ -305,6 +375,11 @@ class InferenceTracer:
         # busy host from one that was waiting or descheduled.
         stamp = time.perf_counter()
         self._marks.append((bucket, kind, event, stamp, time.thread_time()))
+        if self.level == "step":
+            if bucket == "lm" and kind == "start":
+                self._phase_now = "prefill" if self._lm_calls == 0 else "decode"
+            else:
+                self._phase_now = _PHASE_AFTER.get((bucket, kind), self._phase_now)
         # What the mark itself cost the host. Summed per pass, it is the
         # instrument's own share of the wall clock -- a number the recording
         # rules require and that no end-to-end comparison can recover later.
@@ -331,6 +406,11 @@ class InferenceTracer:
         self._memory = []
         self._shapes = {}
         self._lm_calls = 0
+        self._phase_now = "pre_generate"
+        self._kv_bytes, self._kv_calls = {}, 0
+        self._host_lists = {}
+        self._sync_counts, self._sync_sites = {}, {}
+        self._seen_caches = set()
         self.timing = TimingResult()
         if torch.cuda.is_available():
             _POOL.acquire(self)
@@ -439,8 +519,166 @@ class InferenceTracer:
             self._set_attr(space, "action_to_traj",
                            self._wrap_host(space.action_to_traj, "action_to_traj", "a2t"))
 
+        if self.level == "step":
+            self._install_step(vlm, inner)
+
         # Last, so the call's span starts where the model's work does.
         self._mark("call", "start")
+
+    # -- step level -----------------------------------------------------------
+    def _hook_pair(self, module: Any, bucket: str) -> None:
+        if isinstance(module, torch.nn.Module):
+            self._handles.append(
+                module.register_forward_pre_hook(lambda *_: self._mark(bucket, "start")))
+            self._handles.append(module.register_forward_hook(lambda *_: self._mark(bucket, "end")))
+
+    def _install_step(self, vlm: Any, inner: Any) -> None:
+        """Inside the steps: the head's projections and KV concatenation, the decode
+        loop's processors and stopping criteria, postgen's parts, the vision
+        tower's parts, and every host-device synchronization.
+
+        Around 150 marks per decode step: this level is for attribution, and
+        the overhead probe measures what it costs.
+        """
+        self._hook_pair(getattr(self.model, "action_in_proj", None), "in_proj")
+        self._hook_pair(getattr(self.model, "action_out_proj", None), "out_proj")
+        # The KV cache is created inside generate; it is wrapped the first time
+        # the language model or the head is handed it.
+        for module in (getattr(inner, "language_model", None), getattr(self.model, "expert", None)):
+            if isinstance(module, torch.nn.Module):
+                self._handles.append(
+                    module.register_forward_pre_hook(self._see_cache, with_kwargs=True))
+        try:
+            timed_processors, timed_stopping = _timed_lists()
+        except Exception:
+            timed_processors = timed_stopping = None
+        if timed_processors is not None and callable(getattr(vlm, "_get_logits_processor", None)):
+            self._set_attr(vlm, "_get_logits_processor",
+                           self._wrap_list(vlm._get_logits_processor, timed_processors))
+        if timed_stopping is not None and callable(getattr(vlm, "_get_stopping_criteria", None)):
+            self._set_attr(vlm, "_get_stopping_criteria",
+                           self._wrap_list(vlm._get_stopping_criteria, timed_stopping))
+        for name, key in (("prepare_inputs_for_generation", "prep_inputs"),
+                          ("_update_model_kwargs_for_generation", "update_kwargs")):
+            if callable(getattr(vlm, name, None)):
+                self._set_attr(vlm, name, self._wrap_host_list(getattr(vlm, name), key))
+        for name, bucket in (("_find_eos_offset", "find_eos"),
+                             ("_build_expert_pos_ids_and_attn_mask", "build_mask")):
+            if callable(getattr(self.model, name, None)):
+                self._set_attr(self.model, name,
+                               self._wrap_host(getattr(self.model, name), bucket, bucket))
+        visual = getattr(inner, "visual", None)
+        if visual is not None:
+            self._hook_pair(getattr(visual, "patch_embed", None), "v_patch")
+            blocks = getattr(visual, "blocks", None)
+            if blocks is not None and len(blocks):
+                self._handles.append(blocks[0].register_forward_pre_hook(
+                    lambda *_: self._mark("v_blocks", "start")))
+                self._handles.append(blocks[-1].register_forward_hook(
+                    lambda *_: self._mark("v_blocks", "end")))
+            for merger in getattr(visual, "deepstack_merger_list", None) or []:
+                self._hook_pair(merger, "v_deepstack")
+            self._hook_pair(getattr(visual, "merger", None), "v_merger")
+        self._start_sync_audit()
+
+    def _wrap_list(self, original: Any, timed_class: type) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            built = original(*args, **kwargs)
+            try:
+                timed = timed_class(built)
+                timed.tracer = self
+                return timed
+            except Exception:
+                return built
+
+        return wrapper
+
+    def _wrap_host_list(self, original: Any, key: str) -> Any:
+        """Host time of every call, kept as a list -- one entry per step."""
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            started = time.perf_counter()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self._host_lists.setdefault(key, []).append(
+                    (time.perf_counter() - started) * 1000.0)
+
+        return wrapper
+
+    def _see_cache(self, module: Any, args: tuple, kwargs: dict) -> None:
+        cache = kwargs.get("past_key_values")
+        if cache is None or id(cache) in self._seen_caches:
+            return
+        self._seen_caches.add(id(cache))
+        if callable(getattr(cache, "update", None)):
+            self._set_attr(cache, "update", self._wrap_kv_update(cache.update))
+        if callable(getattr(cache, "crop", None)):
+            self._set_attr(cache, "crop", self._wrap_host_list(cache.crop, "crop"))
+
+    def _wrap_kv_update(self, original: Any) -> Any:
+        """Time each layer's cache update and count what it wrote.
+
+        DynamicLayer.update concatenates the whole cache with the new keys and
+        values on every call: the returned tensors are the new cache, and their
+        size is what was written (about as much again was read).
+        """
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            self._mark("kv_cat", "start")
+            out = original(*args, **kwargs)
+            self._mark("kv_cat", "end")
+            try:
+                phase = self._phase_now if self._phase_now in ("prefill", "decode",
+                                                               "expert") else "other"
+                self._kv_bytes[phase] = (self._kv_bytes.get(phase, 0)
+                                         + int(out[0].nbytes + out[1].nbytes))
+                self._kv_calls += 1
+            except Exception:
+                pass
+            return out
+
+        return wrapper
+
+    def _start_sync_audit(self) -> None:
+        """Count every host-device synchronization, by phase and by code site.
+
+        torch's sync debug mode warns on each one; the warnings are caught here
+        rather than shown. A synchronization in the decode loop stalls the host
+        until the device drains, which is what makes a step launch-bound.
+        """
+        try:
+            self._sync_prev_mode = torch.cuda.get_sync_debug_mode()
+            self._warn_ctx = warnings.catch_warnings()
+            self._warn_ctx.__enter__()
+            warnings.filterwarnings("always", message=f".*{_SYNC_MESSAGE}.*")
+            warnings.filterwarnings("ignore", message=".*Synchronization debug mode.*")
+            shown = warnings.showwarning
+
+            def show(message: Any, category: Any, filename: str, lineno: int,
+                     file: Any = None, line: Any = None) -> None:
+                if _SYNC_MESSAGE in str(message):
+                    phase = self._phase_now
+                    self._sync_counts[phase] = self._sync_counts.get(phase, 0) + 1
+                    site = "/".join(str(filename).split("/")[-2:]) + f":{lineno}"
+                    self._sync_sites[site] = self._sync_sites.get(site, 0) + 1
+                    return
+                shown(message, category, filename, lineno, file, line)
+
+            warnings.showwarning = show
+            torch.cuda.set_sync_debug_mode("warn")
+        except Exception:
+            self._stop_sync_audit()
+
+    def _stop_sync_audit(self) -> None:
+        try:
+            if self._sync_prev_mode is not None:
+                torch.cuda.set_sync_debug_mode(self._sync_prev_mode)
+        finally:
+            self._sync_prev_mode = None
+            if self._warn_ctx is not None:
+                self._warn_ctx.__exit__(None, None, None)
+                self._warn_ctx = None
 
     # -- boundaries and shapes ---------------------------------------------
     def _mem_mark(self, label: str) -> None:
@@ -606,6 +844,7 @@ class InferenceTracer:
     def _remove(self) -> None:
         if not self._enabled:
             return
+        self._stop_sync_audit()
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
@@ -756,6 +995,9 @@ class InferenceTracer:
             process=_process_delta(self._process0, _process_stats()),
             memory=self._memory,
             shapes=self._shapes,
+            step={"kv_bytes": self._kv_bytes, "kv_calls": self._kv_calls,
+                  "host_lists": self._host_lists, "sync_counts": self._sync_counts,
+                  "sync_sites": self._sync_sites} if self.level == "step" else None,
         )
         _POOL.release(self)
         return self.timing

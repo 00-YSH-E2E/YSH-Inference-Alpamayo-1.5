@@ -263,3 +263,23 @@ def test_the_inventory_weighs_each_part_it_finds():
     assert "weights.visual_gb" not in inv
     assert inv["weights.n_quant_modules"] == 0.0
 
+
+@needs_gpu
+def test_level_step_audits_syncs_and_restores_what_it_changed():
+    """The tracer's own logits pass brings logits to the host: at least one sync
+    lands in the consume phase. Afterwards the sync debug mode and the warning
+    hook are exactly as they were."""
+    import warnings
+
+    model = _Model()
+    shown = warnings.showwarning
+    mode = torch.cuda.get_sync_debug_mode()
+    with trace_inference(model, level="step") as tracer:
+        model.run()
+    t = tracer.timing
+    assert t.step["n_syncs_consume"] >= 1
+    assert t.sync_sites
+    assert len(t.step["expert_in_proj_ms"]) == 4
+    assert torch.cuda.get_sync_debug_mode() == mode
+    assert warnings.showwarning is shown
+
