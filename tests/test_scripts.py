@@ -102,3 +102,21 @@ def test_a_held_lock_refuses_a_second_sweep(tmp_path):
     assert "막힘" in done.stderr
     # Refused before the first combination: nothing was launched.
     assert "[1/" not in done.stdout
+
+
+def test_the_preflight_never_prints_the_hf_token(tmp_path):
+    """A token in the environment is a secret. The check says where it came
+    from, never what it is: the preflight's output lands in terminals and logs."""
+    scripts = _copy_scripts(tmp_path)
+    (tmp_path / ".env").write_text(
+        f'LOCK_FILE="{tmp_path / "test.lock"}"\nPYTHON="/nonexistent/python"\n'
+        'DATA_CACHE="/nonexistent"\nNETWORK_PROXY=""\n')
+    secret = "hf_not_a_real_token_0123456789"
+    done = subprocess.run(["bash", str(scripts / "run.sh")],
+                          env=_env(HF_TOKEN=secret, OVERRIDE_TRACK="0"),
+                          capture_output=True, text=True, cwd=tmp_path, timeout=60)
+    out = done.stdout + done.stderr
+    # The bogus paths stop it in the preflight, before any GPU work.
+    assert done.returncode != 0, out
+    assert "HF:" in out
+    assert secret not in out

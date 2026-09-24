@@ -379,7 +379,9 @@ if [[ -z "${HF_TOKEN:-}" && ! -f "$HF_TOKEN_FILE" ]]; then
        @main 이 40자리 sha 로 안 풀려서 좌표가 움직이는 이름으로 남는다"
   [[ "$UPLOAD" == "1" ]] && fail "업로드도 못 한다. export HF_TOKEN=... 하거나 UPLOAD=0"
 else
-  ok "HF:    ${HF_TOKEN:+환경변수}${HF_TOKEN:-$HF_TOKEN_FILE}"
+  # 어디서 왔는지만 찍는다. 값을 찍으면 토큰이 터미널과 로그에 그대로 남는다
+  # (전에는 ${HF_TOKEN:-...} 가 환경변수의 값 자체를 펼쳤다).
+  ok "HF:    $([[ -n "${HF_TOKEN:-}" ]] && echo "환경변수 HF_TOKEN" || echo "$HF_TOKEN_FILE")"
 fi
 
 # ── 프록시 ─────────────────────────────────────────────────────────────────
