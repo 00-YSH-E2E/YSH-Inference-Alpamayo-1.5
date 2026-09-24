@@ -264,40 +264,105 @@ def test_the_inventory_weighs_each_part_it_finds():
     assert inv["weights.n_quant_modules"] == 0.0
 
 
+class _Cache:
+    """Like DynamicCache: ``update`` concatenates a layer's keys and values onto
+    what it holds, by layer index, and returns the result."""
+
+    def __init__(self) -> None:
+        self.held: dict[int, tuple] = {}
+
+    def update(self, key, value, layer_idx, cache_kwargs=None):
+        if layer_idx in self.held:
+            key = torch.cat([self.held[layer_idx][0], key])
+            value = torch.cat([self.held[layer_idx][1], value])
+        self.held[layer_idx] = (key, value)
+        return key, value
+
+
+class _VisionAttn(torch.nn.Module):
+    """The vision tower's attention: one fused projection in, ``proj`` out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.qkv = _Lin()
+        self.proj = _Lin()
+
+    def forward(self, x, **kwargs):
+        return self.proj(self.qkv(x))
+
+
+class _TextAttn(torch.nn.Module):
+    """The language model's and the head's: four projections, and the cache
+    updated between them with the layer's index, as Qwen3-VL does."""
+
+    def __init__(self, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.q_proj, self.k_proj, self.v_proj, self.o_proj = _Lin(), _Lin(), _Lin(), _Lin()
+
+    def forward(self, x, past_key_values=None, **kwargs):
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        if past_key_values is not None:
+            k, v = past_key_values.update(k, v, self.layer_idx, None)
+        return self.o_proj(q + v[-q.shape[0]:])
+
+
 class _Layer(torch.nn.Module):
     """A layer whose parts are named the way the real stacks name them."""
 
-    def __init__(self, attn: str) -> None:
+    def __init__(self, attn_name: str, attn: torch.nn.Module) -> None:
         super().__init__()
-        self.attn_name = attn
-        setattr(self, attn, _Lin())
+        self.attn_name = attn_name
+        setattr(self, attn_name, attn)
         self.mlp = _Lin()
 
     def forward(self, x, **kwargs):
-        return self.mlp(getattr(self, self.attn_name)(x))
+        return self.mlp(getattr(self, self.attn_name)(x, **kwargs))
 
 
 class _Stack(torch.nn.Module):
-    def __init__(self, name: str, attn: str, depth: int) -> None:
+    def __init__(self, name: str, layers: list) -> None:
         super().__init__()
         self.stack_name = name
-        setattr(self, name, torch.nn.ModuleList(_Layer(attn) for _ in range(depth)))
+        setattr(self, name, torch.nn.ModuleList(layers))
 
     def forward(self, x, **kwargs):
         for layer in getattr(self, self.stack_name):
-            x = layer(x)
+            x = layer(x, **kwargs)
         return x
+
+
+class _LayeredVlm(_Vlm):
+    """Hands the language model the cache, as generate does."""
+
+    def forward(self, x, prefill=False):
+        if prefill:
+            self.model.visual(x)
+        return self.lm_head(self.model.language_model(x, past_key_values=self.cache))
 
 
 class _LayeredModel(_Model):
     """The stand-in with stacks where the real model has them: vision blocks
-    with ``attn``, language-model and head layers with ``self_attn``."""
+    with ``attn``, language-model and head layers with ``self_attn``, and one
+    cache the language model fills and the head attends to."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.vlm.model.visual = _Stack("blocks", "attn", 2).cuda()
-        self.vlm.model.language_model = _Stack("layers", "self_attn", 3).cuda()
-        self.expert = _Stack("layers", "self_attn", 2).cuda()
+        self.cache = _Cache()
+        self.vlm = _LayeredVlm().cuda()
+        self.vlm.cache = self.cache
+        self.vlm.model.visual = _Stack(
+            "blocks", [_Layer("attn", _VisionAttn()) for _ in range(2)]).cuda()
+        self.vlm.model.language_model = _Stack(
+            "layers", [_Layer("self_attn", _TextAttn(i)) for i in range(3)]).cuda()
+        self.expert = _Stack("layers", [_Layer("self_attn", _TextAttn(i)) for i in range(2)]).cuda()
+
+    def _sample(self, **kwargs):
+        x = torch.randn(4, 256, device="cuda")
+        for _ in range(4):
+            self.action_in_proj(x)
+            x = self.expert(x, past_key_values=self.cache)
+        return x
 
 
 @needs_gpu
@@ -306,19 +371,31 @@ def test_level_layer_times_every_layer_of_every_stack():
     with trace_inference(model, level="layer") as tracer:
         model.run()
     t = tracer.timing
-    # Three parts per layer: vision 2 layers x 1 call, the language model 3 x 3
-    # (prefill and two decode steps), the head 2 x 4 Euler steps.
-    assert len(t.layers) == 3 * (2 * 1 + 3 * 3 + 2 * 4)
+    # Vision: 2 blocks x 1 call x (block, attn, mlp, qkv, o_proj). The language
+    # model, 3 layers x 3 calls (prefill and two decode steps), and the head, 2 x
+    # 4 Euler steps, x (block, attn, mlp, q, k, v, o, kv_cat).
+    assert len(t.layers) == 2 * 5 + 3 * 3 * 8 + 2 * 4 * 8
     assert {(s["stack"], s["phase"]) for s in t.layers} == {
         ("vision", "vision"), ("lm", "prefill"), ("lm", "decode"), ("expert", "expert")}
+    assert {s["part"] for s in t.layers if s["stack"] == "vision"} == {
+        "block", "attn", "mlp", "qkv", "o_proj"}
     s = t.layer_summary
     assert s["n_layer_spans"] == len(t.layers)
+    assert "layer_kv_cat_ms_vision" not in s
     for phase in ("vision", "prefill", "decode", "expert"):
-        # The parts are inside the layer on the device clock.
+        # The parts are inside the layer, and the projections and the cache
+        # update inside the attention, on the device clock.
         assert 0.0 < s[f"layer_attn_ms_{phase}"] + s[f"layer_mlp_ms_{phase}"] \
             <= s[f"layer_block_ms_{phase}"] + 1e-3
-    # Layer level includes step level, and leaves no hook behind.
+        inside = s[f"layer_qkv_ms_{phase}"] + s[f"layer_o_proj_ms_{phase}"] \
+            + s.get(f"layer_kv_cat_ms_{phase}", 0.0)
+        assert 0.0 < inside <= s[f"layer_attn_ms_{phase}"] + 1e-3, phase
+    # Each layer's update is inside the step level's span of the same update.
+    for phase in ("decode", "expert"):
+        assert 0.0 < s[f"layer_kv_cat_ms_{phase}"] <= t.step[f"kv_cat_ms_{phase}"] + 1e-3
+    # Layer level includes step level, and leaves no hook and no wrapper behind.
     assert t.step["n_syncs_total"] is not None
+    assert "update" not in vars(model.cache)
     for module in list(model.vlm.modules()) + list(model.expert.modules()):
         assert not module._forward_hooks and not module._forward_pre_hooks
 

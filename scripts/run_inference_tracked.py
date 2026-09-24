@@ -238,8 +238,9 @@ def parse_args() -> argparse.Namespace:
                    help="How deep the instrumentation goes. 'off' installs no hook and keeps "
                         "only the wall clock -- the baseline the tracer's cost is measured "
                         "against. 'step' goes inside the decode and Euler steps; 'layer' "
-                        "adds every layer's attention and MLP (layers.parquet). Never "
-                        "compare latency across levels.")
+                        "adds every layer's attention -- its projections and cache update "
+                        "apart -- and MLP (layers.parquet). Never compare latency across "
+                        "levels.")
     p.add_argument("--warmup", type=int, default=2,
                    help="Untimed passes on the first clip before the run. The first pass of a "
                         "process carries autotuning and allocator growth; on the Thor clip 1 "

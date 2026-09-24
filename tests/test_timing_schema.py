@@ -383,6 +383,21 @@ def test_decode_growth_expert_drift_and_the_cost_of_a_step():
     assert set(out) <= set(TS.AGGREGATE_KEYS)
 
 
+def test_layer_numbers_split_the_attention_per_step():
+    rows = [row(n_layer_spans=10, n_decode_steps=10, n_expert_calls=10,
+                layer_attn_ms_decode=100.0, layer_qkv_ms_decode=20.0,
+                layer_o_proj_ms_decode=10.0, layer_kv_cat_ms_decode=30.0,
+                layer_attn_ms_expert=200.0, layer_qkv_ms_expert=40.0,
+                layer_o_proj_ms_expert=20.0, layer_kv_cat_ms_expert=60.0)]
+    out = TS.aggregate(rows)
+    assert out["layer.decode_kv_cat_ms_per_step"] == pytest.approx(3.0)
+    assert out["layer.expert_qkv_ms_per_step"] == pytest.approx(4.0)
+    # What is left of the attention: rotary embedding, norms, the kernel.
+    assert out["layer.attn_rest_share_decode"] == pytest.approx(0.4)
+    assert out["layer.attn_rest_share_expert"] == pytest.approx(0.4)
+    assert set(out) <= set(TS.AGGREGATE_KEYS)
+
+
 def test_layer_numbers_are_the_attention_share_and_per_step_time():
     rows = [row(n_layer_spans=100, layer_attn_ms_decode=30.0, layer_block_ms_decode=100.0,
                 layer_mlp_ms_decode=60.0, n_decode_steps=10, layer_attn_ms_expert=40.0,

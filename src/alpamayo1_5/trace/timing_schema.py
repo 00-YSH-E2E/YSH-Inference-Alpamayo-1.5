@@ -56,7 +56,7 @@ from alpamayo1_5.trace.profile_parse import CATEGORIES, SDPA_PHASES, SEGMENTS
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 12
+TIMING_SCHEMA_VERSION = 13
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
@@ -93,10 +93,13 @@ CHANGELOG = {
     "host segment; device time by category; SDPA backend per phase. Kernels go to "
     "kernels.parquet.",
     12: "Counted passes: FLOPs and operand bytes per host segment, and the ops counted.",
+    13: "Trace level layer: the attention's Q/K/V and output projections and its cache "
+    "update, per phase. layers.parquet 2 gains the parts q_proj, k_proj, v_proj, qkv, "
+    "o_proj and kv_cat.",
 }
 
 #: Version of layers.parquet's columns.
-LAYERS_SCHEMA_VERSION = 1
+LAYERS_SCHEMA_VERSION = 2
 
 #: Version of kernels.parquet's columns.
 KERNELS_SCHEMA_VERSION = 1
@@ -596,9 +599,22 @@ FLOPS = _cols("flops", tuple(
 ) + (("fc_n_ops", "i32", "", "N", "Ops the counted pass dispatched, views left out."),),
     since=12)
 
+#: Trace level layer, inside the attention. With them, attention less the
+#: projections and the cache update is what is left: rotary embedding, the
+#: norms and the attention kernel itself.
+LAYER_ATTN = _cols("layer", tuple(
+    (f"layer_{part}_ms_{phase}", "f64", "ms", "L", f"{label} in {where}, all layers and calls.")
+    for phase, where in (("vision", "the vision tower"), ("prefill", "prefill"),
+                         ("decode", "the decode steps"), ("expert", "the head's Euler steps"))
+    for part, label in (("qkv", "Q, K and V projections"), ("o_proj", "Output projection"),
+                        ("kv_cat", "KV cache update (the concatenation)"))
+    if not (phase == "vision" and part == "kv_cat")
+), since=13)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
                             + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST + MEMORY + SHAPES
-                            + BOARD + ENERGY + BOARD_STATE + STEP + LAYER + PROFILE + FLOPS)
+                            + BOARD + ENERGY + BOARD_STATE + STEP + LAYER + PROFILE + FLOPS
+                            + LAYER_ATTN)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -749,6 +765,10 @@ AGGREGATE_KEYS = (
     "layer.attn_share_vision", "layer.attn_share_prefill", "layer.attn_share_decode",
     "layer.attn_share_expert", "layer.decode_attn_ms_per_step", "layer.decode_mlp_ms_per_step",
     "layer.expert_attn_ms_per_step", "layer.expert_mlp_ms_per_step",
+    "layer.decode_qkv_ms_per_step", "layer.decode_o_proj_ms_per_step",
+    "layer.decode_kv_cat_ms_per_step", "layer.expert_qkv_ms_per_step",
+    "layer.expert_o_proj_ms_per_step", "layer.expert_kv_cat_ms_per_step",
+    "layer.attn_rest_share_decode", "layer.attn_rest_share_expert",
     "prof.n_passes", "prof.gpu_idle_pct", *(f"prof.idle_ms_{s}" for s in SEGMENTS),
     "prof.kernels_per_decode_step", "prof.kernels_per_expert_step",
     "prof.launch_us_p50", "prof.lead_ms_p50", "prof.lead_ms_p50_vision",
@@ -1033,10 +1053,17 @@ def _layer(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
                   and float(r[f"layer_block_ms_{phase}"]) > 0.0]
         out[f"layer.attn_share_{phase}"] = _mean(shares)
     for phase, steps in (("decode", "n_decode_steps"), ("expert", "n_expert_calls")):
-        for part in ("attn", "mlp"):
+        for part in ("attn", "mlp", "qkv", "o_proj", "kv_cat"):
             per = [float(r[f"layer_{part}_ms_{phase}"]) / float(r[steps]) for r in rows
                    if is_number(r.get(f"layer_{part}_ms_{phase}")) and r.get(steps)]
             out[f"layer.{phase}_{part}_ms_per_step"] = _mean(per)
+        # What the attention spends outside its projections and its cache
+        # update: rotary embedding, the norms, and the attention kernel.
+        parts = [f"layer_{p}_ms_{phase}" for p in ("attn", "qkv", "o_proj", "kv_cat")]
+        rest = [(float(r[parts[0]]) - sum(float(r[k]) for k in parts[1:])) / float(r[parts[0]])
+                for r in rows if all(is_number(r.get(k)) for k in parts)
+                and float(r[parts[0]]) > 0.0]
+        out[f"layer.attn_rest_share_{phase}"] = _mean(rest)
     return out
 
 

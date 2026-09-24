@@ -413,7 +413,9 @@ _LAYER_COLUMNS = (
     ("call_index", "i16", "The stack's n-th call in the pass: a decode or Euler step."),
     ("layer", "i16", "The layer's index in its stack."),
     ("part", "s", "attn, mlp, or block -- the whole layer, so block - attn - mlp is its norms "
-                  "and residuals."),
+                  "and residuals; inside the attention q_proj, k_proj and v_proj (qkv, fused, "
+                  "in the vision tower), o_proj, and kv_cat, the cache update (layers "
+                  "schema 2)."),
     ("device_ms", "f32", "The span on the device clock."),
     ("host_ms", "f32", "The span on the host clock."),
 )

@@ -95,8 +95,9 @@ LEVELS = (
     ("basic", "Segment spans, per-call arrays, token statistics. The default."),
     ("step", "Also inside the steps: projections, KV concatenation, processors, stopping, "
              "and a sync audit. About 150 marks a decode step."),
-    ("layer", "Also every layer's attention and MLP, all three stacks: `layers.parquet`. "
-              "216 marks a language-model or head call."),
+    ("layer", "Also every layer of all three stacks: the attention -- its Q/K/V and output "
+              "projections and its cache update apart -- and the MLP: `layers.parquet`. "
+              "648 marks a language-model or head call."),
 )
 
 #: run.sh's variable, the runner's flag, what it measures.

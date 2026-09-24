@@ -410,6 +410,20 @@ def _host_windows(result: TimingResult, records: list[Record], lm: list[Span],
 
 LAYER_PHASES = ("vision", "prefill", "decode", "expert")
 
+#: What a timing row sums per phase, from the span parts: ``qkv`` is the
+#: fused projection in the vision tower and three in the language model and
+#: the head.
+LAYER_PARTS = {"attn": ("attn",), "mlp": ("mlp",), "block": ("block",),
+               "qkv": ("qkv", "q_proj", "k_proj", "v_proj"), "o_proj": ("o_proj",),
+               "kv_cat": ("kv_cat",)}
+
+
+def layer_columns() -> list[tuple[str, str]]:
+    """``(phase, part)`` of every per-phase layer column: all but the vision
+    tower's cache update, which it does not have."""
+    return [(phase, part) for phase in LAYER_PHASES for part in LAYER_PARTS
+            if not (phase == "vision" and part == "kv_cat")]
+
 
 def layer_spans(records: list[Record]) -> list[dict[str, Any]]:
     """Every ``L:<stack>:<layer>:<part>`` span, in one pass over the records.
@@ -445,12 +459,21 @@ def layer_spans(records: list[Record]) -> list[dict[str, Any]]:
 
 
 def layer_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
-    """Attention, MLP and whole-layer time per phase, summed over layers and calls."""
+    """Each part's time per phase, summed over layers and calls.
+
+    A part with no span in a phase is absent, not zero: a model whose
+    attention has no such projection, or a cache that was never handed over,
+    did not take no time in it.
+    """
+    totals: dict[tuple[str, str], float] = {}
+    for s in spans:
+        key = (s["phase"], s["part"])
+        totals[key] = totals.get(key, 0.0) + s["device_ms"]
     out: dict[str, Any] = {"n_layer_spans": len(spans)}
-    for phase in LAYER_PHASES:
-        for part in ("attn", "mlp", "block"):
-            out[f"layer_{part}_ms_{phase}"] = float(sum(
-                s["device_ms"] for s in spans if s["phase"] == phase and s["part"] == part))
+    for phase, part in layer_columns():
+        found = [totals[(phase, p)] for p in LAYER_PARTS[part] if (phase, p) in totals]
+        if found:
+            out[f"layer_{part}_ms_{phase}"] = float(sum(found))
     return out
 
 

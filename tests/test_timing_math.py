@@ -413,6 +413,32 @@ def test_the_layer_sums_per_phase_reach_the_row():
     assert not TS.unknown_keys(r)
 
 
+def attention_pass():
+    """A vision block with its fused qkv, and the prefill's layer 0: q, k and v,
+    the cache update and the output projection inside the attention."""
+    return marks(
+        ("L:vision:0:block", 0, 10), ("L:vision:0:attn", 1, 6), ("L:vision:0:qkv", 1, 2),
+        ("L:vision:0:o_proj", 5, 6), ("L:vision:0:mlp", 7, 9),
+        ("L:lm:0:block", 20, 40), ("L:lm:0:attn", 21, 35), ("L:lm:0:q_proj", 21, 22),
+        ("L:lm:0:k_proj", 22, 23), ("L:lm:0:v_proj", 23, 24), ("L:lm:0:kv_cat", 24, 28),
+        ("L:lm:0:o_proj", 33, 35), ("L:lm:0:mlp", 36, 39),
+    )
+
+
+def test_the_attention_is_split_into_its_projections_and_the_cache_update():
+    r = TM.resolve(attention_pass()).row()
+    assert r["layer_qkv_ms_prefill"] == pytest.approx(3.0)       # q, k and v
+    assert r["layer_kv_cat_ms_prefill"] == pytest.approx(4.0)
+    assert r["layer_o_proj_ms_prefill"] == pytest.approx(2.0)
+    assert r["layer_qkv_ms_vision"] == pytest.approx(1.0)        # one fused projection
+    assert r["layer_o_proj_ms_vision"] == pytest.approx(1.0)
+    # The vision tower has no cache; and no decode step ran, so its parts are
+    # absent rather than zero.
+    assert "layer_kv_cat_ms_vision" not in r
+    assert r.get("layer_attn_ms_decode") is None
+    assert not TS.unknown_keys(r)
+
+
 def test_a_layer_end_without_its_start_is_dropped():
     assert TM.layer_spans(marks(("L:lm:0:attn", 1, 3))[1:]) == []
 

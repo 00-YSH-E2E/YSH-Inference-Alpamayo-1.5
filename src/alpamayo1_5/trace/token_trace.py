@@ -180,6 +180,15 @@ def run_peak_bytes() -> int:
 TRACE_LEVELS = ("off", "basic", "step", "layer")
 _STEP_LEVELS = ("step", "layer")
 
+#: Inside an attention module: the projection's attribute and the part it is
+#: recorded as. The vision tower fuses Q, K and V into one projection and calls
+#: its output projection ``proj``; the language model and the head keep four.
+_ATTN_PARTS = (("qkv", "qkv"), ("q_proj", "q_proj"), ("k_proj", "k_proj"),
+               ("v_proj", "v_proj"), ("o_proj", "o_proj"), ("proj", "o_proj"))
+
+#: The phase a cache update runs in -> the stack whose layer made it.
+_UPDATE_STACK = {"prefill": "lm", "decode": "lm", "expert": "expert"}
+
 #: The three transformer stacks, and what their layers call attention and MLP.
 _STACKS = (
     ("vision", ("visual", "blocks"), "attn", "mlp"),
@@ -617,13 +626,16 @@ class InferenceTracer:
         self._start_sync_audit()
 
     def _install_layers(self, inner: Any) -> None:
-        """Every layer of every stack: the layer, its attention and its MLP.
+        """Every layer of every stack: the layer, its attention and its MLP, and
+        inside the attention its projections and -- through the cache wrapper --
+        its cache update.
 
         Buckets are ``L:<stack>:<layer>:<part>``; the n-th span of a bucket is the
         stack's n-th call -- for the language model, call 0 is the prefill and
-        the rest are decode steps. 216 marks per language-model or head call,
-        162 per vision call: the probe at this level says what that costs, and
-        these numbers are for attribution, not for comparing latency.
+        the rest are decode steps. 18 marks a layer in the language model and
+        the head (648 a call), 10 a vision block (270 a call): the probe at
+        this level says what that costs, and these numbers are for
+        attribution, not for comparing latency.
         """
         for stack, path, attn_name, mlp_name in _STACKS:
             owner = inner if path else self.model
@@ -635,9 +647,12 @@ class InferenceTracer:
             if layers is None:
                 continue
             for index, layer in enumerate(layers):
+                attn = getattr(layer, attn_name, None)
                 self._hook_pair(layer, f"L:{stack}:{index}:block")
-                self._hook_pair(getattr(layer, attn_name, None), f"L:{stack}:{index}:attn")
+                self._hook_pair(attn, f"L:{stack}:{index}:attn")
                 self._hook_pair(getattr(layer, mlp_name, None), f"L:{stack}:{index}:mlp")
+                for attr, part in _ATTN_PARTS:
+                    self._hook_pair(getattr(attn, attr, None), f"L:{stack}:{index}:{part}")
 
     def _wrap_list(self, original: Any, timed_class: type) -> Any:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -683,8 +698,13 @@ class InferenceTracer:
         """
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            layer = self._update_bucket(args, kwargs)
             self._mark("kv_cat", "start")
+            if layer is not None:
+                self._mark(layer, "start")
             out = original(*args, **kwargs)
+            if layer is not None:
+                self._mark(layer, "end")
             self._mark("kv_cat", "end")
             try:
                 phase = self._phase_now if self._phase_now in ("prefill", "decode",
@@ -697,6 +717,22 @@ class InferenceTracer:
             return out
 
         return wrapper
+
+    def _update_bucket(self, args: tuple, kwargs: dict) -> str | None:
+        """At trace level layer, the layer bucket a cache update belongs to.
+
+        The update is a method of the cache, not a module, so no layer hook
+        sees it; its layer index arrives as an argument, and the stack follows
+        from the phase -- prefill and decode are the language model's, the
+        Euler steps the head's.
+        """
+        if self.level != "layer":
+            return None
+        index = args[2] if len(args) > 2 else kwargs.get("layer_idx")
+        stack = _UPDATE_STACK.get(self._phase_now)
+        if stack is None or not isinstance(index, int):
+            return None
+        return f"L:{stack}:{index}:kv_cat"
 
     def _start_sync_audit(self) -> None:
         """Count every host-device synchronization, by phase and by code site.

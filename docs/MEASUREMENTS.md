@@ -12,9 +12,9 @@ Raw measurements go to parquet and on to Hugging Face; MLflow gets run-level agg
 |---|---|---|---|
 | `predictions.parquet` | sample | HF | schema 3, frozen |
 | `per_clip.parquet` | clip | HF | schema 3, frozen |
-| `timing.parquet` | pass | HF | timing schema 12 |
+| `timing.parquet` | pass | HF | timing schema 13 |
 | `thermal.parquet` | board reading | HF | thermal schema 1 |
-| `layers.parquet` | layer span of a main pass (`--trace-level layer`) | HF | layers schema 1 |
+| `layers.parquet` | layer span of a main pass (`--trace-level layer`) | HF | layers schema 2 |
 | `kernels.parquet` | device event of a profile pass (`--profile-clips`) | HF | kernels schema 1 |
 | `run.json` | run | MLflow artifact and HF | the run's config, params, work model, probe peaks, calibration |
 | `memsnap_*.pickle, profile_*.json.gz` | -- | local only | paths in run.json |
@@ -42,7 +42,7 @@ Recorded on every row as `trace_level`. Latency is never compared across levels.
 | `off` | No hook. The wall clock only: the probe's baseline. |
 | `basic` | Segment spans, per-call arrays, token statistics. The default. |
 | `step` | Also inside the steps: projections, KV concatenation, processors, stopping, and a sync audit. About 150 marks a decode step. |
-| `layer` | Also every layer's attention and MLP, all three stacks: `layers.parquet`. 216 marks a language-model or head call. |
+| `layer` | Also every layer of all three stacks: the attention -- its Q/K/V and output projections and its cache update apart -- and the MLP: `layers.parquet`. 648 marks a language-model or head call. |
 
 ## Settings
 
@@ -67,7 +67,7 @@ Set in `scripts/run.sh` (or `OVERRIDE_<NAME>=... ./scripts/run.sh`).
 | `STEADY_SKIP` | `--steady-skip` | Clips left out of the steady-state numbers. |
 | `MODEL_REVISION` | `--model-revision` | The model snapshot loaded and recorded. |
 
-## timing.parquet (schema 12, tracer 5)
+## timing.parquet (schema 13, tracer 5)
 
 `better` is what a comparison calls an improvement; blank for counts and conditions, where ranking would be a mistake. `since` is the schema version that added the column.
 
@@ -405,6 +405,17 @@ Trace level layer: attention and MLP time per phase.
 | `layer_mlp_ms_expert` | float64 | ms | lower | 10 | MLP time in the head's Euler steps, all layers and calls. |
 | `layer_block_ms_expert` | float64 | ms | lower | 10 | Whole-layer time in the head's Euler steps, all layers and calls. |
 | `n_layer_spans` | int32 |  |  | 10 | Layer spans recorded in the pass. |
+| `layer_qkv_ms_vision` | float64 | ms | lower | 13 | Q, K and V projections in the vision tower, all layers and calls. |
+| `layer_o_proj_ms_vision` | float64 | ms | lower | 13 | Output projection in the vision tower, all layers and calls. |
+| `layer_qkv_ms_prefill` | float64 | ms | lower | 13 | Q, K and V projections in prefill, all layers and calls. |
+| `layer_o_proj_ms_prefill` | float64 | ms | lower | 13 | Output projection in prefill, all layers and calls. |
+| `layer_kv_cat_ms_prefill` | float64 | ms | lower | 13 | KV cache update (the concatenation) in prefill, all layers and calls. |
+| `layer_qkv_ms_decode` | float64 | ms | lower | 13 | Q, K and V projections in the decode steps, all layers and calls. |
+| `layer_o_proj_ms_decode` | float64 | ms | lower | 13 | Output projection in the decode steps, all layers and calls. |
+| `layer_kv_cat_ms_decode` | float64 | ms | lower | 13 | KV cache update (the concatenation) in the decode steps, all layers and calls. |
+| `layer_qkv_ms_expert` | float64 | ms | lower | 13 | Q, K and V projections in the head's Euler steps, all layers and calls. |
+| `layer_o_proj_ms_expert` | float64 | ms | lower | 13 | Output projection in the head's Euler steps, all layers and calls. |
+| `layer_kv_cat_ms_expert` | float64 | ms | lower | 13 | KV cache update (the concatenation) in the head's Euler steps, all layers and calls. |
 
 ### profile
 
@@ -580,7 +591,7 @@ One row per reading, span or device event; each joins its timing row on `(clip_i
 | `phase` | string | vision, prefill, decode or expert: the language model's call 0 is the prefill. |
 | `call_index` | int16 | The stack's n-th call in the pass: a decode or Euler step. |
 | `layer` | int16 | The layer's index in its stack. |
-| `part` | string | attn, mlp, or block -- the whole layer, so block - attn - mlp is its norms and residuals. |
+| `part` | string | attn, mlp, or block -- the whole layer, so block - attn - mlp is its norms and residuals; inside the attention q_proj, k_proj and v_proj (qkv, fused, in the vision tower), o_proj, and kv_cat, the cache update (layers schema 2). |
 | `device_ms` | float32 | The span on the device clock. |
 | `host_ms` | float32 | The span on the host clock. |
 
@@ -632,7 +643,7 @@ Logged once, in one batch, at the end of the run: aggregates over the main passe
 - `throttle.*`: `throttle.oc3_events_sum`, `throttle.oc3_events_per_clip`, `throttle.clips_with_oc_frac`, `throttle.state_max`, `throttle.temp_tj_max_c`, `throttle.corr_wall_gpu_mhz`, `throttle.corr_wall_oc3`
 - `step.*`: `step.expert_in_proj_ms`, `step.expert_out_proj_ms`, `step.expert_kv_cat_ms`, `step.expert_crop_host_ms`, `step.expert_euler_rest_ms`, `step.decode_logits_proc_ms`, `step.decode_stop_ms`, `step.decode_prep_inputs_host_ms`, `step.decode_update_kwargs_host_ms`, `step.decode_kv_cat_ms`, `step.lp_top_p_ms`, `step.lp_mask_ms`, `step.lp_temperature_ms`, `step.t_find_eos_ms`, `step.t_build_mask_ms`, `step.t_postgen_rest_ms`
 - `sync.*`: `sync.n_per_clip`, `sync.n_per_decode_step`, `sync.n_decode`, `sync.n_gen_loop`, `sync.n_postgen`, `sync.n_expert`, `sync.n_vision`, `sync.n_prefill`
-- `layer.*`: `layer.attn_share_vision`, `layer.attn_share_prefill`, `layer.attn_share_decode`, `layer.attn_share_expert`, `layer.decode_attn_ms_per_step`, `layer.decode_mlp_ms_per_step`, `layer.expert_attn_ms_per_step`, `layer.expert_mlp_ms_per_step`
+- `layer.*`: `layer.attn_share_vision`, `layer.attn_share_prefill`, `layer.attn_share_decode`, `layer.attn_share_expert`, `layer.decode_attn_ms_per_step`, `layer.decode_mlp_ms_per_step`, `layer.expert_attn_ms_per_step`, `layer.expert_mlp_ms_per_step`, `layer.decode_qkv_ms_per_step`, `layer.decode_o_proj_ms_per_step`, `layer.decode_kv_cat_ms_per_step`, `layer.expert_qkv_ms_per_step`, `layer.expert_o_proj_ms_per_step`, `layer.expert_kv_cat_ms_per_step`, `layer.attn_rest_share_decode`, `layer.attn_rest_share_expert`
 - `prof.*`: `prof.n_passes`, `prof.gpu_idle_pct`, `prof.idle_ms_pre`, `prof.idle_ms_vision`, `prof.idle_ms_prefill`, `prof.idle_ms_decode`, `prof.idle_ms_lm_head`, `prof.idle_ms_gen_other`, `prof.idle_ms_postgen`, `prof.idle_ms_trace`, `prof.idle_ms_expert`, `prof.idle_ms_head_other`, `prof.idle_ms_tail`, `prof.kernels_per_decode_step`, `prof.kernels_per_expert_step`, `prof.launch_us_p50`, `prof.lead_ms_p50`, `prof.lead_ms_p50_vision`, `prof.lead_ms_p50_decode`, `prof.lead_ms_p50_expert`, `prof.sync_api_ms`, `prof.cat_share_attention`, `prof.cat_share_gemm`, `prof.cat_share_conv`, `prof.cat_share_cat`, `prof.cat_share_copy`, `prof.cat_share_norm`, `prof.cat_share_softmax`, `prof.cat_share_reduction`, `prof.cat_share_elementwise`, `prof.cat_share_memory`, `prof.cat_share_other`, `prof.overhead_pct`
 - `roofline.*`: `roofline.gemm_tflops`, `roofline.gemv_gbps`, `roofline.read_gbps`, `roofline.copy_gbps`, `roofline.kvcat_gbps`
 - `ai.*`: `ai.vision`, `ai.prefill`, `ai.decode`, `ai.lm_head`, `ai.expert`
@@ -661,3 +672,4 @@ Logged once, in one batch, at the end of the run: aggregates over the main passe
 | 10 | Trace level layer: attention, MLP and whole-layer time per phase, and the span count; the spans themselves go to layers.parquet. |
 | 11 | Profile passes: kernels, device time, true GPU idle, launch and sync calls per host segment; device time by category; SDPA backend per phase. Kernels go to kernels.parquet. |
 | 12 | Counted passes: FLOPs and operand bytes per host segment, and the ops counted. |
+| 13 | Trace level layer: the attention's Q/K/V and output projections and its cache update, per phase. layers.parquet 2 gains the parts q_proj, k_proj, v_proj, qkv, o_proj and kv_cat. |
