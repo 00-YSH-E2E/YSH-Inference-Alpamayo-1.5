@@ -410,6 +410,22 @@ def test_upload_paths_include_timing(tmp_path):
     assert "gt.parquet" not in names
 
 
+def test_layer_spans_round_trip_and_are_uploaded(tmp_path):
+    from alpamayo1_5.trace import timing_schema as TS
+
+    span = {"run_id": "r", "clip_id": "c1", "clip_index": 0, "row_kind": "main",
+            "pass_index": 0, "timing_schema_version": TS.TIMING_SCHEMA_VERSION,
+            "tracer_version": TS.TRACER_VERSION, "stack": "lm", "phase": "decode",
+            "call_index": 3, "layer": 35, "part": "attn", "device_ms": 0.25, "host_ms": 0.02}
+    frame = pd.read_parquet(W.write_layers(tmp_path, [span]))
+    assert frame.loc[0, "layers_schema_version"] == TS.LAYERS_SCHEMA_VERSION
+    assert frame.loc[0, "layer"] == 35 and frame.loc[0, "part"] == "attn"
+    assert frame.loc[0, "device_ms"] == pytest.approx(0.25)
+    assert "layers.parquet" in {p.name for p in W.upload_paths(tmp_path)}
+    # Below layer level there is no file at all, not an empty one.
+    assert W.write_layers(tmp_path / "nothing", []) is None
+
+
 def test_thermal_series_round_trips(tmp_path):
     from alpamayo1_5.trace import thermal as TH
 

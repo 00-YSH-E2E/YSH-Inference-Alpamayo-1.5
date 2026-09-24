@@ -311,3 +311,18 @@ def test_step_numbers_pool_steps_and_rate_the_concatenation():
     assert out["step.decode_kv_cat_ms"] == 20.0
     assert set(out) <= set(TS.AGGREGATE_KEYS)
     assert not any(k.startswith(("step.", "sync.")) for k in TS.aggregate([row(t_total_ms=1.0)]))
+
+
+def test_layer_numbers_are_the_attention_share_and_per_step_time():
+    rows = [row(n_layer_spans=100, layer_attn_ms_decode=30.0, layer_block_ms_decode=100.0,
+                layer_mlp_ms_decode=60.0, n_decode_steps=10, layer_attn_ms_expert=40.0,
+                layer_block_ms_expert=80.0, layer_mlp_ms_expert=30.0, n_expert_calls=10)]
+    out = TS.aggregate(rows)
+    assert out["layer.attn_share_decode"] == pytest.approx(0.3)
+    assert out["layer.attn_share_expert"] == pytest.approx(0.5)
+    assert out["layer.decode_mlp_ms_per_step"] == pytest.approx(6.0)
+    assert out["layer.expert_attn_ms_per_step"] == pytest.approx(4.0)
+    # A phase with no layer time has no share, rather than a share of zero.
+    assert "layer.attn_share_vision" not in out
+    assert set(out) <= set(TS.AGGREGATE_KEYS)
+    assert not any(k.startswith("layer.") for k in TS.aggregate([row(t_total_ms=1.0)]))

@@ -98,6 +98,7 @@ CUDA_GRAPH_MAX_GRAPHS=4
 
 # 계측을 얼마나 깊게 할까.  basic = 구간 분해·토큰 통계 (기본).  off = 훅 없이 벽시계만 —
 # 계측기 자신의 비용을 재는 기준선이다.  step = 스텝 내부(KV concat·logits 처리기·동기화 감사)까지.
+# layer = step + 층마다 attention·MLP (layers.parquet).  CUDA_GRAPH=1 이면 리플레이 스텝은 층 행이 없다.
 # **깊이가 다른 run 끼리 지연시간을 비교하지 않는다.**  step 은 원인 분해용이지 헤드라인용이 아니다
 TRACE_LEVEL="basic"
 # 본 run 전에 첫 클립으로 몇 번 예열할까.  프로세스의 첫 패스는 autotune·할당자 확장을 떠안아서

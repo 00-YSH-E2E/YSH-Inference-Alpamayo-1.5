@@ -98,6 +98,10 @@ _MEMSNAPS: list[str] = []
 # loop would have to change.
 _SYNC_SITES: dict[str, int] = {}
 
+# The key a main pass's layer spans travel under (trace level layer), popped the
+# same way.
+LAYERS = "__layers__"
+
 # The key a pass's host-clock windows travel under from run_clip to the loop.
 # Popped before the row is stored: windows are how energy is attributed, not a
 # column.
@@ -224,7 +228,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trace-level", default="basic", choices=TRACE_LEVELS,
                    help="How deep the instrumentation goes. 'off' installs no hook and keeps "
                         "only the wall clock -- the baseline the tracer's cost is measured "
-                        "against. Never compare latency across levels.")
+                        "against. 'step' goes inside the decode and Euler steps; 'layer' "
+                        "adds every layer's attention and MLP (layers.parquet). Never "
+                        "compare latency across levels.")
     p.add_argument("--warmup", type=int, default=2,
                    help="Untimed passes on the first clip before the run. The first pass of a "
                         "process carries autotuning and allocator growth; on the Thor clip 1 "
@@ -573,7 +579,8 @@ def run_clip(
     HS.add_since("metrics_ms", started)
 
     timing_rows = [{**timing.row(), "row_kind": "main", "pass_index": 0,
-                    "trace_level": args.trace_level, WINDOWS: timing.windows}]
+                    "trace_level": args.trace_level, WINDOWS: timing.windows,
+                    LAYERS: timing.layers}]
     started = time.perf_counter()
     if extra_passes:
         TH.mark("extra")
@@ -751,7 +758,7 @@ def main() -> None:
             "run_id": run_id, "variant": args.variant, "date": date,
             "machine": machine, "clips": clips, "params": params,
         }
-        rows, per_clip, gt_rows, timing_rows = [], [], [], []
+        rows, per_clip, gt_rows, timing_rows, layer_rows = [], [], [], [], []
         # What the board is: release, driver, clock ranges. Into every timing
         # row (the two that decide comparability), the params and run.json.
         hw = TH.hw_inventory()
@@ -805,6 +812,9 @@ def main() -> None:
         if args.trace_level == "off":
             print("[trace] level off: no token statistics, no x0 and no spans are recorded -- "
                   "only the wall clock. predictions.parquet will lack token_ids.")
+        if args.trace_level == "layer" and args.cuda_graph:
+            print("[trace] level layer with --cuda-graph: layer hooks do not fire on a replayed "
+                  "step, so replayed Euler steps have no layer rows.")
         with thermal.sampling():
             if args.warmup and clips:
                 TH.mark("warmup", 0)
@@ -840,6 +850,14 @@ def main() -> None:
                 per_clip.append(extras)
                 for timing_row in clip_timing:
                     windows = timing_row.pop(WINDOWS, None)
+                    for span in timing_row.pop(LAYERS, None) or []:
+                        layer_rows.append({
+                            **span, "run_id": run_id, "clip_id": clip_id, "clip_index": i,
+                            "row_kind": timing_row.get("row_kind"),
+                            "pass_index": timing_row.get("pass_index"),
+                            "timing_schema_version": TS.TIMING_SCHEMA_VERSION,
+                            "tracer_version": TS.TRACER_VERSION,
+                        })
                     timing_rows.append({**timing_base, **timing_row, "clip_id": clip_id,
                                         "t0_us": args.t0_us, "clip_index": i})
                     board.add(timing_rows[-1], windows)
@@ -867,7 +885,7 @@ def main() -> None:
                         W.write_run(out_dir, rows, config,
                                     {**identity, "partial": True, "n_clips_done": done},
                                     gt=gt_rows if args.include_gt else None, per_clip=per_clip,
-                                    timing=timing_rows, thermal=thermal)
+                                    timing=timing_rows, thermal=thermal, layers=layer_rows)
                 main_row.update(clock.row(
                     clip_wall_ms=(time.perf_counter() - clock.started) * 1000.0))
                 HS.CURRENT.clock = None
@@ -951,7 +969,7 @@ def main() -> None:
         print(f"\n{thermal.verdict()}")
         W.write_run(out_dir, rows, config, meta,
                     gt=gt_rows if args.include_gt else None, per_clip=per_clip,
-                    timing=timing_rows, thermal=thermal)
+                    timing=timing_rows, thermal=thermal, layers=layer_rows)
         print(f"\nrun directory: {out_dir}")
 
         # Archive before the tracking short-circuit below. --no-track means "do

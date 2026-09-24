@@ -264,6 +264,73 @@ def test_the_inventory_weighs_each_part_it_finds():
     assert inv["weights.n_quant_modules"] == 0.0
 
 
+class _Layer(torch.nn.Module):
+    """A layer whose parts are named the way the real stacks name them."""
+
+    def __init__(self, attn: str) -> None:
+        super().__init__()
+        self.attn_name = attn
+        setattr(self, attn, _Lin())
+        self.mlp = _Lin()
+
+    def forward(self, x, **kwargs):
+        return self.mlp(getattr(self, self.attn_name)(x))
+
+
+class _Stack(torch.nn.Module):
+    def __init__(self, name: str, attn: str, depth: int) -> None:
+        super().__init__()
+        self.stack_name = name
+        setattr(self, name, torch.nn.ModuleList(_Layer(attn) for _ in range(depth)))
+
+    def forward(self, x, **kwargs):
+        for layer in getattr(self, self.stack_name):
+            x = layer(x)
+        return x
+
+
+class _LayeredModel(_Model):
+    """The stand-in with stacks where the real model has them: vision blocks
+    with ``attn``, language-model and head layers with ``self_attn``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.vlm.model.visual = _Stack("blocks", "attn", 2).cuda()
+        self.vlm.model.language_model = _Stack("layers", "self_attn", 3).cuda()
+        self.expert = _Stack("layers", "self_attn", 2).cuda()
+
+
+@needs_gpu
+def test_level_layer_times_every_layer_of_every_stack():
+    model = _LayeredModel()
+    with trace_inference(model, level="layer") as tracer:
+        model.run()
+    t = tracer.timing
+    # Three parts per layer: vision 2 layers x 1 call, the language model 3 x 3
+    # (prefill and two decode steps), the head 2 x 4 Euler steps.
+    assert len(t.layers) == 3 * (2 * 1 + 3 * 3 + 2 * 4)
+    assert {(s["stack"], s["phase"]) for s in t.layers} == {
+        ("vision", "vision"), ("lm", "prefill"), ("lm", "decode"), ("expert", "expert")}
+    s = t.layer_summary
+    assert s["n_layer_spans"] == len(t.layers)
+    for phase in ("vision", "prefill", "decode", "expert"):
+        # The parts are inside the layer on the device clock.
+        assert 0.0 < s[f"layer_attn_ms_{phase}"] + s[f"layer_mlp_ms_{phase}"] \
+            <= s[f"layer_block_ms_{phase}"] + 1e-3
+    # Layer level includes step level, and leaves no hook behind.
+    assert t.step["n_syncs_total"] is not None
+    for module in list(model.vlm.modules()) + list(model.expert.modules()):
+        assert not module._forward_hooks and not module._forward_pre_hooks
+
+
+@needs_gpu
+def test_level_layer_marks_nothing_inside_a_capture_it_did_not_start(monkeypatch):
+    tracer = InferenceTracer(types.SimpleNamespace(expert=None), level="layer")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    tracer._mark("L:expert:0:attn", "start")
+    assert tracer._marks == []
+
+
 @needs_gpu
 def test_level_step_audits_syncs_and_restores_what_it_changed():
     """The tracer's own logits pass brings logits to the host: at least one sync

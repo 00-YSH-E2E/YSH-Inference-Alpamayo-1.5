@@ -113,6 +113,10 @@ class TimingResult:
     #: Trace level step only: columns, and the sync sites (not a column).
     step: dict[str, Any] = field(default_factory=dict)
     sync_sites: dict[str, int] = field(default_factory=dict)
+    #: Trace level layer: one entry per layer span (layers.parquet), and the
+    #: per-phase sums that go into the timing row.
+    layers: list[dict[str, Any]] = field(default_factory=list)
+    layer_summary: dict[str, Any] = field(default_factory=dict)
 
     gen_preamble_ms: float | None = None
     lm_head_ms: float | None = None
@@ -193,6 +197,7 @@ class TimingResult:
             **self.shapes,
             "anchor_lag_ms": self.anchor_lag_ms,
             **self.step,
+            **self.layer_summary,
         })
         return out
 
@@ -401,6 +406,52 @@ def _host_windows(result: TimingResult, records: list[Record], lm: list[Span],
     call = span_pairs(records, "call")
     if call:
         result.anchor_lag_ms = float((host(call[0][0]) - call[0][2]) * 1000.0)
+
+
+LAYER_PHASES = ("vision", "prefill", "decode", "expert")
+
+
+def layer_spans(records: list[Record]) -> list[dict[str, Any]]:
+    """Every ``L:<stack>:<layer>:<part>`` span, in one pass over the records.
+
+    The per-bucket pairing the other spans use would rescan the records once
+    per bucket -- hundreds of buckets over tens of thousands of records. Here
+    the n-th span of a bucket is its stack's n-th call.
+    """
+    pending: dict[str, tuple[float, float]] = {}
+    calls: dict[str, int] = {}
+    out: list[dict[str, Any]] = []
+    for r in records:
+        bucket = r[0]
+        if not str(bucket).startswith("L:"):
+            continue
+        if r[1] == "start":
+            pending[bucket] = (r[2], r[3])
+            continue
+        begun = pending.pop(bucket, None)
+        if begun is None:
+            continue
+        _, stack, layer, part = bucket.split(":")
+        call = calls.get(bucket, 0)
+        calls[bucket] = call + 1
+        if stack == "lm":
+            phase = "prefill" if call == 0 else "decode"
+        else:
+            phase = stack
+        out.append({"stack": stack, "phase": phase, "call_index": call, "layer": int(layer),
+                    "part": part, "device_ms": float(r[2] - begun[0]),
+                    "host_ms": float((r[3] - begun[1]) * 1000.0)})
+    return out
+
+
+def layer_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
+    """Attention, MLP and whole-layer time per phase, summed over layers and calls."""
+    out: dict[str, Any] = {"n_layer_spans": len(spans)}
+    for phase in LAYER_PHASES:
+        for part in ("attn", "mlp", "block"):
+            out[f"layer_{part}_ms_{phase}"] = float(sum(
+                s["device_ms"] for s in spans if s["phase"] == phase and s["part"] == part))
+    return out
 
 
 #: Logits processor class -> column stem.
@@ -651,6 +702,10 @@ def resolve(
     _host_windows(result, records, lm, vision, diffusion, wall_start_s, wall_end_s)
     if step is not None:
         _split_step(result, records, lm, expert, diffusion, step)
+    layers = layer_spans(records)
+    if layers:
+        result.layers = layers
+        result.layer_summary = layer_summary(layers)
 
     spans = [v for v in (result.vision_ms, result.prefill_ms, result.decode_ms,
                          result.expert_ms) if v is not None]

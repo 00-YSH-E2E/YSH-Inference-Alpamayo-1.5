@@ -177,7 +177,15 @@ def run_peak_bytes() -> int:
 #: pair of marks around the call, for the wall clock -- and exists so the cost
 #: of ``basic`` can be measured against it on the same clip. Deeper levels are
 #: added by the commits that implement them.
-TRACE_LEVELS = ("off", "basic", "step")
+TRACE_LEVELS = ("off", "basic", "step", "layer")
+_STEP_LEVELS = ("step", "layer")
+
+#: The three transformer stacks, and what their layers call attention and MLP.
+_STACKS = (
+    ("vision", ("visual", "blocks"), "attn", "mlp"),
+    ("lm", ("language_model", "layers"), "self_attn", "mlp"),
+    ("expert", None, "self_attn", "mlp"),
+)
 
 #: What torch's sync debug mode says when an operation synchronizes the host
 #: with the device. Checked against libc10_cuda in the pinned torch.
@@ -367,6 +375,10 @@ class InferenceTracer:
         # a span of this pass.
         if self._in_capture or not torch.cuda.is_available():
             return
+        # Layer hooks also fire inside graph captures the tracer did not start;
+        # a timing event recorded there would land inside the captured graph.
+        if self.level == "layer" and torch.cuda.is_current_stream_capturing():
+            return
         entered = time.perf_counter()
         event = _POOL.take()
         event.record()
@@ -375,7 +387,7 @@ class InferenceTracer:
         # busy host from one that was waiting or descheduled.
         stamp = time.perf_counter()
         self._marks.append((bucket, kind, event, stamp, time.thread_time()))
-        if self.level == "step":
+        if self.level in _STEP_LEVELS:
             if bucket == "lm" and kind == "start":
                 self._phase_now = "prefill" if self._lm_calls == 0 else "decode"
             else:
@@ -519,8 +531,10 @@ class InferenceTracer:
             self._set_attr(space, "action_to_traj",
                            self._wrap_host(space.action_to_traj, "action_to_traj", "a2t"))
 
-        if self.level == "step":
+        if self.level in _STEP_LEVELS:
             self._install_step(vlm, inner)
+        if self.level == "layer":
+            self._install_layers(inner)
 
         # Last, so the call's span starts where the model's work does.
         self._mark("call", "start")
@@ -580,6 +594,29 @@ class InferenceTracer:
                 self._hook_pair(merger, "v_deepstack")
             self._hook_pair(getattr(visual, "merger", None), "v_merger")
         self._start_sync_audit()
+
+    def _install_layers(self, inner: Any) -> None:
+        """Every layer of every stack: the layer, its attention and its MLP.
+
+        Buckets are ``L:<stack>:<layer>:<part>``; the n-th span of a bucket is the
+        stack's n-th call -- for the language model, call 0 is the prefill and
+        the rest are decode steps. 216 marks per language-model or head call,
+        162 per vision call: the probe at this level says what that costs, and
+        these numbers are for attribution, not for comparing latency.
+        """
+        for stack, path, attn_name, mlp_name in _STACKS:
+            owner = inner if path else self.model
+            layers = None
+            if path is None:
+                layers = getattr(getattr(self.model, "expert", None), "layers", None)
+            elif owner is not None:
+                layers = getattr(getattr(owner, path[0], None), path[1], None)
+            if layers is None:
+                continue
+            for index, layer in enumerate(layers):
+                self._hook_pair(layer, f"L:{stack}:{index}:block")
+                self._hook_pair(getattr(layer, attn_name, None), f"L:{stack}:{index}:attn")
+                self._hook_pair(getattr(layer, mlp_name, None), f"L:{stack}:{index}:mlp")
 
     def _wrap_list(self, original: Any, timed_class: type) -> Any:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -997,7 +1034,7 @@ class InferenceTracer:
             shapes=self._shapes,
             step={"kv_bytes": self._kv_bytes, "kv_calls": self._kv_calls,
                   "host_lists": self._host_lists, "sync_counts": self._sync_counts,
-                  "sync_sites": self._sync_sites} if self.level == "step" else None,
+                  "sync_sites": self._sync_sites} if self.level in _STEP_LEVELS else None,
         )
         _POOL.release(self)
         return self.timing

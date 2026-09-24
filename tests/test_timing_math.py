@@ -376,3 +376,47 @@ def test_below_step_level_there_is_nothing_of_it():
     t = TM.resolve(one_pass())
     assert t.step == {} and t.sync_sites == {}
     assert t.row().get("n_syncs_total") is None
+
+
+# -- trace level layer (table 10) ---------------------------------------------------
+def layer_pass():
+    """A vision call, a prefill, one decode step and one Euler step, each through
+    two layers; in each layer an attention and an MLP span inside the block."""
+    spans = []
+    for stack, calls in (("vision", (0,)), ("lm", (20, 40)), ("expert", (60,))):
+        for start in calls:
+            for layer in range(2):
+                t = start + 8 * layer
+                spans += [(f"L:{stack}:{layer}:block", t, t + 7),
+                          (f"L:{stack}:{layer}:attn", t + 1, t + 3),
+                          (f"L:{stack}:{layer}:mlp", t + 4, t + 6)]
+    return marks(*spans)
+
+
+def test_layer_spans_are_numbered_by_the_call_of_their_stack():
+    spans = TM.layer_spans(layer_pass())
+    assert len(spans) == 4 * 2 * 3
+    attn = [s for s in spans if s["stack"] == "lm" and s["layer"] == 1 and s["part"] == "attn"]
+    assert [(s["phase"], s["call_index"]) for s in attn] == [("prefill", 0), ("decode", 1)]
+    assert attn[1]["device_ms"] == pytest.approx(2.0)
+    assert attn[1]["host_ms"] == pytest.approx(2.0)
+    assert {s["phase"] for s in spans if s["stack"] == "expert"} == {"expert"}
+
+
+def test_the_layer_sums_per_phase_reach_the_row():
+    t = TM.resolve(layer_pass())
+    r = t.row()
+    assert r["n_layer_spans"] == 24 and len(t.layers) == 24
+    assert r["layer_attn_ms_decode"] == pytest.approx(4.0)   # two layers, 2 ms each
+    assert r["layer_mlp_ms_vision"] == pytest.approx(4.0)
+    assert r["layer_block_ms_expert"] == pytest.approx(14.0)
+    assert not TS.unknown_keys(r)
+
+
+def test_a_layer_end_without_its_start_is_dropped():
+    assert TM.layer_spans(marks(("L:lm:0:attn", 1, 3))[1:]) == []
+
+
+def test_below_layer_level_there_are_no_layer_columns():
+    t = TM.resolve(one_pass())
+    assert t.layers == [] and t.row().get("n_layer_spans") is None

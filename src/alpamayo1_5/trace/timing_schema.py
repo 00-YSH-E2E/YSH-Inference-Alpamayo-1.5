@@ -53,7 +53,7 @@ import numpy as np
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 9
+TIMING_SCHEMA_VERSION = 10
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
@@ -84,7 +84,12 @@ CHANGELOG = {
     9: "Trace level step: per Euler step (projections, KV concatenation, crop, rest), per "
     "decode step (logits processors, stopping, input preparation, KV concatenation), KV "
     "totals and bytes, postgen and vision parts, synchronizations by phase.",
+    10: "Trace level layer: attention, MLP and whole-layer time per phase, and the span "
+    "count; the spans themselves go to layers.parquet.",
 }
+
+#: Version of layers.parquet's columns.
+LAYERS_SCHEMA_VERSION = 1
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
 #: aggregates; the others are extra passes over the same clip whose purpose is
@@ -475,9 +480,20 @@ STEP = _cols("step", (
     ("n_syncs_tail", "i32", "", "L", "Synchronizations after the head."),
 ), since=9)
 
+#: Trace level layer only. Per phase, summed over every layer and call; each span
+#: is in layers.parquet. "block" is the whole layer, so block - attn - mlp is its
+#: norms and residuals.
+LAYER = _cols("layer", tuple(
+    (f"layer_{part}_ms_{phase}", "f64", "ms", "L",
+     f"{label} time in {where}, all layers and calls.")
+    for phase, where in (("vision", "the vision tower"), ("prefill", "prefill"),
+                         ("decode", "the decode steps"), ("expert", "the head's Euler steps"))
+    for part, label in (("attn", "Attention"), ("mlp", "MLP"), ("block", "Whole-layer"))
+) + (("n_layer_spans", "i32", "", "N", "Layer spans recorded in the pass."),), since=10)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
                             + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST + MEMORY + SHAPES
-                            + BOARD + ENERGY + BOARD_STATE + STEP)
+                            + BOARD + ENERGY + BOARD_STATE + STEP + LAYER)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -625,6 +641,9 @@ AGGREGATE_KEYS = (
     "vision.patch_embed_ms", "vision.blocks_ms", "vision.deepstack_ms", "vision.merger_ms",
     "sync.n_per_clip", "sync.n_per_decode_step", "sync.n_decode", "sync.n_gen_loop",
     "sync.n_postgen", "sync.n_expert", "sync.n_vision", "sync.n_prefill",
+    "layer.attn_share_vision", "layer.attn_share_prefill", "layer.attn_share_decode",
+    "layer.attn_share_expert", "layer.decode_attn_ms_per_step", "layer.decode_mlp_ms_per_step",
+    "layer.expert_attn_ms_per_step", "layer.expert_mlp_ms_per_step",
 )
 
 
@@ -881,6 +900,26 @@ def _step(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
     return out
 
 
+def _layer(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
+    """Trace level layer: how much of each phase's layer time is attention."""
+    rows = [r for r in rows if r.get("n_layer_spans")]
+    if not rows:
+        return {}
+    out: dict[str, float | None] = {}
+    for phase in ("vision", "prefill", "decode", "expert"):
+        shares = [float(r[f"layer_attn_ms_{phase}"]) / float(r[f"layer_block_ms_{phase}"])
+                  for r in rows if is_number(r.get(f"layer_attn_ms_{phase}"))
+                  and is_number(r.get(f"layer_block_ms_{phase}"))
+                  and float(r[f"layer_block_ms_{phase}"]) > 0.0]
+        out[f"layer.attn_share_{phase}"] = _mean(shares)
+    for phase, steps in (("decode", "n_decode_steps"), ("expert", "n_expert_calls")):
+        for part in ("attn", "mlp"):
+            per = [float(r[f"layer_{part}_ms_{phase}"]) / float(r[steps]) for r in rows
+                   if is_number(r.get(f"layer_{part}_ms_{phase}")) and r.get(steps)]
+            out[f"layer.{phase}_{part}_ms_per_step"] = _mean(per)
+    return out
+
+
 def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     """Run-level numbers for MLflow, from the main measured rows only.
 
@@ -1019,5 +1058,6 @@ def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
 
     out.update(_board(rows))
     out.update(_step(rows))
+    out.update(_layer(rows))
 
     return {k: float(v) for k, v in out.items() if v is not None and math.isfinite(v)}

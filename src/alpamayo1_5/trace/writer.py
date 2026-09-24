@@ -22,6 +22,7 @@ Layout, one directory per run (see :func:`run_dir_name`)::
     ├── per_clip.parquet      one row per clip: situation label and its metrics
     ├── timing.parquet        one row per inference pass: where the time went
     ├── thermal.parquet       the board over the run: one row per sensor reading
+    ├── layers.parquet        trace level layer only: one row per layer span of a main pass
     ├── run.json              run-level metadata and the constants needed to
     │                         recompute anything offline
     ├── gt.parquet            logged future -- local only, never uploaded
@@ -379,6 +380,39 @@ def write_thermal(out_dir: Path, thermal: Any, run_id: str | None = None) -> Pat
     return path
 
 
+_LAYER_COLUMNS = (
+    ("layers_schema_version", "i16"), ("run_id", "s"), ("clip_id", "s"), ("clip_index", "i32"),
+    ("row_kind", "s"), ("pass_index", "i16"), ("timing_schema_version", "i16"),
+    ("tracer_version", "i16"), ("stack", "s"), ("phase", "s"), ("call_index", "i16"),
+    ("layer", "i16"), ("part", "s"), ("device_ms", "f32"), ("host_ms", "f32"),
+)
+
+
+def write_layers(out_dir: Path, rows: list[dict]) -> Path | None:
+    """Every layer span of the main passes of a trace-level-layer run, long format.
+
+    Kept whole because the question asked of it is a shape -- which layers,
+    which part, whether decode steps drift as the cache grows -- and a sum
+    per phase in the timing row cannot answer it. ``(clip_id, row_kind,
+    pass_index)`` joins a span to its timing row.
+    """
+    if not rows:
+        return None
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    types = {"i16": pa.int16(), "i32": pa.int32(), "f32": pa.float32(), "s": pa.string()}
+    schema = pa.schema([(name, types[kind]) for name, kind in _LAYER_COLUMNS])
+    names = [name for name, _ in _LAYER_COLUMNS]
+    table = pa.Table.from_pylist(
+        [{"layers_schema_version": TS.LAYERS_SCHEMA_VERSION,
+          **{k: r.get(k) for k in names if k != "layers_schema_version"}} for r in rows],
+        schema=schema)
+    path = Path(out_dir) / "layers.parquet"
+    pq.write_table(table, path, compression="zstd")
+    return path
+
+
 def write_run(
     out_dir: Path,
     samples: list[dict],
@@ -388,6 +422,7 @@ def write_run(
     per_clip: list[dict] | None = None,
     timing: list[dict] | None = None,
     thermal: Any = None,
+    layers: list[dict] | None = None,
 ) -> Path:
     """Write predictions/per_clip/timing parquet, run.json and (locally) gt.parquet.
 
@@ -408,6 +443,8 @@ def write_run(
         write_timing(out_dir, timing)
     if thermal is not None:
         write_thermal(out_dir, thermal, config.get("run_id"))
+    if layers:
+        write_layers(out_dir, layers)
 
     payload = dict(meta)
     payload["schema_version"] = SCHEMA_VERSION
@@ -437,7 +474,8 @@ def upload_paths(out_dir: Path) -> list[Path]:
     """Files that go to Hugging Face. ``gt.parquet`` is deliberately absent."""
     out_dir = Path(out_dir)
     paths = [out_dir / "predictions.parquet", out_dir / "per_clip.parquet",
-             out_dir / "timing.parquet", out_dir / "thermal.parquet", out_dir / "run.json"]
+             out_dir / "timing.parquet", out_dir / "thermal.parquet",
+             out_dir / "layers.parquet", out_dir / "run.json"]
     samples = out_dir / "samples"
     if samples.is_dir():
         paths.extend(sorted(samples.glob("*.png")))
