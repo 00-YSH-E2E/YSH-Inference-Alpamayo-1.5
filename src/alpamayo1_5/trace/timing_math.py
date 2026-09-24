@@ -305,13 +305,17 @@ def resolve(
     diffusion = span_pairs(records, "diffusion")
     generate = span_pairs(records, "generate")
 
+    # A span that was never marked is absent, not zero. At trace level off
+    # nothing inside the call is marked, and a row of 0.0 ms spans would read
+    # as a pass that took no time in any of them.
     result.vision_call_ms = _device(vision)
     result.n_vision_calls = len(vision)
-    result.vision_ms = float(sum(result.vision_call_ms))
-    result.prefill_ms = float(sum(_device(lm[:1])))
-    result.decode_step_ms = _device(lm[1:])
-    result.decode_step_host_ms = _host(lm[1:])
-    result.decode_ms = float(sum(result.decode_step_ms))
+    result.vision_ms = float(sum(result.vision_call_ms)) if vision else None
+    if lm:
+        result.prefill_ms = float(sum(_device(lm[:1])))
+        result.decode_step_ms = _device(lm[1:])
+        result.decode_step_host_ms = _host(lm[1:])
+        result.decode_ms = float(sum(result.decode_step_ms))
     result.n_decode_steps = max(len(lm) - 1, 0)
 
     result.expert_step_ms = _device(expert)
@@ -320,21 +324,19 @@ def resolve(
     # The diffusion span also covers the sampler's arithmetic between steps,
     # which the per-step sum does not. Prefer it for the aggregate; keep the
     # steps for the shape.
-    result.expert_ms = (float(sum(_device(diffusion))) if diffusion
-                        else float(sum(result.expert_step_ms)))
+    if diffusion:
+        result.expert_ms = float(sum(_device(diffusion)))
+    elif expert:
+        result.expert_ms = float(sum(result.expert_step_ms))
 
-    postgen = 0.0
     if generate and diffusion:
-        postgen = max(diffusion[0][0] - generate[0][1], 0.0)
-    result.postgen_ms = float(postgen)
+        result.postgen_ms = float(max(diffusion[0][0] - generate[0][1], 0.0))
     if generate:
-        result.total_ms = float(sum(_device(generate))) + result.postgen_ms + result.expert_ms
-        named = (result.vision_ms + result.prefill_ms + result.decode_ms
-                 + result.postgen_ms + result.expert_ms)
+        result.total_ms = (float(sum(_device(generate))) + (result.postgen_ms or 0.0)
+                           + (result.expert_ms or 0.0))
+        named = sum(v or 0.0 for v in (result.vision_ms, result.prefill_ms, result.decode_ms,
+                                       result.postgen_ms, result.expert_ms))
         result.other_ms = float(max(result.total_ms - named, 0.0))
-    else:
-        result.total_ms = None
-        result.other_ms = None
 
     # The tracer's own logits pass sits inside the postgen window: the generate
     # wrapper marks generate's end, then runs it, then returns to the model. It
@@ -350,8 +352,9 @@ def resolve(
 
     _split_generate(result, records, generate, wall_start_s)
 
-    result.compute_span_ms = (result.vision_ms + result.prefill_ms
-                              + result.decode_ms + result.expert_ms)
+    spans = [v for v in (result.vision_ms, result.prefill_ms, result.decode_ms,
+                         result.expert_ms) if v is not None]
+    result.compute_span_ms = float(sum(spans)) if spans else None
     if wall_start_s is not None and wall_end_s is not None:
         result.wall_ms = float((wall_end_s - wall_start_s) * 1000.0)
     result.measured = True

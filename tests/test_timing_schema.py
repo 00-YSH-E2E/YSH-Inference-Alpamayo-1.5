@@ -179,3 +179,57 @@ def test_the_tracer_cost_is_aggregated():
 def test_columns_added_later_say_when():
     assert TS.column("t_trace_consume_ms").since == 2
     assert TS.column("t_total_ms").since == 1
+
+
+# -- the measurement protocol (table 4) -----------------------------------------
+def probe(clip, level, wall):
+    return {"row_kind": "probe", "clip_id": clip, "trace_level": level, "t_wall_ms": wall,
+            "timing_measured": True}
+
+
+def test_overhead_is_the_paired_median_over_clips():
+    rows = [probe("a", "off", 1000.0), probe("a", "basic", 1020.0),
+            probe("b", "basic", 2060.0), probe("b", "off", 2000.0),
+            probe("c", "off", 500.0), probe("c", "basic", 510.0)]
+    out = TS.overhead(rows)
+    assert out["trace.overhead_pct"] == pytest.approx(2.0)   # median of 2, 3, 2
+    assert out["trace.overhead_n"] == 3.0
+    assert out["trace.overhead_lo"] <= out["trace.overhead_pct"] <= out["trace.overhead_hi"]
+
+
+def test_overhead_ignores_unpaired_clips_and_other_rows():
+    rows = [probe("a", "off", 1000.0), row(clip_id="a", t_wall_ms=5.0),
+            probe("b", "basic", 1000.0)]
+    assert TS.overhead(rows) is None
+
+
+def test_the_interval_covers_a_known_overhead():
+    rng = np.random.default_rng(1)
+    rows = []
+    for i in range(40):
+        base = float(rng.uniform(8000, 20000))
+        rows += [probe(str(i), "off", base),
+                 probe(str(i), "basic", base * (1.03 + float(rng.normal(0, 0.005))))]
+    out = TS.overhead(rows)
+    assert out["trace.overhead_lo"] <= 3.0 <= out["trace.overhead_hi"]
+
+
+def test_protocol_numbers_come_from_extra_passes():
+    rows = [
+        {"row_kind": "warmup", "clip_id": "a", "t_wall_ms": 30000.0, "t_start_host_s": 1.0,
+         "timing_measured": True},
+        row(clip_id="a", t_wall_ms=20000.0, t_start_host_s=2.0),
+        {"row_kind": "repeat", "clip_id": "a", "t_wall_ms": 22000.0, "t_start_host_s": 3.0,
+         "timing_measured": True, "pass_output_match": True},
+        {"row_kind": "repeat", "clip_id": "a", "t_wall_ms": 99999.0, "t_start_host_s": 4.0,
+         "timing_measured": True, "pass_output_match": False},
+    ]
+    out = TS.aggregate(rows)
+    assert out["cold_start_ms"] == 30000.0
+    assert out["cold_start_excess_ms"] == 10000.0
+    # The repeat that did different work is out of the noise band.
+    assert out["latency_cv"] == pytest.approx(np.std([20000.0, 22000.0], ddof=1) / 21000.0)
+    assert out["pass.output_mismatch_sum"] == 1.0
+    assert out["timing.n_extra_rows"] == 3.0
+    # And none of the extra passes enters the latency means.
+    assert out["t_wall_ms"] == 20000.0

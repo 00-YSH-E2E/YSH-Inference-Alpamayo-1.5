@@ -212,3 +212,25 @@ def test_events_are_reused_across_passes_not_reallocated():
         model.run()
     assert len(TT._POOL._events) == size
     assert TT._POOL.owner is None
+
+
+@needs_gpu
+def test_level_off_installs_nothing_and_keeps_the_wall_clock():
+    """The baseline the tracer's cost is measured against: no hook of any kind."""
+    model = _Model()
+    with trace_inference(model, level="off") as tracer:
+        for module in (model.vlm, model.expert, model.vlm.model.language_model):
+            assert not module._forward_hooks and not module._forward_pre_hooks
+        assert "generate" not in vars(model.vlm)
+        model.run()
+    t = tracer.timing
+    assert t.measured is True and t.wall_ms > 0.0
+    assert t.trace_n_marks == 2
+    assert t.total_ms is None and t.decode_ms is None
+    assert tracer.trace is None
+
+
+def test_an_unknown_level_is_refused():
+    with pytest.raises(ValueError, match="trace level"):
+        InferenceTracer(types.SimpleNamespace(), level="deep")
+

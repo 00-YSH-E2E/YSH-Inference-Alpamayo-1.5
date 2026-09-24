@@ -72,7 +72,11 @@ from alpamayo1_5.trace import metrics as M  # noqa: E402
 from alpamayo1_5.trace import thermal as TH  # noqa: E402
 from alpamayo1_5.trace import timing_schema as TS  # noqa: E402
 from alpamayo1_5.trace import writer as W  # noqa: E402
-from alpamayo1_5.trace.token_trace import DEFAULT_SPECIAL_IDS, trace_inference  # noqa: E402
+from alpamayo1_5.trace.token_trace import (  # noqa: E402
+    DEFAULT_SPECIAL_IDS,
+    TRACE_LEVELS,
+    trace_inference,
+)
 
 MODEL_REPO = "nvidia/Alpamayo-1.5-10B"
 DATASET_REPO = "nvidia/PhysicalAI-Autonomous-Vehicles"
@@ -202,6 +206,21 @@ def parse_args() -> argparse.Namespace:
                    help="Replay the diffusion expert with exact-shape CUDA graphs.")
     p.add_argument("--cuda-graph-max-graphs", type=int, default=4,
                    help="Distinct input signatures to keep captured (default 4).")
+    p.add_argument("--trace-level", default="basic", choices=TRACE_LEVELS,
+                   help="How deep the instrumentation goes. 'off' installs no hook and keeps "
+                        "only the wall clock -- the baseline the tracer's cost is measured "
+                        "against. Never compare latency across levels.")
+    p.add_argument("--warmup", type=int, default=2,
+                   help="Untimed passes on the first clip before the run. The first pass of a "
+                        "process carries autotuning and allocator growth; on the Thor clip 1 "
+                        "came out 31%% slower than the median. Recorded as warmup rows.")
+    p.add_argument("--overhead-probe", type=int, default=0,
+                   help="Give the first N clips an extra off/on pass pair, re-seeded, to "
+                        "measure the tracer's own cost (trace.overhead_pct).")
+    p.add_argument("--timing-repeats", type=int, default=0,
+                   help="Extra passes per repeated clip, for the latency noise band.")
+    p.add_argument("--repeat-clips", type=int, default=5,
+                   help="How many clips, from the start, get --timing-repeats.")
     p.add_argument("--variant", default="Vanilla", help="Vanilla, Pruned-24L, INT8 ...")
     p.add_argument("--data-spec", default="Cam-4")
     p.add_argument("--machine", default=None,
@@ -325,15 +344,12 @@ def clip_seed(seed: int, clip_id: str) -> int:
     return seed ^ int(digest, 16)
 
 
-def run_clip(
-    model, processor, avdi, clip_id: str, args, out_dir: Path
-) -> tuple[list[dict], dict, dict]:
-    """Inference for one clip.
+def prepare_clip(processor, avdi, clip_id: str, args) -> tuple[dict, dict, dict]:
+    """Load one clip and build the model's inputs.
 
-    Returns one row per sample, the per-clip extras, and the pass's timing row.
-    The sample rows carry only the legacy timing keys -- the predictions table
-    is frozen at schema 3 -- and everything else the tracer measured goes to
-    the timing table, one row per pass rather than repeated K times.
+    Kept apart from inference so that extra passes over a clip -- the overhead
+    probe, the repeats -- reuse these inputs rather than decoding the video
+    again. The model deep-copies what it is given, so the inputs survive a pass.
     """
     data = load_physical_aiavdataset(
         clip_id, t0_us=args.t0_us, avdi=avdi, maybe_stream=args.allow_stream
@@ -361,9 +377,19 @@ def run_clip(
         if x0 is None or x0.shape[0] != args.num_traj_samples:
             raise SystemExit(f"--x0-from has no {args.num_traj_samples} rows for clip {clip_id}")
         diffusion_kwargs["x0"] = torch.as_tensor(x0, dtype=torch.float32, device="cuda")
+    return data, model_inputs, diffusion_kwargs
 
+
+def infer(model, clip_id: str, model_inputs: dict, diffusion_kwargs: dict, args, level: str):
+    """One traced inference pass, re-seeded for the clip.
+
+    Every pass over a clip starts the generator at the same point, so extra
+    passes are replicates of the main one: same tokens, same noise, same
+    trajectories. ``pass_output_match`` checks that it held -- a timing
+    difference between passes that did different work is not noise.
+    """
     torch.cuda.manual_seed_all(clip_seed(args.seed, clip_id))
-    with trace_inference(model) as tracer:
+    with trace_inference(model, level=level) as tracer:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=model_inputs,
@@ -374,6 +400,39 @@ def run_clip(
                 diffusion_kwargs=diffusion_kwargs,
                 return_extra=True,
             )
+    return pred_xyz, pred_rot, extra, tracer
+
+
+def extra_passes_for(index: int, args) -> list[tuple[str, str]]:
+    """The extra passes clip ``index`` gets after its main pass: ``(row_kind, level)``.
+
+    The probe pair alternates its order by clip, so a slow drift over the run --
+    the board warming -- does not load onto one side of the comparison.
+    """
+    passes: list[tuple[str, str]] = []
+    if index < args.overhead_probe and args.trace_level != "off":
+        pair = [("probe", "off"), ("probe", args.trace_level)]
+        passes += pair if index % 2 == 0 else pair[::-1]
+    if index < args.repeat_clips:
+        passes += [("repeat", args.trace_level)] * args.timing_repeats
+    return passes
+
+
+def run_clip(
+    model, processor, avdi, clip_id: str, args, out_dir: Path,
+    extra_passes: list[tuple[str, str]] = (),
+) -> tuple[list[dict], dict, list[dict]]:
+    """Inference for one clip.
+
+    Returns one row per sample, the per-clip extras, and a timing row per pass:
+    the main one, then any extra passes. The sample rows carry only the legacy
+    timing keys -- the predictions table is frozen at schema 3 -- and every
+    other measurement goes to the timing table.
+    """
+    data, model_inputs, diffusion_kwargs = prepare_clip(processor, avdi, clip_id, args)
+    pred_xyz, pred_rot, extra, tracer = infer(
+        model, clip_id, model_inputs, diffusion_kwargs, args, args.trace_level
+    )
     timing = tracer.timing
     trace = tracer.trace
 
@@ -452,7 +511,16 @@ def run_clip(
         extras.get("net_heading_abs_deg", 0.0), extras.get("lateral_offset_abs_m", 0.0)
     )
     extras["pred_xy"] = pred_xy
-    return rows, extras, timing.row()
+
+    timing_rows = [{**timing.row(), "row_kind": "main", "pass_index": 0,
+                    "trace_level": args.trace_level}]
+    for index, (kind, level) in enumerate(extra_passes, start=1):
+        xyz, _, _, other = infer(model, clip_id, model_inputs, diffusion_kwargs, args, level)
+        timing_rows.append({
+            **other.timing.row(), "row_kind": kind, "pass_index": index, "trace_level": level,
+            "pass_output_match": bool(torch.equal(xyz, pred_xyz)),
+        })
+    return rows, extras, timing_rows
 
 
 def main() -> None:
@@ -498,6 +566,11 @@ def main() -> None:
         # Latency is only comparable within one table version and one tracer.
         "timing_schema_version": TS.TIMING_SCHEMA_VERSION,
         "tracer_version": TS.TRACER_VERSION,
+        "trace_level": args.trace_level,
+        "warmup": args.warmup,
+        "overhead_probe": args.overhead_probe,
+        "timing_repeats": args.timing_repeats,
+        "repeat_clips": args.repeat_clips,
         "torch_disable_native_jit": os.environ.get("TORCH_DISABLE_NATIVE_JIT"),
         "torch_version": torch.__version__,
         "data_cache": args.data_cache,
@@ -628,9 +701,12 @@ def main() -> None:
             "max_new_tokens": args.max_generation_length,
             "cuda_graph": args.cuda_graph,
             "cuda_graph_max_graphs": args.cuda_graph_max_graphs if args.cuda_graph else None,
-            "trace_level": "basic",
+            "trace_level": args.trace_level,
             "sample_hz": 2.0,
-            "warmup": 0,
+            "warmup": args.warmup,
+            "overhead_probe": args.overhead_probe,
+            "timing_repeats": args.timing_repeats,
+            "repeat_clips": args.repeat_clips,
         }
         # Throttling moves latency without moving anything else, and after the
         # run there is no way to tell that from a regression.
@@ -642,18 +718,38 @@ def main() -> None:
         # different quantity rather than a low estimate.
         thermal = TH.ThermalLog()
         thermal.sample()
+        if args.trace_level == "off":
+            print("[trace] level off: no token statistics, no x0 and no spans are recorded -- "
+                  "only the wall clock. predictions.parquet will lack token_ids.")
         with thermal.sampling():
+            if args.warmup and clips:
+                # On the first clip, inside the sampler so the board's state during
+                # warmup is on record too. Nothing from these passes reaches the
+                # predictions: they exist to absorb the process's first-pass costs.
+                started = time.perf_counter()
+                _, warm_inputs, warm_kwargs = prepare_clip(processor, avdi, clips[0], args)
+                for n in range(args.warmup):
+                    _, _, _, warm = infer(model, clips[0], warm_inputs, warm_kwargs, args,
+                                          args.trace_level)
+                    timing_rows.append({
+                        **timing_base, **warm.timing.row(), "clip_id": clips[0],
+                        "t0_us": args.t0_us, "clip_index": 0, "row_kind": "warmup",
+                        "pass_index": n + 1, "trace_level": args.trace_level,
+                    })
+                del warm_inputs, warm_kwargs
+                print(f"[warmup] {args.warmup} pass(es) on {clips[0][:8]} "
+                      f"{time.perf_counter() - started:.1f}s")
             for i, clip_id in enumerate(clips):
                 started = time.perf_counter()
-                clip_rows, extras, timing_row = run_clip(
-                    model, processor, avdi, clip_id, args, out_dir
+                clip_rows, extras, clip_timing = run_clip(
+                    model, processor, avdi, clip_id, args, out_dir,
+                    extra_passes=extra_passes_for(i, args),
                 )
                 rows.extend(clip_rows)
                 per_clip.append(extras)
-                timing_rows.append({
-                    **timing_base, **timing_row, "clip_id": clip_id, "t0_us": args.t0_us,
-                    "clip_index": i, "row_kind": "main", "pass_index": 0,
-                })
+                for timing_row in clip_timing:
+                    timing_rows.append({**timing_base, **timing_row, "clip_id": clip_id,
+                                        "t0_us": args.t0_us, "clip_index": i})
                 if extras.get("gt_xy") is not None:
                     gt_rows.append({"clip_id": clip_id, "t0_us": args.t0_us, "gt_xy": extras["gt_xy"]})
                 if not args.no_samples and i < MAX_SAMPLE_IMAGES:
@@ -718,6 +814,18 @@ def main() -> None:
             "params_billions": sum(p.numel() for p in model.parameters()) / 1e9,
         }
         meta.update(M.model_size(model))
+        # The recording rules want the tracer's cost in run.json as well as in
+        # MLflow: it is what a reader needs to decide how far to trust any
+        # latency here, and run.json is what survives without the tracker.
+        probe = TS.overhead(timing_rows) or {}
+        meta["trace"] = {
+            "level": args.trace_level,
+            "warmup": args.warmup,
+            "overhead_probe": args.overhead_probe,
+            "timing_repeats": args.timing_repeats,
+            "repeat_clips": args.repeat_clips,
+            **{key.split(".", 1)[1]: value for key, value in probe.items()},
+        }
         meta["thermal"] = thermal.summary()
         meta["power_mode"] = thermal.mode
         print(f"\n{thermal.verdict()}")
@@ -853,6 +961,15 @@ def main() -> None:
             run.metrics(TS.aggregate(timing_rows))
         except Exception as exc:  # a lost metric batch must not lose the run's link
             print(f"[timing] aggregate metrics not recorded: {exc}", file=sys.stderr)
+        # Measured during the loop, so it could not be among the parameters
+        # logged when the run opened. New keys may be added; logged ones may not
+        # change, so this is logged once, here.
+        if probe:
+            try:
+                run.params({"trace.overhead_pct": round(probe["trace.overhead_pct"], 4),
+                            "trace.overhead_n": int(probe["trace.overhead_n"])})
+            except Exception as exc:
+                print(f"[timing] trace.overhead_pct param not recorded: {exc}", file=sys.stderr)
         # Breakdown by scene: fixed cardinality, and it answers the question
         # actually being asked -- does the model give up on curves? The previous
         # code wrote a metric key per clip UUID, which put 100 keys in a 148-key

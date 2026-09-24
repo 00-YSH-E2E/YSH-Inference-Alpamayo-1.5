@@ -198,3 +198,14 @@ def test_a_forward_outside_generate_is_counted_not_hidden():
     t = TM.resolve(records)
     assert t.span_violations >= 1
     assert t.gen_preamble_ms == 0.0
+
+
+def test_spans_that_were_never_marked_are_absent_not_zero():
+    """Level off marks only the call. A row of 0.0 ms spans would read as a
+    pass that took no time in any of them."""
+    t = TM.resolve([("call", "start", 0.0, 0.0), ("call", "end", 50.0, 0.05)],
+                   wall_start_s=0.0, wall_end_s=0.06)
+    assert t.measured is True and t.wall_ms == pytest.approx(60.0)
+    assert t.vision_ms is None and t.prefill_ms is None and t.decode_ms is None
+    assert t.expert_ms is None and t.postgen_ms is None and t.total_ms is None
+    assert t.compute_span_ms is None

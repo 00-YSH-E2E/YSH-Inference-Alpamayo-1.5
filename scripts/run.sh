@@ -96,6 +96,19 @@ CUDA_GRAPH=0
 # 크면 그래프마다 프롬프트 KV 사본(K=6 에서 약 2.7 GB)을 잡는다 — 16 을 넘기면 경고한다.
 CUDA_GRAPH_MAX_GRAPHS=4
 
+# 계측을 얼마나 깊게 할까.  basic = 구간 분해·토큰 통계 (기본).  off = 훅 없이 벽시계만 —
+# 계측기 자신의 비용을 재는 기준선이다.  **깊이가 다른 run 끼리 지연시간을 비교하지 않는다.**
+TRACE_LEVEL="basic"
+# 본 run 전에 첫 클립으로 몇 번 예열할까.  프로세스의 첫 패스는 autotune·할당자 확장을 떠안아서
+# Thor 에서 첫 클립이 중앙값보다 31% 느렸다.  예열 패스는 timing.parquet 에 warmup 행으로만 남는다
+WARMUP=2
+# 앞에서 몇 클립에 off/on 패스 한 쌍을 더 돌려 계측기 비용(trace.overhead_pct)을 잴까.
+# 기록 규약이 요구하는 값이다 — 0 으로 두면 그 값이 없는 run 이 된다
+OVERHEAD_PROBE=4
+# 같은 클립을 몇 번 더 돌려 지연시간 잡음 밴드(latency_cv)를 잴까.  앞 REPEAT_CLIPS 개 클립에만
+TIMING_REPEATS=0
+REPEAT_CLIPS=5
+
 # 한 번에 하나만.  두 run 이 겹치면 서로의 지연시간을 부풀린다 — 2026-09-01 에 실제로
 # 겹쳐서 기준선이 6% 부풀었다.  run·sweep·queue 가 전부 이 파일을 잠근다.
 LOCK_FILE="/tmp/alpamayo-inference.lock"
@@ -176,6 +189,11 @@ UPLOAD="${OVERRIDE_UPLOAD:-$UPLOAD}"
 TRACK="${OVERRIDE_TRACK:-$TRACK}"
 SAMPLES="${OVERRIDE_SAMPLES:-$SAMPLES}"
 CUDA_GRAPH="${OVERRIDE_CUDA_GRAPH:-$CUDA_GRAPH}"
+TRACE_LEVEL="${OVERRIDE_TRACE_LEVEL:-$TRACE_LEVEL}"
+WARMUP="${OVERRIDE_WARMUP:-$WARMUP}"
+OVERHEAD_PROBE="${OVERRIDE_OVERHEAD_PROBE:-$OVERHEAD_PROBE}"
+TIMING_REPEATS="${OVERRIDE_TIMING_REPEATS:-$TIMING_REPEATS}"
+REPEAT_CLIPS="${OVERRIDE_REPEAT_CLIPS:-$REPEAT_CLIPS}"
 CUDA_GRAPH_MAX_GRAPHS="${OVERRIDE_CUDA_GRAPH_MAX_GRAPHS:-$CUDA_GRAPH_MAX_GRAPHS}"
 SWEEP="${SWEEP:-}"
 
@@ -236,6 +254,16 @@ if [[ "$CUDA_GRAPH" == "1" ]]; then
     warn "CUDA_GRAPH_MAX_GRAPHS=${CUDA_GRAPH_MAX_GRAPHS}.  그래프마다 프롬프트 KV 사본을
        잡는다 (K=6 에서 약 2.7 GB).  통합 메모리를 다 먹을 수 있다"
   fi
+fi
+
+# ── 계측 ───────────────────────────────────────────────────────────────────
+ok "계측: level=${TRACE_LEVEL} · 예열 ${WARMUP} · overhead probe ${OVERHEAD_PROBE} · 반복 ${TIMING_REPEATS}"
+if [[ "$TRACE_LEVEL" == "off" ]]; then
+  warn "TRACE_LEVEL=off — 벽시계만 남는다.  토큰 통계·x0·구간 분해가 없고
+       predictions.parquet 에 token_ids 가 빠진다 (게이트의 token 비교가 경고로 바뀐다)"
+elif [[ "$OVERHEAD_PROBE" == "0" ]]; then
+  warn "OVERHEAD_PROBE=0 — trace.overhead_pct 가 없는 run 이 된다.
+       기록 규약이 요구하는 값이고, 없으면 이 run 의 지연시간을 얼마나 믿을지 말할 수 없다"
 fi
 
 # ── 소급 불가한 것들 ────────────────────────────────────────────────────────
@@ -404,6 +432,8 @@ fi
 [[ "$SAMPLES"      == "0" ]] && ARGS+=(--no-samples)
 [[ "$INCLUDE_GT"   == "1" ]] && ARGS+=(--include-gt)
 [[ "$CUDA_GRAPH"   == "1" ]] && ARGS+=(--cuda-graph --cuda-graph-max-graphs "$CUDA_GRAPH_MAX_GRAPHS")
+ARGS+=(--trace-level "$TRACE_LEVEL" --warmup "$WARMUP" --overhead-probe "$OVERHEAD_PROBE"
+       --timing-repeats "$TIMING_REPEATS" --repeat-clips "$REPEAT_CLIPS")
 
 [[ "$FORCE_LOCAL_SRC" == "1" ]] && export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 

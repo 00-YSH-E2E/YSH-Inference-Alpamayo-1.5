@@ -154,6 +154,12 @@ class _EventPool:
 
 _POOL = _EventPool()
 
+#: How deep the instrumentation goes. ``off`` installs no hook at all -- only a
+#: pair of marks around the call, for the wall clock -- and exists so the cost
+#: of ``basic`` can be measured against it on the same clip. Deeper levels are
+#: added by the commits that implement them.
+TRACE_LEVELS = ("off", "basic")
+
 
 def _reduce_logits(logits_step: torch.Tensor, chosen: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """One step of logits to (logprob of chosen token, entropy). Never keeps the logits.
@@ -178,8 +184,12 @@ class InferenceTracer:
     exactly as it was found.
     """
 
-    def __init__(self, model: Any, special_token_ids: dict[str, int] | None = None) -> None:
+    def __init__(self, model: Any, special_token_ids: dict[str, int] | None = None,
+                 level: str = "basic") -> None:
+        if level not in TRACE_LEVELS:
+            raise ValueError(f"trace level {level!r} is not one of {TRACE_LEVELS}")
         self.model = model
+        self.level = level
         self.ids = dict(DEFAULT_SPECIAL_IDS)
         if special_token_ids:
             self.ids.update(special_token_ids)
@@ -207,6 +217,8 @@ class InferenceTracer:
         return self
 
     def __exit__(self, *exc: Any) -> None:
+        if self.level == "off":
+            self._mark("call", "end")
         self._remove()
 
     def _mark(self, bucket: str, kind: str) -> None:
@@ -256,6 +268,12 @@ class InferenceTracer:
         self._runner = self._graph_runner()
         self._graph0 = self._graph_counters()
         self._capture_ms = 0.0
+        if self.level == "off":
+            # Nothing inside the call is observed: two marks bracket it, so the
+            # wall clock is taken exactly as at every other level, and nothing
+            # else is added to what is being timed.
+            self._mark("call", "start")
+            return
         if self._runner is not None and hasattr(self._runner, "_capture"):
             self._set_attr(self._runner, "_capture", self._wrap_capture(self._runner._capture))
 
@@ -548,9 +566,10 @@ class InferenceTracer:
 
 
 @contextlib.contextmanager
-def trace_inference(model: Any, special_token_ids: dict[str, int] | None = None):
+def trace_inference(model: Any, special_token_ids: dict[str, int] | None = None,
+                    level: str = "basic"):
     """Convenience wrapper: yields a tracer and resolves timings on exit."""
-    tracer = InferenceTracer(model, special_token_ids)
+    tracer = InferenceTracer(model, special_token_ids, level=level)
     with tracer:
         yield tracer
     tracer.finalize()

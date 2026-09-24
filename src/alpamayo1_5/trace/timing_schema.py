@@ -53,7 +53,7 @@ import numpy as np
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 3
+TIMING_SCHEMA_VERSION = 4
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
@@ -68,6 +68,8 @@ CHANGELOG = {
     3: "generate split: t_gen_preamble_ms, t_lm_head_ms, t_vlm_glue_ms, t_gen_loop_ms, "
     "t_ttft_ms, n_vlm_forwards, lm_head_step_ms, decode_gap_ms, trace_span_violations. "
     "Tracer 3 hooks the VLM forward and lm_head.",
+    4: "Measurement protocol: overhead_probe, timing_repeats and repeat_clips conditions, "
+    "pass_output_match. Warmup, probe and repeat passes are rows of their own kind.",
 }
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
@@ -252,8 +254,18 @@ GENERATE = _cols("generate", (
      "assumption broke and the split is suspect."),
 ), since=3)
 
+PROTOCOL = _cols("condition", (
+    ("overhead_probe", "i16", "", "N",
+     "Clips that got an extra off/on pass pair to measure the tracer's own cost."),
+    ("timing_repeats", "i16", "", "N", "Extra passes per repeated clip, for the noise band."),
+    ("repeat_clips", "i16", "", "N", "How many clips, from the start, got the repeats."),
+    ("pass_output_match", "b", "", "N",
+     "Extra passes only: whether the trajectories came out bit-identical to the main pass. "
+     "False means the passes were not replicates, and their timing differences are not noise."),
+), since=4)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
-                            + TRACE + GENERATE)
+                            + TRACE + GENERATE + PROTOCOL)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -366,6 +378,9 @@ AGGREGATE_KEYS = (
     "t_gen_preamble_ms", "t_lm_head_ms", "t_vlm_glue_ms", "t_gen_loop_ms",
     "t_ttft_ms", "t_ttft_ms_p95", "decode_gap_ms", "decode_gap_ms_p95", "lm_head_step_ms",
     "trace.span_violations_sum",
+    "trace.overhead_pct", "trace.overhead_lo", "trace.overhead_hi", "trace.overhead_n",
+    "cold_start_ms", "cold_start_excess_ms", "latency_cv", "latency_cv_n",
+    "timing.n_extra_rows", "pass.output_mismatch_sum",
 )
 
 
@@ -408,16 +423,96 @@ def _ratio_of_sums(rows: Iterable[Mapping[str, Any]], num: str, den: str) -> lis
     return out
 
 
+def overhead(rows: Iterable[Mapping[str, Any]], n_boot: int = 2000,
+             seed: int = 0) -> dict[str, float] | None:
+    """The tracer's own cost, from probe passes: off and on over the same clip.
+
+    Per clip, ``100 * (wall_on - wall_off) / wall_off``; the run's number is the
+    median over clips, with a bootstrap interval over clips. Paired per clip
+    because clips differ by seconds and the cost is milliseconds -- an
+    unpaired difference of means would be all clip variance. The probe order
+    alternates by clip, so a slow drift (the board warming) does not load onto
+    one side.
+    """
+    by_clip: dict[str, dict[str, list[float]]] = {}
+    for r in rows:
+        if r.get("row_kind") != "probe" or not is_number(r.get("t_wall_ms")):
+            continue
+        side = "off" if r.get("trace_level") == "off" else "on"
+        by_clip.setdefault(str(r.get("clip_id")), {"off": [], "on": []})[side].append(
+            float(r["t_wall_ms"]))
+    pcts = [100.0 * (np.mean(v["on"]) - np.mean(v["off"])) / np.mean(v["off"])
+            for v in by_clip.values() if v["on"] and v["off"] and np.mean(v["off"]) > 0.0]
+    if not pcts:
+        return None
+    values = np.asarray(pcts, dtype=float)
+    rng = np.random.default_rng(seed)
+    boot = np.median(rng.choice(values, size=(n_boot, values.size), replace=True), axis=1)
+    return {
+        "trace.overhead_pct": float(np.median(values)),
+        "trace.overhead_lo": float(np.percentile(boot, 2.5)),
+        "trace.overhead_hi": float(np.percentile(boot, 97.5)),
+        "trace.overhead_n": float(values.size),
+    }
+
+
+def _protocol(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
+    """Numbers that need the extra passes, not only the main ones."""
+    out: dict[str, float | None] = {}
+    out.update(overhead(rows) or {})
+    extra = [r for r in rows if r.get("row_kind", "main") != "main"]
+    if extra:
+        out["timing.n_extra_rows"] = float(len(extra))
+        # Extra passes are re-seeded replicates of the main one. A mismatch
+        # means they were not, and everything measured on them is suspect.
+        out["pass.output_mismatch_sum"] = float(
+            sum(1 for r in extra if r.get("pass_output_match") is False))
+
+    # The first pass the process made, whatever its kind: cuDNN autotuning,
+    # allocator growth and lazy initialisation all land on it. It is a real
+    # deployment number -- the first plan after boot -- and a contaminant
+    # anywhere else, which is why warmup passes exist.
+    stamped = [r for r in rows if is_number(r.get("t_wall_ms"))]
+    if stamped:
+        first = min(stamped, key=lambda r: (float(r.get("t_start_host_s") or 0.0),
+                                            r.get("clip_index") or 0, r.get("pass_index") or 0))
+        out["cold_start_ms"] = float(first["t_wall_ms"])
+        steady = _values(main_rows(rows), "t_wall_ms")
+        if steady:
+            out["cold_start_excess_ms"] = out["cold_start_ms"] - float(np.median(steady))
+
+    # Run-to-run noise on one clip: the main pass and its repeats. Only passes
+    # that reproduced the main pass's output count -- otherwise the spread
+    # includes a different amount of work, not just noise.
+    groups: dict[str, list[float]] = {}
+    for r in rows:
+        kind = r.get("row_kind", "main")
+        if kind not in ("main", "repeat") or not is_number(r.get("t_wall_ms")):
+            continue
+        if kind == "repeat" and r.get("pass_output_match") is False:
+            continue
+        groups.setdefault(str(r.get("clip_id")), []).append(float(r["t_wall_ms"]))
+    cvs = [float(np.std(v, ddof=1) / np.mean(v)) for v in groups.values()
+           if len(v) >= 2 and np.mean(v) > 0.0]
+    if cvs:
+        out["latency_cv"] = float(np.mean(cvs))
+        out["latency_cv_n"] = float(len(cvs))
+    return out
+
+
 def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     """Run-level numbers for MLflow, from the main measured rows only.
 
     Restricting to measured rows is a fix, not a nicety: the averaging this
     replaces took the legacy spans off every row, and an unmeasured row carried
     0.0 -- so a run where timing failed on some clips reported them as having
-    taken no time.
+    taken no time. The protocol numbers (tracer overhead, cold start, noise
+    band) are the exception: they exist only in the extra passes.
     """
+    rows = list(rows)
+    protocol = _protocol(rows)
     rows = main_rows(rows)
-    out: dict[str, float | None] = {"timing.n_main_rows": float(len(rows))}
+    out: dict[str, float | None] = {"timing.n_main_rows": float(len(rows)), **protocol}
     if not rows:
         return {k: v for k, v in out.items() if v is not None}
 
