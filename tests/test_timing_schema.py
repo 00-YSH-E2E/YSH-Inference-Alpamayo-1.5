@@ -271,3 +271,28 @@ def test_memory_is_aggregated_in_gigabytes():
     assert out["kv.bytes_mb"] == pytest.approx(460.0)
     assert out["vision.n_images"] == 96.0
     assert set(out) <= set(TS.AGGREGATE_KEYS)
+
+
+def test_the_board_is_aggregated_per_clip_and_across_them():
+    rows = [row(e_vin_j=1600.0, num_traj_samples=6, e_vin_decode_j=400.0, n_decode_steps=40,
+                t_wall_ms=20000.0, gpu_mhz_mean=1400.0, oc3_events=300, e_coverage=0.99),
+            row(e_vin_j=1500.0, num_traj_samples=6, e_vin_decode_j=380.0, n_decode_steps=38,
+                t_wall_ms=18000.0, gpu_mhz_mean=1500.0, oc3_events=100, e_coverage=1.0),
+            row(e_vin_j=1400.0, num_traj_samples=6, e_vin_decode_j=360.0, n_decode_steps=36,
+                t_wall_ms=16000.0, gpu_mhz_mean=1570.0, oc3_events=0, e_coverage=1.0)]
+    out = TS.aggregate(rows)
+    assert out["energy.clip_j"] == pytest.approx(1500.0)
+    assert out["energy.per_traj_j"] == pytest.approx(250.0)
+    assert out["energy.decode_j_per_step"] == pytest.approx(10.0)
+    assert out["energy.coverage_min"] == pytest.approx(0.99)
+    assert out["throttle.oc3_events_sum"] == 400.0
+    assert out["throttle.clips_with_oc_frac"] == pytest.approx(2 / 3)
+    # Slower clips ran at lower clocks and with more over-current events.
+    assert out["throttle.corr_wall_gpu_mhz"] < -0.9
+    assert out["throttle.corr_wall_oc3"] > 0.9
+    assert set(out) <= set(TS.AGGREGATE_KEYS)
+
+
+def test_a_correlation_needs_three_clips_that_moved():
+    two = [row(t_wall_ms=1.0, gpu_mhz_mean=2.0), row(t_wall_ms=2.0, gpu_mhz_mean=1.0)]
+    assert "throttle.corr_wall_gpu_mhz" not in TS.aggregate(two)

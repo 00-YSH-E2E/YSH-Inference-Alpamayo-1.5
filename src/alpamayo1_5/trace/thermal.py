@@ -56,6 +56,7 @@ on its own. The point is to know, later, whether a timing can be trusted.
 from __future__ import annotations
 
 import array
+import bisect
 import contextlib
 import functools
 import glob
@@ -370,6 +371,175 @@ def _nvml_driver() -> str | None:
         return None
 
 
+# -- attributing readings to a window ------------------------------------------------
+def _at(times: list[float], values: list[float], t: float) -> float:
+    """Linear interpolation, held flat beyond the ends."""
+    i = bisect.bisect_left(times, t)
+    if i <= 0:
+        return values[0]
+    if i >= len(times):
+        return values[-1]
+    t0, t1 = times[i - 1], times[i]
+    if t1 == t0:
+        return values[i]
+    return values[i - 1] + (values[i] - values[i - 1]) * (t - t0) / (t1 - t0)
+
+
+def integrate(times: list[float], values: list[float], start: float,
+              end: float) -> tuple[float | None, float]:
+    """The integral of a sampled series over ``[start, end]``, and its coverage.
+
+    Trapezoids between readings, with the window's edges interpolated from
+    their neighbours. Coverage is the share of the window between the first
+    and the last reading; outside it the series is held flat, which is an
+    assumption, and the coverage says how much of the answer rests on it. For
+    power in watts over seconds, the integral is energy in joules.
+    """
+    if end <= start or len(times) < 2:
+        return None, 0.0
+    inside = [(t, v) for t, v in zip(times, values) if start < t < end]
+    points = [(start, _at(times, values, start))] + inside + [(end, _at(times, values, end))]
+    area = sum((t1 - t0) * (v0 + v1) / 2.0
+               for (t0, v0), (t1, v1) in zip(points, points[1:]))
+    covered = max(0.0, min(end, times[-1]) - max(start, times[0]))
+    return area, min(covered / (end - start), 1.0)
+
+
+def time_mean(times: list[float], values: list[float], start: float,
+              end: float) -> float | None:
+    """Time-weighted mean over the window -- a clock that sat at one value for
+    most of a segment weighs more than one reading taken in a brief dip."""
+    area, _ = integrate(times, values, start, end)
+    return None if area is None else area / (end - start)
+
+
+def counter_delta(times: list[float], values: list[float], start: float,
+                  end: float) -> float | None:
+    """How far a counter moved in the window: the last reading at or before
+    ``end`` minus the last at or before ``start``."""
+    if not times:
+        return None
+    i0 = bisect.bisect_right(times, start) - 1
+    i1 = bisect.bisect_right(times, end) - 1
+    if i0 < 0 or i1 < 0:
+        return None
+    return max(values[i1] - values[i0], 0.0)
+
+
+#: Rail name on the board -> column stem.
+RAIL_COLUMNS = {"VIN": "vin", "VDD_GPU": "gpu", "VDD_CPU_SOC_MSS": "cpu_soc_mss",
+                "VIN_SYS_5V0": "sys5v0"}
+_SEGMENTS = ("vision", "prefill", "decode", "expert")
+#: Below this many seconds a segment gets no energy of its own: at 10 Hz it
+#: would rest on one or two readings.
+MIN_SEGMENT_S = 1.9
+
+
+def attribute(log: "ThermalLog", windows: dict[str, tuple[float, float]]) -> dict[str, Any]:
+    """Energy, clocks and throttling over one pass, from the board series.
+
+    ``windows`` are host-clock intervals from the tracer: ``call`` for the
+    whole pass and one per segment. The sampler stamps the same clock, so a
+    reading belongs to a window by its stamp alone.
+    """
+    out: dict[str, Any] = {}
+    call = windows.get("call")
+    if not call:
+        return out
+    a, b = call
+    coverage = []
+    for rail, stem in RAIL_COLUMNS.items():
+        times, watts = log.window(f"power.{rail}", a, b)
+        joules, cov = integrate(times, watts, a, b)
+        if joules is None:
+            continue
+        out[f"e_{stem}_j"] = joules
+        coverage.append(cov)
+        if stem == "vin":
+            out["p_vin_mean_w"] = joules / (b - a)
+            out["n_power_samples"] = sum(1 for t in times if a <= t <= b)
+            inside = [w for t, w in zip(times, watts) if a <= t <= b]
+            if inside:
+                out["p_vin_peak_w"] = max(inside)
+        if stem == "gpu":
+            inside = [w for t, w in zip(times, watts) if a <= t <= b]
+            if inside:
+                out["p_gpu_peak_w"] = max(inside)
+        if stem in ("vin", "gpu"):
+            for seg in _SEGMENTS:
+                window = windows.get(seg)
+                if window and window[1] - window[0] >= MIN_SEGMENT_S:
+                    joules, _ = integrate(times, watts, *window)
+                    if joules is not None:
+                        out[f"e_{stem}_{seg}_j"] = joules
+    if coverage:
+        out["e_coverage"] = min(coverage)
+
+    times, mhz = log.window("freq.gpu", a, b)
+    if len(times) >= 2:
+        out["gpu_mhz_mean"] = time_mean(times, mhz, a, b)
+        inside = [f for t, f in zip(times, mhz) if a <= t <= b]
+        if inside:
+            out["gpu_mhz_min"] = min(inside)
+        for seg in _SEGMENTS:
+            window = windows.get(seg)
+            if window and window[1] - window[0] >= MIN_SEGMENT_S:
+                out[f"gpu_mhz_{seg}"] = time_mean(times, mhz, *window)
+    for index in (1, 2, 3):
+        times, counts = log.window(f"oc.oc{index}", a, b)
+        delta = counter_delta(times, counts, a, b)
+        if delta is not None:
+            out[f"oc{index}_events"] = int(delta)
+    states = []
+    for sensor in log.sensors():
+        if sensor.startswith("cool.") and "fan" not in sensor:
+            times, values = log.window(sensor, a, b)
+            states += [v for t, v in zip(times, values) if a <= t <= b]
+    if states:
+        out["throttle_state_max"] = int(max(states))
+    times, temps = log.window("tj-thermal", a, b)
+    inside = [v for t, v in zip(times, temps) if a <= t <= b]
+    if inside:
+        out["temp_tj_max_c"] = max(inside)
+    times, emc = log.window("freq.emc", a, b)
+    inside = [v for t, v in zip(times, emc) if a <= t <= b]
+    if inside:
+        out["emc_mhz_min"] = min(inside)
+    return out
+
+
+class PendingAttribution:
+    """Attribute the board sampler's readings to passes, once they are all in.
+
+    A pass's energy needs the readings on both sides of its window, and the
+    sampler writes them from its own thread: at 10 Hz the last reading of a
+    pass that just ended may not exist yet. So a pass waits here until the
+    series has moved past its window's end, and whatever is left when the run
+    ends is attributed then, from the complete series.
+    """
+
+    def __init__(self, thermal: "ThermalLog") -> None:
+        self.thermal = thermal
+        self.pending: list[tuple[dict, dict]] = []
+
+    def add(self, row: dict, windows: dict | None) -> None:
+        if windows:
+            self.pending.append((row, windows))
+
+    def settle(self, final: bool = False) -> None:
+        horizon = self.thermal.last_stamp
+        waiting = []
+        for row, windows in self.pending:
+            if final or windows["call"][1] <= horizon:
+                try:
+                    row.update(attribute(self.thermal, windows))
+                except Exception as exc:  # energy must never cost the run
+                    print(f"[board] {str(row.get('clip_id', ''))[:8]}: {exc}")
+            else:
+                waiting.append((row, windows))
+        self.pending = waiting
+
+
 class _Current:
     """The run's sampler, so pipeline code can mark phases without a handle."""
 
@@ -533,6 +703,31 @@ class ThermalLog:
     def sensors(self) -> list[str]:
         with self._lock:
             return sorted(self._series)
+
+    def window(self, sensor: str, start: float, end: float) -> tuple[list[float], list[float]]:
+        """One sensor's readings in ``[start, end]``, plus one on each side.
+
+        The neighbours are what edge interpolation needs. Found by bisection on
+        the tick times, which only grow: attributing every clip of a long run
+        must not rescan the whole series each time.
+        """
+        with self._lock:
+            entry = self._series.get(sensor)
+            if entry is None:
+                return [], []
+            ticks, readings = entry
+            stamp = self._t_host.__getitem__
+            lo = bisect.bisect_left(ticks, start, key=stamp)
+            hi = bisect.bisect_right(ticks, end, key=stamp)
+            lo, hi = max(lo - 1, 0), min(hi + 1, len(ticks))
+            stamps = [self._t_host[t] for t in ticks[lo:hi]]
+            values = list(readings[lo:hi])
+        return stamps, values
+
+    @property
+    def last_stamp(self) -> float:
+        with self._lock:
+            return self._t_host[-1] if len(self._t_host) else float("-inf")
 
     def table(self) -> dict[str, list[Any]]:
         """Long format for thermal.parquet: one row per sensor reading."""

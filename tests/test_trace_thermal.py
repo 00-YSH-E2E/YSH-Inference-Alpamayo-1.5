@@ -315,3 +315,73 @@ def test_a_driver_without_a_number_keeps_its_build_date():
     assert TH.parse_nvrm_version("NVRM version: NVIDIA Module for x86_64  580.00  Release") \
         == "580.00"
     assert TH.parse_nvrm_version("") is None
+
+
+# -- attributing readings to a pass (C10) ---------------------------------------------
+def test_integrate_is_energy_for_power_and_says_its_coverage():
+    t, w = [0.0, 1.0, 2.0, 3.0, 4.0], [50.0] * 5
+    assert TH.integrate(t, w, 1.0, 3.0) == (pytest.approx(100.0), 1.0)
+    ramp, _ = TH.integrate([0.0, 2.0], [0.0, 20.0], 0.5, 1.5)
+    assert ramp == pytest.approx(10.0)          # mean 10 W over 1 s
+    energy, coverage = TH.integrate(t, w, 3.0, 7.0)
+    assert coverage == pytest.approx(0.25) and energy == pytest.approx(200.0)  # held flat
+    assert TH.integrate([1.0], [5.0], 0.0, 2.0) == (None, 0.0)
+
+
+def test_time_mean_and_counter_delta():
+    t = [0.0, 1.0, 2.0, 3.0]
+    assert TH.time_mean(t, [1000.0, 1000.0, 1500.0, 1500.0], 0.0, 3.0) == pytest.approx(
+        (1000 + 1250 + 1500) / 3)
+    assert TH.counter_delta(t, [5.0, 5.0, 9.0, 12.0], 0.5, 2.5) == 4.0
+    assert TH.counter_delta(t, [5.0, 5.0, 9.0, 12.0], -2.0, -1.0) is None
+
+
+def _synthetic_log():
+    """10 Hz for 10 s: VIN 100 W, GPU rail 50 W, the GPU clock dipping to
+    1000 MHz between 4 and 5 s, oc3 counting from 2 to 8 s, a throttle-alert
+    state at 6 s; slow sensors every 0.5 s."""
+    log = TH.ThermalLog(mode="unknown")
+    for i in range(101):
+        t = i / 10.0
+        reading = {"power.VIN": 100.0, "power.VDD_GPU": 50.0,
+                   "freq.gpu": 1000.0 if 4.0 <= t < 5.0 else 1500.0,
+                   "oc.oc3": float(min(max(i - 20, 0), 60))}
+        if i % 5 == 0:
+            reading.update({"tj-thermal": 50.0 + t, "freq.emc": 4266.0,
+                            "cool.gpu-throttle-alert": 1.0 if t == 6.0 else 0.0,
+                            "cool.pwm-fan": 3.0})
+        log._record(reading, t, 0.3)
+    return log
+
+
+def test_a_pass_gets_its_energy_clocks_and_throttling():
+    windows = {"call": (1.0, 9.0), "vision": (1.0, 2.0), "decode": (3.0, 7.0),
+               "expert": (7.0, 9.0)}
+    out = TH.attribute(_synthetic_log(), windows)
+    assert out["e_vin_j"] == pytest.approx(800.0)
+    assert out["e_gpu_j"] == pytest.approx(400.0)
+    assert out["p_vin_mean_w"] == pytest.approx(100.0)
+    assert out["e_coverage"] == pytest.approx(1.0)
+    assert out["e_vin_decode_j"] == pytest.approx(400.0)
+    assert out["e_gpu_expert_j"] == pytest.approx(100.0)
+    # A 1 s segment rests on too few readings to get energy of its own.
+    assert "e_vin_vision_j" not in out
+    assert out["gpu_mhz_min"] == 1000.0
+    assert out["gpu_mhz_mean"] < 1500.0
+    assert out["oc3_events"] == 60
+    assert out["throttle_state_max"] == 1       # the fan's state does not count
+    assert out["temp_tj_max_c"] == pytest.approx(59.0)
+    assert out["emc_mhz_min"] == 4266.0
+
+
+def test_a_pass_waits_until_the_series_has_passed_its_end():
+    log = _synthetic_log()
+    pending = TH.PendingAttribution(log)
+    early, late = {"clip_id": "a"}, {"clip_id": "b"}
+    pending.add(early, {"call": (1.0, 5.0)})
+    pending.add(late, {"call": (8.0, 12.0)})       # the series ends at 10 s
+    pending.settle()
+    assert "e_vin_j" in early and "e_vin_j" not in late
+    pending.settle(final=True)
+    assert late["e_coverage"] == pytest.approx(0.5)
+    assert pending.pending == []

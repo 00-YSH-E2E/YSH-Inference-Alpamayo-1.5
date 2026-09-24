@@ -303,3 +303,26 @@ def test_memory_and_shapes_reach_the_row():
     assert row["mem_peak_clip_bytes"] == 3 and row["kv_bytes"] == 10
     assert row["n_images"] == 96 and row["host_mem_avail_min_bytes"] == 5
     assert not TS.unknown_keys(row)
+
+
+# -- device spans on the host clock (table 8) ------------------------------------------
+def test_device_spans_are_mapped_onto_the_host_clock_through_the_anchor():
+    """The anchor completed just before the host read wall_end_s = 100 s, so a
+    device time of -2000 ms happened at 98.0 s on the host clock."""
+    records = [
+        ("call", "start", -2000.0, 97.99), ("vision", "start", -1800.0, 98.0),
+        ("vision", "end", -1500.0, 98.0), ("lm", "start", -1500.0, 98.0),
+        ("lm", "end", -1400.0, 98.1), ("lm", "start", -1300.0, 98.2),
+        ("lm", "end", -900.0, 98.6), ("lm", "start", -800.0, 98.7),
+        ("lm", "end", -200.0, 99.3), ("diffusion", "start", -150.0, 99.4),
+        ("diffusion", "end", -10.0, 99.5), ("call", "end", -5.0, 99.9),
+    ]
+    t = TM.resolve(records, wall_start_s=97.98, wall_end_s=100.0)
+    w = t.windows
+    assert w["call"] == (97.98, 100.0)
+    assert w["vision"] == pytest.approx((98.2, 98.5))
+    assert w["prefill"] == pytest.approx((98.5, 98.6))
+    assert w["decode"] == pytest.approx((98.7, 99.8))
+    assert w["expert"] == pytest.approx((99.85, 99.99))
+    assert t.anchor_lag_ms == pytest.approx(10.0)
+    assert "windows" not in t.row() and t.row()["anchor_lag_ms"] == pytest.approx(10.0)

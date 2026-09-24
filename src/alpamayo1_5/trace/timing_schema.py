@@ -53,7 +53,7 @@ import numpy as np
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 7
+TIMING_SCHEMA_VERSION = 8
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
@@ -78,6 +78,9 @@ CHANGELOG = {
     "memory_snapshot condition. Tracer 5 reads the allocator at segment boundaries.",
     7: "Board conditions: l4t_release and nvidia_driver. sample_hz is now the fast tier's "
     "rate (10 by default).",
+    8: "Board attribution per pass: energy per rail and per segment, power mean and peaks, "
+    "coverage, GPU clock per segment, EMC minimum, over-current events, throttle state, "
+    "junction peak, anchor lag.",
 }
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
@@ -370,9 +373,56 @@ BOARD = _cols("condition", (
     ("nvidia_driver", "s", "", "N", "GPU driver version."),
 ), since=7)
 
+#: The board over one pass, integrated from the sampler's series over the pass's
+#: host-clock window. Segment energy is kept only where a segment lasts long
+#: enough (1.9 s) to rest on more than a couple of readings.
+ENERGY = _cols("energy", (
+    ("e_vin_j", "f64", "J", "L", "Whole-module input energy over the pass (INA238 VIN)."),
+    ("e_gpu_j", "f64", "J", "L", "GPU rail energy (VDD_GPU)."),
+    ("e_cpu_soc_mss_j", "f64", "J", "L", "CPU, SoC and memory rail energy."),
+    ("e_sys5v0_j", "f64", "J", "L", "5 V system rail energy."),
+    ("e_vin_vision_j", "f64", "J", "L", "Module input energy in the vision span."),
+    ("e_vin_prefill_j", "f64", "J", "L", "Module input energy in prefill."),
+    ("e_vin_decode_j", "f64", "J", "L", "Module input energy over the decode loop."),
+    ("e_vin_expert_j", "f64", "J", "L", "Module input energy in the head."),
+    ("e_gpu_vision_j", "f64", "J", "L", "GPU rail energy in the vision span."),
+    ("e_gpu_prefill_j", "f64", "J", "L", "GPU rail energy in prefill."),
+    ("e_gpu_decode_j", "f64", "J", "L", "GPU rail energy over the decode loop."),
+    ("e_gpu_expert_j", "f64", "J", "L", "GPU rail energy in the head."),
+    ("p_vin_mean_w", "f64", "W", "L", "Mean module input power over the pass."),
+    ("p_vin_peak_w", "f64", "W", "L", "Highest module input reading in the pass."),
+    ("p_gpu_peak_w", "f64", "W", "L",
+     "Highest GPU rail reading: near 100 W the rail is at its ~5 A current limit."),
+    ("e_coverage", "f32", "", "H",
+     "Share of the window between the first and last reading. Below 1 the rest is held "
+     "flat -- an assumption the energy rests on."),
+    ("n_power_samples", "i32", "", "N", "Module input readings inside the window."),
+), since=8)
+
+BOARD_STATE = _cols("board", (
+    ("gpu_mhz_mean", "f32", "MHz", "H", "Time-weighted GPU clock over the pass."),
+    ("gpu_mhz_min", "f32", "MHz", "H", "Lowest GPU clock read in the pass."),
+    ("gpu_mhz_vision", "f32", "MHz", "H", "GPU clock in the vision span."),
+    ("gpu_mhz_prefill", "f32", "MHz", "H", "GPU clock in prefill."),
+    ("gpu_mhz_decode", "f32", "MHz", "H", "GPU clock over the decode loop."),
+    ("gpu_mhz_expert", "f32", "MHz", "H", "GPU clock in the head."),
+    ("emc_mhz_min", "f32", "MHz", "H", "Lowest memory clock read in the pass."),
+    ("oc1_events", "i32", "", "L", "Over-current events on channel 1 during the pass."),
+    ("oc2_events", "i32", "", "L", "Over-current events on channel 2 during the pass."),
+    ("oc3_events", "i32", "", "L",
+     "Over-current events on channel 3 -- the GPU's current limit. Each one pulls clocks "
+     "back; nonzero means the pass ran throttled whatever the temperature said."),
+    ("throttle_state_max", "i16", "", "L",
+     "Highest state of any capping cooling device (not the fan) during the pass."),
+    ("temp_tj_max_c", "f32", "C", "L", "Hottest junction reading in the pass."),
+    ("anchor_lag_ms", "f32", "ms", "N",
+     "How late the pass's first event ran on the device after being enqueued. Large means "
+     "the GPU was still busy with earlier work and the window's start is less certain."),
+), since=8)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
                             + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST + MEMORY + SHAPES
-                            + BOARD)
+                            + BOARD + ENERGY + BOARD_STATE)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -501,6 +551,15 @@ AGGREGATE_KEYS = (
     "mem.peak_tail_gb", "mem.reserved_peak_gb_max", "mem.n_ooms_sum", "mem.host_avail_min_gb",
     "kv.bytes_mb", "kv.final_tokens", "kv.cat_decode_gb", "kv.cat_expert_gb", "kv.graph_copy_gb",
     "vision.n_images", "vision.n_patches", "vision.n_tokens",
+    "energy.clip_j", "energy.per_traj_j", "energy.gpu_clip_j", "energy.cpu_soc_clip_j",
+    "energy.decode_j_per_step", "energy.vin_decode_j", "energy.vin_expert_j",
+    "energy.gpu_vision_j", "energy.gpu_prefill_j", "energy.gpu_decode_j", "energy.gpu_expert_j",
+    "energy.coverage_min", "power.vin_clip_mean_w", "power.vin_clip_peak_w",
+    "power.gpu_clip_peak_w", "clock.gpu_mhz_clip_mean", "clock.gpu_mhz_clip_min",
+    "clock.gpu_mhz_decode", "clock.gpu_mhz_expert", "clock.emc_mhz_min",
+    "throttle.oc3_events_sum", "throttle.oc3_events_per_clip", "throttle.clips_with_oc_frac",
+    "throttle.state_max", "throttle.temp_tj_max_c", "throttle.corr_wall_gpu_mhz",
+    "throttle.corr_wall_oc3", "trace.anchor_lag_ms",
 )
 
 
@@ -651,6 +710,68 @@ def _protocol(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
     return out
 
 
+def _corr(rows: list[Mapping[str, Any]], a: str, b: str) -> float | None:
+    """Pearson r across clips, or None when it cannot mean anything (fewer
+    than three clips, or a series that never moved)."""
+    pairs = [(float(r[a]), float(r[b])) for r in rows if is_number(r.get(a))
+             and is_number(r.get(b))]
+    if len(pairs) < 3:
+        return None
+    x, y = np.asarray(pairs).T
+    if np.std(x) == 0.0 or np.std(y) == 0.0:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _board(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
+    """Energy, clocks and throttling over the main passes."""
+    out: dict[str, float | None] = {}
+    out["energy.clip_j"] = _mean(_values(rows, "e_vin_j"))
+    per_traj = [float(r["e_vin_j"]) / float(r["num_traj_samples"]) for r in rows
+                if is_number(r.get("e_vin_j")) and is_number(r.get("num_traj_samples"))
+                and r["num_traj_samples"]]
+    out["energy.per_traj_j"] = _mean(per_traj)
+    out["energy.gpu_clip_j"] = _mean(_values(rows, "e_gpu_j"))
+    out["energy.cpu_soc_clip_j"] = _mean(_values(rows, "e_cpu_soc_mss_j"))
+    per_step = [float(r["e_vin_decode_j"]) / float(r["n_decode_steps"]) for r in rows
+                if is_number(r.get("e_vin_decode_j")) and r.get("n_decode_steps")]
+    out["energy.decode_j_per_step"] = _mean(per_step)
+    out["energy.vin_decode_j"] = _mean(_values(rows, "e_vin_decode_j"))
+    out["energy.vin_expert_j"] = _mean(_values(rows, "e_vin_expert_j"))
+    for seg in ("vision", "prefill", "decode", "expert"):
+        out[f"energy.gpu_{seg}_j"] = _mean(_values(rows, f"e_gpu_{seg}_j"))
+    coverage = _values(rows, "e_coverage")
+    out["energy.coverage_min"] = min(coverage) if coverage else None
+    out["power.vin_clip_mean_w"] = _mean(_values(rows, "p_vin_mean_w"))
+    peaks = _values(rows, "p_vin_peak_w")
+    out["power.vin_clip_peak_w"] = max(peaks) if peaks else None
+    peaks = _values(rows, "p_gpu_peak_w")
+    out["power.gpu_clip_peak_w"] = max(peaks) if peaks else None
+    out["clock.gpu_mhz_clip_mean"] = _mean(_values(rows, "gpu_mhz_mean"))
+    lows = _values(rows, "gpu_mhz_min")
+    out["clock.gpu_mhz_clip_min"] = min(lows) if lows else None
+    out["clock.gpu_mhz_decode"] = _mean(_values(rows, "gpu_mhz_decode"))
+    out["clock.gpu_mhz_expert"] = _mean(_values(rows, "gpu_mhz_expert"))
+    emc = _values(rows, "emc_mhz_min")
+    out["clock.emc_mhz_min"] = min(emc) if emc else None
+    oc = _values(rows, "oc3_events")
+    if oc:
+        out["throttle.oc3_events_sum"] = float(sum(oc))
+        out["throttle.oc3_events_per_clip"] = float(np.mean(oc))
+        out["throttle.clips_with_oc_frac"] = float(np.mean([v > 0 for v in oc]))
+    states = _values(rows, "throttle_state_max")
+    out["throttle.state_max"] = max(states) if states else None
+    temps = _values(rows, "temp_tj_max_c")
+    out["throttle.temp_tj_max_c"] = max(temps) if temps else None
+    # Does the latency spread across clips follow the board? A strong negative
+    # correlation with the clock, or a positive one with over-current events,
+    # says the clips were not slow for their own reasons.
+    out["throttle.corr_wall_gpu_mhz"] = _corr(rows, "t_wall_ms", "gpu_mhz_mean")
+    out["throttle.corr_wall_oc3"] = _corr(rows, "t_wall_ms", "oc3_events")
+    out["trace.anchor_lag_ms"] = _mean(_values(rows, "anchor_lag_ms"))
+    return out
+
+
 def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     """Run-level numbers for MLflow, from the main measured rows only.
 
@@ -786,5 +907,7 @@ def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     out["vision.n_images"] = _mean(_values(rows, "n_images"))
     out["vision.n_patches"] = _mean(_values(rows, "n_vision_patches"))
     out["vision.n_tokens"] = _mean(_values(rows, "n_vision_tokens"))
+
+    out.update(_board(rows))
 
     return {k: float(v) for k, v in out.items() if v is not None and math.isfinite(v)}

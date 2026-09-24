@@ -106,6 +106,10 @@ class TimingResult:
 
     memory: dict[str, Any] = field(default_factory=dict)
     shapes: dict[str, Any] = field(default_factory=dict)
+    #: Host-clock intervals of the pass and its segments, for attributing the
+    #: board sampler's readings. Not a column: the energy computed from them is.
+    windows: dict[str, tuple[float, float]] = field(default_factory=dict)
+    anchor_lag_ms: float | None = None
 
     gen_preamble_ms: float | None = None
     lm_head_ms: float | None = None
@@ -184,6 +188,7 @@ class TimingResult:
             "rss_bytes": self.rss_bytes,
             **self.memory,
             **self.shapes,
+            "anchor_lag_ms": self.anchor_lag_ms,
         })
         return out
 
@@ -358,6 +363,42 @@ def _split_host(result: TimingResult, records: list[Record], generate: list[Span
     result.cpu_ms = ms
 
 
+def _host_windows(result: TimingResult, records: list[Record], lm: list[Span],
+                  vision: list[Span], diffusion: list[Span], wall_start_s: float | None,
+                  wall_end_s: float | None) -> None:
+    """Map the device spans onto the host clock, where the board sampler lives.
+
+    Device times are relative to the end anchor, which completed just before
+    the host read ``wall_end_s``; so a device time ``d`` (negative ms)
+    happened at ``wall_end_s + d / 1000`` on the host clock. The error is the
+    few microseconds between the anchor completing and the host reading.
+
+    ``anchor_lag_ms`` is how late the call's first event ran on the device
+    after the host enqueued it. Near zero means the GPU was idle when the pass
+    began; large means earlier work was still queued, and the start of the
+    pass's energy window is less certain.
+    """
+    if wall_end_s is None or wall_start_s is None:
+        return
+
+    def host(device_ms: float) -> float:
+        return wall_end_s + device_ms / 1000.0
+
+    windows = {"call": (wall_start_s, wall_end_s)}
+    if vision:
+        windows["vision"] = (host(vision[0][0]), host(vision[-1][1]))
+    if lm:
+        windows["prefill"] = (host(lm[0][0]), host(lm[0][1]))
+    if len(lm) > 1:
+        windows["decode"] = (host(lm[1][0]), host(lm[-1][1]))
+    if diffusion:
+        windows["expert"] = (host(diffusion[0][0]), host(diffusion[-1][1]))
+    result.windows = windows
+    call = span_pairs(records, "call")
+    if call:
+        result.anchor_lag_ms = float((host(call[0][0]) - call[0][2]) * 1000.0)
+
+
 def _split_generate(result: TimingResult, records: list[Record], generate: list[Span],
                     wall_start_s: float | None) -> None:
     """Break the generate span's remainder into the four things it was made of.
@@ -521,6 +562,7 @@ def resolve(
 
     _split_generate(result, records, generate, wall_start_s)
     _split_host(result, records, generate, diffusion)
+    _host_windows(result, records, lm, vision, diffusion, wall_start_s, wall_end_s)
 
     spans = [v for v in (result.vision_ms, result.prefill_ms, result.decode_ms,
                          result.expert_ms) if v is not None]

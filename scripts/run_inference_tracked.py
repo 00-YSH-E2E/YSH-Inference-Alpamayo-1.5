@@ -93,6 +93,11 @@ MAX_SAMPLE_IMAGES = 20  # representative figures per run, per the recording rule
 # Allocator history snapshots written this run (local files; see --memory-snapshot).
 _MEMSNAPS: list[str] = []
 
+# The key a pass's host-clock windows travel under from run_clip to the loop.
+# Popped before the row is stored: windows are how energy is attributed, not a
+# column.
+WINDOWS = "__windows__"
+
 # Per-clip values that become run-level means. Spelled out rather than swept
 # off whatever per_clip happens to contain: with a sweep, the metric namespace
 # of every future run is decided by whatever metrics.py last returned, and a
@@ -561,7 +566,7 @@ def run_clip(
     HS.add_since("metrics_ms", started)
 
     timing_rows = [{**timing.row(), "row_kind": "main", "pass_index": 0,
-                    "trace_level": args.trace_level}]
+                    "trace_level": args.trace_level, WINDOWS: timing.windows}]
     started = time.perf_counter()
     if extra_passes:
         TH.mark("extra")
@@ -575,7 +580,7 @@ def run_clip(
                 _dump_memory_snapshot(out_dir / f"memsnap_{clip_id[:8]}.pickle")
         timing_rows.append({
             **other.timing.row(), "row_kind": kind, "pass_index": index, "trace_level": level,
-            "pass_output_match": bool(torch.equal(xyz, pred_xyz)),
+            "pass_output_match": bool(torch.equal(xyz, pred_xyz)), WINDOWS: other.timing.windows,
         })
     if extra_passes:
         HS.add_since("extra_passes_ms", started)
@@ -789,6 +794,7 @@ def main() -> None:
         # different quantity rather than a low estimate.
         thermal = TH.ThermalLog(hz=args.sample_hz)
         thermal.sample()
+        board = TH.PendingAttribution(thermal)
         if args.trace_level == "off":
             print("[trace] level off: no token statistics, no x0 and no spans are recorded -- "
                   "only the wall clock. predictions.parquet will lack token_ids.")
@@ -808,6 +814,7 @@ def main() -> None:
                         "t0_us": args.t0_us, "clip_index": 0, "row_kind": "warmup",
                         "pass_index": n + 1, "trace_level": args.trace_level,
                     })
+                    board.add(timing_rows[-1], warm.timing.windows)
                 del warm_inputs, warm_kwargs
                 print(f"[warmup] {args.warmup} pass(es) on {clips[0][:8]} "
                       f"{time.perf_counter() - started:.1f}s")
@@ -825,8 +832,10 @@ def main() -> None:
                 rows.extend(clip_rows)
                 per_clip.append(extras)
                 for timing_row in clip_timing:
+                    windows = timing_row.pop(WINDOWS, None)
                     timing_rows.append({**timing_base, **timing_row, "clip_id": clip_id,
                                         "t0_us": args.t0_us, "clip_index": i})
+                    board.add(timing_rows[-1], windows)
                 # The main pass is the clip's first row; its host stages are
                 # complete only once the figure and the flush below are done.
                 main_row = timing_rows[-len(clip_timing)]
@@ -846,6 +855,7 @@ def main() -> None:
                 # still read what completed. The final write below replaces it.
                 done = i + 1
                 if args.flush_every and done % args.flush_every == 0 and done < len(clips):
+                    board.settle()
                     with clock.span("flush_ms"):
                         W.write_run(out_dir, rows, config,
                                     {**identity, "partial": True, "n_clips_done": done},
@@ -855,6 +865,7 @@ def main() -> None:
                     clip_wall_ms=(time.perf_counter() - clock.started) * 1000.0))
                 HS.CURRENT.clock = None
                 TH.mark("between")
+                board.settle()
                 reading = thermal.latest()
                 print(
                     f"[{i + 1}/{len(clips)}] {clip_id[:8]} "
@@ -863,6 +874,9 @@ def main() -> None:
                     f"tj {reading.get('tj-thermal', float('nan')):.0f}C"
                 )
 
+        # The sampler has stopped: every reading is in, so every pass still
+        # waiting gets its energy from the complete series.
+        board.settle(final=True)
         space = model.action_space
         meta = {
             **identity,
