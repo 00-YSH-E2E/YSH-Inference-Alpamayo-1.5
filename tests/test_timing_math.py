@@ -259,3 +259,47 @@ def test_host_and_process_figures_pass_through():
     assert (row["ctx_vol"], row["ctx_invol"], row["rss_bytes"]) == (3, 1, 2 ** 30)
     assert row["cpu_pass_ms"] == pytest.approx(100.0)
     assert not TS.unknown_keys(row)
+
+
+# -- memory per segment (table 6) -------------------------------------------------
+def boundary(label, current, peak, reserved=0, ooms=0):
+    return {"label": label, "current": current, "peak": peak, "reserved_peak": reserved,
+            "ooms": ooms}
+
+
+def test_each_boundary_closes_its_own_segment():
+    mem = TM.memory_segments([
+        boundary("start", 100, 999, ooms=2),       # before the pass: not the pass's peak
+        boundary("vision_start", 110, 120),
+        boundary("vision_end", 130, 400, reserved=500),
+        boundary("prefill_end", 150, 700),
+        boundary("generate_end", 160, 650),
+        boundary("diffusion_start", 160, 300),
+        boundary("diffusion_end", 170, 800, reserved=900),
+        boundary("end", 105, 200, ooms=3),
+    ])
+    assert mem["mem_start_bytes"] == 100 and mem["mem_end_bytes"] == 105
+    assert (mem["mem_peak_pre_bytes"], mem["mem_peak_vision_bytes"],
+            mem["mem_peak_prefill_bytes"], mem["mem_peak_decode_bytes"],
+            mem["mem_peak_postgen_bytes"], mem["mem_peak_expert_bytes"],
+            mem["mem_peak_tail_bytes"]) == (120, 400, 700, 650, 300, 800, 200)
+    assert mem["mem_peak_clip_bytes"] == 800
+    assert mem["mem_reserved_peak_bytes"] == 900
+    assert mem["n_ooms"] == 1
+    assert not TS.unknown_keys(mem)
+
+
+def test_level_off_gets_only_the_pass_peak():
+    mem = TM.memory_segments([boundary("start", 100, 50), boundary("end", 100, 640)])
+    assert mem["mem_peak_clip_bytes"] == 640
+    assert "mem_peak_tail_bytes" not in mem and "mem_peak_vision_bytes" not in mem
+
+
+def test_memory_and_shapes_reach_the_row():
+    t = TM.resolve(one_pass(), memory=[boundary("start", 1, 1), boundary("end", 2, 3)],
+                   shapes={"kv_bytes": 10, "n_images": 96},
+                   process={"host_mem_avail_min_bytes": 5})
+    row = t.row()
+    assert row["mem_peak_clip_bytes"] == 3 and row["kv_bytes"] == 10
+    assert row["n_images"] == 96 and row["host_mem_avail_min_bytes"] == 5
+    assert not TS.unknown_keys(row)

@@ -156,6 +156,20 @@ class _EventPool:
 
 _POOL = _EventPool()
 
+#: The allocator's peak over the whole run. Each pass reads and resets the peak
+#: at its segment boundaries, which would otherwise leave the run-level
+#: ``vram_peak_gb`` describing only the last segment of the last clip. Every
+#: read is folded in here first, so the run's peak keeps its meaning.
+_RUN_PEAK = {"bytes": 0}
+
+
+def run_peak_bytes() -> int:
+    """Peak allocated bytes since the run's reset, across every pass and between them."""
+    peak = _RUN_PEAK["bytes"]
+    if torch.cuda.is_available():
+        peak = max(peak, int(torch.cuda.max_memory_allocated()))
+    return peak
+
 #: How deep the instrumentation goes. ``off`` installs no hook at all -- only a
 #: pair of marks around the call, for the wall clock -- and exists so the cost
 #: of ``basic`` can be measured against it on the same clip. Deeper levels are
@@ -190,11 +204,18 @@ def _process_stats() -> dict[str, Any] | None:
         usage = resource.getrusage(resource.RUSAGE_THREAD)
         with open("/proc/self/statm") as handle:
             resident_pages = int(handle.read().split()[1])
+        available = None
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) * 1024
+                    break
         return {
             "cpu_s": times.user + times.system,
             "nvcsw": usage.ru_nvcsw,
             "nivcsw": usage.ru_nivcsw,
             "rss_bytes": resident_pages * os.sysconf("SC_PAGE_SIZE"),
+            "mem_available": available,
         }
     except (OSError, ValueError, AttributeError):
         return None
@@ -209,6 +230,10 @@ def _process_delta(before: dict[str, Any] | None,
         "ctx_vol": max(after["nvcsw"] - before["nvcsw"], 0),
         "ctx_invol": max(after["nivcsw"] - before["nivcsw"], 0),
         "rss_bytes": after["rss_bytes"],
+        "host_mem_avail_min_bytes": (
+            min(before["mem_available"], after["mem_available"])
+            if before.get("mem_available") is not None
+            and after.get("mem_available") is not None else None),
     }
 
 
@@ -239,6 +264,11 @@ class InferenceTracer:
         #: Host milliseconds inside wrapped host-side functions, by name.
         self._host_ms: dict[str, float] = {}
         self._process0: dict[str, Any] | None = None
+        #: Allocator reads at segment boundaries, in call order.
+        self._memory: list[dict[str, Any]] = []
+        #: Shapes read off hook arguments: the KV cache the head attends to, the images.
+        self._shapes: dict[str, Any] = {}
+        self._lm_calls = 0
         self._enabled = False
         self._wall_start: float | None = None
         self._start_unix: float | None = None
@@ -298,6 +328,9 @@ class InferenceTracer:
         self._marks.clear()
         self._hook_s = 0.0
         self._host_ms = {}
+        self._memory = []
+        self._shapes = {}
+        self._lm_calls = 0
         self.timing = TimingResult()
         if torch.cuda.is_available():
             _POOL.acquire(self)
@@ -309,6 +342,7 @@ class InferenceTracer:
         # that metric as the peak of the last clip.
         self._alloc0 = self._alloc_counters()
         self._process0 = _process_stats()
+        self._mem_mark("start")
         self._runner = self._graph_runner()
         self._graph0 = self._graph_counters()
         self._capture_ms = 0.0
@@ -329,11 +363,9 @@ class InferenceTracer:
         visual = getattr(inner, "visual", None)
         if visual is not None:
             self._handles.append(
-                visual.register_forward_pre_hook(lambda *_: self._mark("vision", "start"))
+                visual.register_forward_pre_hook(self._on_vision_start, with_kwargs=True)
             )
-            self._handles.append(
-                visual.register_forward_hook(lambda *_: self._mark("vision", "end"))
-            )
+            self._handles.append(visual.register_forward_hook(self._on_vision_end))
 
         # Language model: call #1 is the prompt prefill, the rest are decode
         # steps. The call count is also the exact number of generated tokens.
@@ -342,9 +374,7 @@ class InferenceTracer:
             self._handles.append(
                 language.register_forward_pre_hook(lambda *_: self._mark("lm", "start"))
             )
-            self._handles.append(
-                language.register_forward_hook(lambda *_: self._mark("lm", "end"))
-            )
+            self._handles.append(language.register_forward_hook(self._on_lm_end))
 
         # The whole VLM forward, once per generate step, and the vocabulary
         # projection inside it. lm_head runs after the language model returns,
@@ -381,7 +411,7 @@ class InferenceTracer:
         expert = getattr(self.model, "expert", None)
         if expert is not None:
             self._handles.append(
-                expert.register_forward_pre_hook(lambda *_: self._mark("expert", "start"))
+                expert.register_forward_pre_hook(self._on_expert_start, with_kwargs=True)
             )
             self._handles.append(
                 expert.register_forward_hook(lambda *_: self._mark("expert", "end"))
@@ -411,6 +441,84 @@ class InferenceTracer:
 
         # Last, so the call's span starts where the model's work does.
         self._mark("call", "start")
+
+    # -- boundaries and shapes ---------------------------------------------
+    def _mem_mark(self, label: str) -> None:
+        """Read the allocator at a segment boundary, then reset its peak.
+
+        The peak read here is the peak since the previous boundary, which is
+        what makes it a per-segment number. Host-side bookkeeping only: no
+        sync, and about a tenth of a millisecond.
+        """
+        if not torch.cuda.is_available():
+            return
+        try:
+            stats = torch.cuda.memory_stats()
+            peak = int(stats.get("allocated_bytes.all.peak", 0))
+            _RUN_PEAK["bytes"] = max(_RUN_PEAK["bytes"], peak)
+            self._memory.append({
+                "label": label,
+                "current": int(stats.get("allocated_bytes.all.current", 0)),
+                "peak": peak,
+                "reserved_peak": int(stats.get("reserved_bytes.all.peak", 0)),
+                "ooms": int(stats.get("num_ooms", 0)),
+            })
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+    def _on_vision_start(self, module: Any, args: tuple, kwargs: dict) -> None:
+        self._mem_mark("vision_start")
+        self._mark("vision", "start")
+        if "n_images" in self._shapes:
+            return
+        # Qwen3-VL calls the tower as visual(pixel_values, grid_thw=...): one row
+        # of patch features per patch, one grid row per image. generate has
+        # already copied the images K times, so these count K x the frames.
+        pixels = args[0] if args else kwargs.get("hidden_states")
+        grid = kwargs.get("grid_thw", args[1] if len(args) > 1 else None)
+        try:
+            if pixels is not None:
+                self._shapes["n_vision_patches"] = int(pixels.shape[0])
+                merge = getattr(module, "spatial_merge_unit", None)
+                if merge:
+                    self._shapes["n_vision_tokens"] = int(pixels.shape[0]) // int(merge)
+            if grid is not None:
+                self._shapes["n_images"] = int(grid.shape[0])
+        except Exception:
+            pass
+
+    def _on_vision_end(self, *_: Any) -> None:
+        self._mark("vision", "end")
+        self._mem_mark("vision_end")
+
+    def _on_lm_end(self, *_: Any) -> None:
+        self._mark("lm", "end")
+        self._lm_calls += 1
+        if self._lm_calls == 1:
+            self._mem_mark("prefill_end")
+
+    def _on_expert_start(self, module: Any, args: tuple, kwargs: dict) -> None:
+        if "kv_bytes" not in self._shapes:
+            # The prompt cache the head attends to at every Euler step: the
+            # generated prompt's keys and values, K rows, every layer. Metadata
+            # only -- nbytes and shapes -- so reading it costs no sync.
+            try:
+                cache = kwargs.get("past_key_values")
+                layers = [layer for layer in getattr(cache, "layers", [])
+                          if getattr(layer, "keys", None) is not None]
+                if layers:
+                    self._shapes["kv_bytes"] = int(sum(layer.keys.nbytes + layer.values.nbytes
+                                                       for layer in layers))
+                    self._shapes["kv_layers"] = len(layers)
+                    self._shapes["kv_rows"] = int(layers[0].keys.shape[0])
+                    self._shapes["kv_final_tokens"] = int(layers[0].keys.shape[-2])
+                embeds = kwargs.get("inputs_embeds")
+                if embeds is not None and embeds.dim() == 3:
+                    self._shapes["expert_tokens"] = int(embeds.shape[1])
+            except Exception:
+                pass
+        self._mark("expert", "start")
 
     # -- counters ----------------------------------------------------------
     @staticmethod
@@ -517,6 +625,7 @@ class InferenceTracer:
             self._mark("generate", "start")
             out = original(*args, **kwargs)
             self._mark("generate", "end")
+            self._mem_mark("generate_end")
             input_ids = kwargs.get("input_ids")
             if input_ids is None and args:
                 input_ids = args[0]
@@ -548,9 +657,11 @@ class InferenceTracer:
     def _wrap_sample(self, original: Any) -> Any:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             self._x0 = None
+            self._mem_mark("diffusion_start")
             self._mark("diffusion", "start")
             out = original(*args, **kwargs)
             self._mark("diffusion", "end")
+            self._mem_mark("diffusion_end")
             # generate() ran first and built self.trace; the noise only exists now.
             if self.trace is not None and self._x0 is not None:
                 self.trace.x0 = self._x0.float().cpu().numpy()
@@ -613,6 +724,7 @@ class InferenceTracer:
     # -- results -----------------------------------------------------------
     def finalize(self) -> TimingResult:
         """Resolve recorded events into segment times. Call once, after inference."""
+        self._mem_mark("end")
         alloc1 = self._alloc_counters()
         graph1 = self._graph_counters()
         records: list[timing_math.Record] = []
@@ -642,6 +754,8 @@ class InferenceTracer:
             hook_ms=self._hook_s * 1000.0,
             host_ms=self._host_ms,
             process=_process_delta(self._process0, _process_stats()),
+            memory=self._memory,
+            shapes=self._shapes,
         )
         _POOL.release(self)
         return self.timing

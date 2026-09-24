@@ -53,12 +53,12 @@ import numpy as np
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 5
+TIMING_SCHEMA_VERSION = 6
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
 #: comparable on latency even when every other condition matches.
-TRACER_VERSION = 4
+TRACER_VERSION = 5
 
 CHANGELOG = {
     1: "Initial table: legacy spans, host wall clock, per-call arrays, allocator and "
@@ -73,6 +73,9 @@ CHANGELOG = {
     5: "Host side: the clip's stages outside the call (data, tokenization, copies, metrics, "
     "figures), the spans before generate and after the head, first trajectory, thread CPU "
     "per segment, context switches, RSS. Tracer 4 marks the call and stamps thread CPU.",
+    6: "Memory and shapes: allocator peak per segment, clip peak, reserved peak, OOMs, host "
+    "memory available; the KV cache the head attends to, the image and patch counts, and the "
+    "memory_snapshot condition. Tracer 5 reads the allocator at segment boundaries.",
 }
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
@@ -322,8 +325,45 @@ PASS_HOST = _cols("pass_host", (
     ("rss_bytes", "i64", "B", "L", "Process resident set at the end of the call."),
 ), since=5)
 
+#: Memory is unified on the Thor: what the GPU allocates, the host no longer
+#: has. The allocator's peak is read and reset at every segment boundary, so
+#: each segment gets its own peak rather than the run sharing one.
+MEMORY = _cols("memory", (
+    ("mem_start_bytes", "i64", "B", "N", "Allocated when the call began."),
+    ("mem_end_bytes", "i64", "B", "N", "Allocated when the call ended."),
+    ("mem_peak_pre_bytes", "i64", "B", "L", "Peak before vision: input copies and expansion."),
+    ("mem_peak_vision_bytes", "i64", "B", "L", "Peak during the vision tower."),
+    ("mem_peak_prefill_bytes", "i64", "B", "L", "Peak from vision's end through prefill."),
+    ("mem_peak_decode_bytes", "i64", "B", "L", "Peak over the decode loop."),
+    ("mem_peak_postgen_bytes", "i64", "B", "L",
+     "Peak between generate and the head -- includes the tracer's logits pass."),
+    ("mem_peak_expert_bytes", "i64", "B", "L", "Peak during the head."),
+    ("mem_peak_tail_bytes", "i64", "B", "L", "Peak after the head."),
+    ("mem_peak_clip_bytes", "i64", "B", "L", "Peak over the whole call."),
+    ("mem_reserved_peak_bytes", "i64", "B", "L",
+     "Peak held by the caching allocator -- what the process actually took from the board."),
+    ("n_ooms", "i32", "", "L", "Out-of-memory events the allocator recovered from."),
+    ("host_mem_avail_min_bytes", "i64", "B", "H",
+     "MemAvailable at the lower of the call's two ends. The GPU's memory is the host's."),
+), since=6)
+
+SHAPES = _cols("shape", (
+    ("kv_bytes", "i64", "B", "N", "The KV cache the head attended to, all layers, K and V."),
+    ("kv_final_tokens", "i32", "", "N",
+     "Its length: prompt plus decoded tokens. Clips differ, which is also why a graph "
+     "captured for one clip rarely fits the next."),
+    ("kv_rows", "i16", "", "N", "Its batch rows: K."),
+    ("kv_layers", "i16", "", "N", "Its layers."),
+    ("expert_tokens", "i16", "", "N", "Action tokens the head appends each Euler step."),
+    ("n_images", "i16", "", "N", "Images the vision tower encoded: K copies of every frame."),
+    ("n_vision_patches", "i32", "", "N", "Patches it encoded."),
+    ("n_vision_tokens", "i32", "", "N", "Tokens those became after the spatial merge."),
+    ("memory_snapshot", "i16", "", "N",
+     "Clips that got an extra pass under the allocator's history recorder."),
+), since=6)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
-                            + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST)
+                            + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST + MEMORY + SHAPES)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -447,7 +487,43 @@ AGGREGATE_KEYS = (
     "t_pre_generate_ms", "t_tail_ms", "t_action_to_traj_ms", "t_first_traj_ms",
     "t_first_traj_ms_p95", "host.cpu_pass_ms", "host.cpu_decode_ms", "host.cpu_expert_ms",
     "host.ctx_invol", "host.rss_max_gb",
+    "mem.peak_clip_gb", "mem.peak_clip_gb_max", "mem.peak_pre_gb", "mem.peak_vision_gb",
+    "mem.peak_prefill_gb", "mem.peak_decode_gb", "mem.peak_postgen_gb", "mem.peak_expert_gb",
+    "mem.peak_tail_gb", "mem.reserved_peak_gb_max", "mem.n_ooms_sum", "mem.host_avail_min_gb",
+    "kv.bytes_mb", "kv.final_tokens", "kv.cat_decode_gb", "kv.cat_expert_gb", "kv.graph_copy_gb",
+    "vision.n_images", "vision.n_patches", "vision.n_tokens",
 )
+
+
+def kv_traffic(row: Mapping[str, Any]) -> dict[str, float] | None:
+    """Bytes the KV cache's concatenation moves in one pass, estimated from shapes.
+
+    Derived here rather than stored: the stored facts are the cache's size and
+    length and the step counts, and the model of what a concatenation costs
+    may change. transformers' DynamicLayer.update rebuilds every layer's cache
+    with torch.cat on every call -- reading the old tensor and writing a new
+    one one token longer. So a decode step at cache length L moves about
+    2 * L token-rows per layer, and an Euler step of the head, which appends
+    its action tokens to the full prompt cache and crops them off again, moves
+    about 2 * (L_final + tokens). A CUDA graph captures the same concatenation,
+    and its first replay per clip also copies the whole prompt cache into the
+    graph's static buffers.
+    """
+    need = ("kv_bytes", "kv_rows", "kv_final_tokens")
+    if not all(is_number(row.get(k)) for k in need) or not row["kv_rows"] or \
+            not row["kv_final_tokens"]:
+        return None
+    rows_, final = float(row["kv_rows"]), float(row["kv_final_tokens"])
+    per_token_row = float(row["kv_bytes"]) / (rows_ * final)
+    n = float(row.get("n_decode_steps") or 0)
+    prompt = max(final - n, 0.0)
+    steps = float(row.get("n_expert_calls") or 0)
+    tokens = float(row.get("expert_tokens") or 0)
+    return {
+        "cat_decode": 2.0 * per_token_row * rows_ * (n * prompt + n * (n + 1) / 2.0),
+        "cat_expert": 2.0 * per_token_row * rows_ * steps * (final + tokens),
+        "graph_copy": float(row["kv_bytes"]) if (row.get("graph_replays") or 0) > 0 else 0.0,
+    }
 
 
 def main_rows(rows: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -677,5 +753,29 @@ def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     out["host.ctx_invol"] = _mean(_values(rows, "ctx_invol"))
     rss = _values(rows, "rss_bytes")
     out["host.rss_max_gb"] = max(rss) / 1e9 if rss else None
+
+    clip_peak = _values(rows, "mem_peak_clip_bytes")
+    out["mem.peak_clip_gb"] = _mean(clip_peak) / 1e9 if clip_peak else None
+    out["mem.peak_clip_gb_max"] = max(clip_peak) / 1e9 if clip_peak else None
+    for seg in ("pre", "vision", "prefill", "decode", "postgen", "expert", "tail"):
+        values = _values(rows, f"mem_peak_{seg}_bytes")
+        out[f"mem.peak_{seg}_gb"] = _mean(values) / 1e9 if values else None
+    reserved = _values(rows, "mem_reserved_peak_bytes")
+    out["mem.reserved_peak_gb_max"] = max(reserved) / 1e9 if reserved else None
+    ooms = _values(rows, "n_ooms")
+    out["mem.n_ooms_sum"] = float(sum(ooms)) if ooms else None
+    avail = _values(rows, "host_mem_avail_min_bytes")
+    out["mem.host_avail_min_gb"] = min(avail) / 1e9 if avail else None
+
+    kv = _values(rows, "kv_bytes")
+    out["kv.bytes_mb"] = _mean(kv) / 1e6 if kv else None
+    out["kv.final_tokens"] = _mean(_values(rows, "kv_final_tokens"))
+    estimates = [kv_traffic(r) for r in rows]
+    for key in ("cat_decode", "cat_expert", "graph_copy"):
+        values = [e[key] for e in estimates if e and e.get(key) is not None]
+        out[f"kv.{key}_gb"] = _mean(values) / 1e9 if values else None
+    out["vision.n_images"] = _mean(_values(rows, "n_images"))
+    out["vision.n_patches"] = _mean(_values(rows, "n_vision_patches"))
+    out["vision.n_tokens"] = _mean(_values(rows, "n_vision_tokens"))
 
     return {k: float(v) for k, v in out.items() if v is not None and math.isfinite(v)}

@@ -372,3 +372,58 @@ def model_size(model: torch.nn.Module) -> dict[str, float]:
     if torch.cuda.is_available():
         out["vram_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
     return out
+
+
+#: The model's parts, by attribute path. Each is weighed separately because each
+#: is read at a different rate: the vision tower once per clip, the language
+#: model and lm_head once per decode step, the head once per Euler step.
+_MODULE_PARTS = {
+    "visual": "vlm.model.visual",
+    "language_model": "vlm.model.language_model",
+    "lm_head": "vlm.lm_head",
+    "expert": "expert",
+    "action_in_proj": "action_in_proj",
+    "action_out_proj": "action_out_proj",
+}
+
+
+def module_inventory(model: torch.nn.Module) -> dict[str, float]:
+    """What each part of the model weighs in memory, parameters and buffers both.
+
+    Counted from the live module tree rather than from the checkpoint files,
+    because a quantized checkpoint is restored into a different set of tensors
+    than it was saved as -- packed weights, scales, quantizer state in buffers
+    -- and what a decode step reads is what is resident, not what was on disk.
+    Bytes per decode step or Euler step divided by the measured step time is
+    the bandwidth the step achieved; this is the numerator.
+    """
+    def weight(module: torch.nn.Module) -> int:
+        tensors = list(module.parameters()) + list(module.buffers())
+        return sum(t.numel() * t.element_size() for t in tensors)
+
+    out: dict[str, float] = {}
+    counted = 0
+    for name, path in _MODULE_PARTS.items():
+        part = model
+        for attr in path.split("."):
+            part = getattr(part, attr, None)
+            if part is None:
+                break
+        if isinstance(part, torch.nn.Module):
+            size = weight(part)
+            counted += size
+            out[f"weights.{name}_gb"] = size / 1e9
+    total = weight(model)
+    out["weights.total_gb"] = total / 1e9
+    out["weights.other_gb"] = max(total - counted, 0) / 1e9
+    by_dtype: dict[str, int] = {}
+    for t in list(model.parameters()) + list(model.buffers()):
+        key = str(t.dtype).replace("torch.", "")
+        by_dtype[key] = by_dtype.get(key, 0) + t.numel() * t.element_size()
+    for key, size in sorted(by_dtype.items()):
+        out[f"weights.dtype.{key}_gb"] = size / 1e9
+    # ModelOpt and similar libraries swap in their own module classes; a count
+    # of them says whether a "quantized" run is quantized at all.
+    out["weights.n_quant_modules"] = float(sum(
+        1 for m in model.modules() if "quant" in type(m).__name__.lower()))
+    return out

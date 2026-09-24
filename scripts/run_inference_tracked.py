@@ -76,6 +76,7 @@ from alpamayo1_5.trace import writer as W  # noqa: E402
 from alpamayo1_5.trace.token_trace import (  # noqa: E402
     DEFAULT_SPECIAL_IDS,
     TRACE_LEVELS,
+    run_peak_bytes,
     trace_inference,
 )
 
@@ -88,6 +89,9 @@ DATA_CACHE = "/home/thor/Documents/Alpamayo/Data/Alpamayo-1.5_Cam-4_Vanilla"
 OUT_ROOT = "/home/thor/Documents/Alpamayo/Inference"
 DEFAULT_CLIP = "030c760c-ae38-49aa-9ad8-f5650a545d26"
 MAX_SAMPLE_IMAGES = 20  # representative figures per run, per the recording rules
+
+# Allocator history snapshots written this run (local files; see --memory-snapshot).
+_MEMSNAPS: list[str] = []
 
 # Per-clip values that become run-level means. Spelled out rather than swept
 # off whatever per_clip happens to contain: with a sweep, the metric namespace
@@ -222,6 +226,11 @@ def parse_args() -> argparse.Namespace:
                    help="Extra passes per repeated clip, for the latency noise band.")
     p.add_argument("--repeat-clips", type=int, default=5,
                    help="How many clips, from the start, get --timing-repeats.")
+    p.add_argument("--memory-snapshot", type=int, default=0,
+                   help="Give the first N clips an extra pass under the allocator's history "
+                        "recorder, and write each snapshot next to the run (local only; open "
+                        "it at pytorch.org/memory_viz). Shows every allocation the KV "
+                        "concatenation makes.")
     p.add_argument("--variant", default="Vanilla", help="Vanilla, Pruned-24L, INT8 ...")
     p.add_argument("--data-spec", default="Cam-4")
     p.add_argument("--machine", default=None,
@@ -426,7 +435,22 @@ def extra_passes_for(index: int, args) -> list[tuple[str, str]]:
         passes += pair if index % 2 == 0 else pair[::-1]
     if index < args.repeat_clips:
         passes += [("repeat", args.trace_level)] * args.timing_repeats
+    if index < getattr(args, "memory_snapshot", 0):
+        passes.append(("memsnap", args.trace_level))
     return passes
+
+
+def _dump_memory_snapshot(path: Path) -> None:
+    """Write the allocator's recorded history and stop recording. A snapshot that
+    cannot be written costs the file, never the run."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.cuda.memory._dump_snapshot(str(path))
+        _MEMSNAPS.append(str(path))
+    except Exception as exc:
+        print(f"[memsnap] {path.name}: {exc}", file=sys.stderr)
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 def run_clip(
@@ -533,7 +557,13 @@ def run_clip(
                     "trace_level": args.trace_level}]
     started = time.perf_counter()
     for index, (kind, level) in enumerate(extra_passes, start=1):
-        xyz, _, _, other = infer(model, clip_id, model_inputs, diffusion_kwargs, args, level)
+        if kind == "memsnap":
+            torch.cuda.memory._record_memory_history(max_entries=200_000)
+        try:
+            xyz, _, _, other = infer(model, clip_id, model_inputs, diffusion_kwargs, args, level)
+        finally:
+            if kind == "memsnap":
+                _dump_memory_snapshot(out_dir / f"memsnap_{clip_id[:8]}.pickle")
         timing_rows.append({
             **other.timing.row(), "row_kind": kind, "pass_index": index, "trace_level": level,
             "pass_output_match": bool(torch.equal(xyz, pred_xyz)),
@@ -591,6 +621,7 @@ def main() -> None:
         "overhead_probe": args.overhead_probe,
         "timing_repeats": args.timing_repeats,
         "repeat_clips": args.repeat_clips,
+        "memory_snapshot": args.memory_snapshot,
         "torch_disable_native_jit": os.environ.get("TORCH_DISABLE_NATIVE_JIT"),
         "torch_version": torch.__version__,
         "data_cache": args.data_cache,
@@ -730,6 +761,7 @@ def main() -> None:
             "overhead_probe": args.overhead_probe,
             "timing_repeats": args.timing_repeats,
             "repeat_clips": args.repeat_clips,
+            "memory_snapshot": args.memory_snapshot,
         }
         # Throttling moves latency without moving anything else, and after the
         # run there is no way to tell that from a regression.
@@ -847,6 +879,16 @@ def main() -> None:
             "params_billions": sum(p.numel() for p in model.parameters()) / 1e9,
         }
         meta.update(M.model_size(model))
+        # The tracer reads and resets the allocator's peak at every segment
+        # boundary, folding each read into a run-level maximum first; without
+        # that, max_memory_allocated would describe only the last segment.
+        meta["vram_peak_gb"] = run_peak_bytes() / 1e9
+        # What each part of the model weighs as loaded -- quantized checkpoints
+        # restore into different tensors than they were saved as.
+        inventory = M.module_inventory(model)
+        meta["modules"] = inventory
+        if _MEMSNAPS:
+            meta["memory_snapshots"] = list(_MEMSNAPS)
         # The recording rules want the tracer's cost in run.json as well as in
         # MLflow: it is what a reader needs to decide how far to trust any
         # latency here, and run.json is what survives without the tracker.
@@ -997,12 +1039,16 @@ def main() -> None:
         # Measured during the loop, so it could not be among the parameters
         # logged when the run opened. New keys may be added; logged ones may not
         # change, so this is logged once, here.
+        # The model's weights by part are known only once it has loaded, which
+        # is after the run opened: they join the same late batch.
+        late = {key: round(value, 4) for key, value in inventory.items()}
         if probe:
-            try:
-                run.params({"trace.overhead_pct": round(probe["trace.overhead_pct"], 4),
-                            "trace.overhead_n": int(probe["trace.overhead_n"])})
-            except Exception as exc:
-                print(f"[timing] trace.overhead_pct param not recorded: {exc}", file=sys.stderr)
+            late["trace.overhead_pct"] = round(probe["trace.overhead_pct"], 4)
+            late["trace.overhead_n"] = int(probe["trace.overhead_n"])
+        try:
+            run.params(late)
+        except Exception as exc:
+            print(f"[timing] late params not recorded: {exc}", file=sys.stderr)
         # Breakdown by scene: fixed cardinality, and it answers the question
         # actually being asked -- does the model give up on curves? The previous
         # code wrote a metric key per clip UUID, which put 100 keys in a 148-key

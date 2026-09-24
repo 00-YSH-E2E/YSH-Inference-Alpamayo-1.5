@@ -194,6 +194,11 @@ def test_a_traced_pass_fills_both_clocks_and_every_array():
     assert t.action_to_traj_ms >= 0.0
     assert t.cpu_ms["pass"] > 0.0
     assert t.rss_bytes > 0 and t.ctx_vol is not None
+    # Tracer 5 reads the allocator at every segment boundary.
+    for seg in ("pre", "vision", "prefill", "decode", "postgen", "expert", "tail"):
+        assert t.memory[f"mem_peak_{seg}_bytes"] > 0, seg
+    assert t.memory["mem_peak_clip_bytes"] <= TT.run_peak_bytes()
+    assert t.shapes["n_vision_patches"] == 4
 
 
 @needs_gpu
@@ -240,4 +245,21 @@ def test_level_off_installs_nothing_and_keeps_the_wall_clock():
 def test_an_unknown_level_is_refused():
     with pytest.raises(ValueError, match="trace level"):
         InferenceTracer(types.SimpleNamespace(), level="deep")
+
+
+def test_the_inventory_weighs_each_part_it_finds():
+    from alpamayo1_5.trace import metrics as M
+
+    model = torch.nn.Module()
+    model.expert = torch.nn.Linear(10, 10, bias=False)             # 400 bytes in fp32
+    model.action_out_proj = torch.nn.Linear(10, 2, bias=False)      # 80 bytes
+    model.register_buffer("scale", torch.ones(5, dtype=torch.float16))  # 10 bytes, "other"
+    inv = M.module_inventory(model)
+    assert inv["weights.expert_gb"] == pytest.approx(400e-9)
+    assert inv["weights.action_out_proj_gb"] == pytest.approx(80e-9)
+    assert inv["weights.total_gb"] == pytest.approx(490e-9)
+    assert inv["weights.other_gb"] == pytest.approx(10e-9)
+    assert inv["weights.dtype.float16_gb"] == pytest.approx(10e-9)
+    assert "weights.visual_gb" not in inv
+    assert inv["weights.n_quant_modules"] == 0.0
 

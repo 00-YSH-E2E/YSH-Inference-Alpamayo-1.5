@@ -244,3 +244,30 @@ def test_host_stages_and_the_paper_boundary_are_aggregated():
     assert out["t_first_traj_ms"] == 14000.0
     assert out["host.rss_max_gb"] == pytest.approx(30.0)
     assert set(out) <= set(TS.AGGREGATE_KEYS)
+
+
+def test_kv_traffic_follows_the_concatenation_model():
+    """K=2 rows, 100 tokens at the head, 3 decode steps, 10 Euler steps of 64 tokens.
+    Each token-row across all layers weighs 1000 bytes."""
+    r = row(kv_bytes=2 * 100 * 1000, kv_rows=2, kv_final_tokens=100, n_decode_steps=3,
+            n_expert_calls=10, expert_tokens=64, graph_replays=0)
+    est = TS.kv_traffic(r)
+    prompt = 97
+    assert est["cat_decode"] == pytest.approx(2 * 1000 * 2 * (3 * prompt + 6))
+    assert est["cat_expert"] == pytest.approx(2 * 1000 * 2 * 10 * (100 + 64))
+    assert est["graph_copy"] == 0.0
+    assert TS.kv_traffic(row()) is None
+
+
+def test_memory_is_aggregated_in_gigabytes():
+    out = TS.aggregate([row(mem_peak_clip_bytes=40e9, mem_peak_expert_bytes=30e9, n_ooms=0,
+                            host_mem_avail_min_bytes=80e9, kv_bytes=450e6, n_images=96),
+                        row(mem_peak_clip_bytes=44e9, mem_peak_expert_bytes=32e9, n_ooms=1,
+                            host_mem_avail_min_bytes=70e9, kv_bytes=470e6, n_images=96)])
+    assert out["mem.peak_clip_gb"] == pytest.approx(42.0)
+    assert out["mem.peak_clip_gb_max"] == pytest.approx(44.0)
+    assert out["mem.host_avail_min_gb"] == pytest.approx(70.0)
+    assert out["mem.n_ooms_sum"] == 1.0
+    assert out["kv.bytes_mb"] == pytest.approx(460.0)
+    assert out["vision.n_images"] == 96.0
+    assert set(out) <= set(TS.AGGREGATE_KEYS)

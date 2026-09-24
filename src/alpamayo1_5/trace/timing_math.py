@@ -104,6 +104,9 @@ class TimingResult:
     ctx_invol: int | None = None
     rss_bytes: int | None = None
 
+    memory: dict[str, Any] = field(default_factory=dict)
+    shapes: dict[str, Any] = field(default_factory=dict)
+
     gen_preamble_ms: float | None = None
     lm_head_ms: float | None = None
     vlm_glue_ms: float | None = None
@@ -179,8 +182,59 @@ class TimingResult:
             "ctx_vol": self.ctx_vol,
             "ctx_invol": self.ctx_invol,
             "rss_bytes": self.rss_bytes,
+            **self.memory,
+            **self.shapes,
         })
         return out
+
+
+#: Which segment a memory boundary closes: the peak read at a boundary is the
+#: peak since the previous one, because each read is followed by a reset.
+_MEMORY_SEGMENTS = {
+    "vision_start": "pre",
+    "vision_end": "vision",
+    "prefill_end": "prefill",
+    "generate_end": "decode",
+    "diffusion_start": "postgen",
+    "diffusion_end": "expert",
+}
+
+
+def memory_segments(boundaries: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Per-segment allocator peaks from the boundaries of one pass, as timing columns.
+
+    ``boundaries`` are ``{label, current, peak, reserved_peak, ooms}`` in call
+    order, starting with ``start`` and ending with ``end``. The ``start``
+    boundary's peak is what happened *before* the pass -- between clips -- and
+    is left out of the pass's own peak. ``end`` closes the tail only when the
+    head's end was seen; at trace level off there are no inner boundaries and
+    the pass gets its overall peak alone.
+    """
+    if not boundaries:
+        return {}
+    out: dict[str, Any] = {}
+    first, last = boundaries[0], boundaries[-1]
+    if first.get("label") == "start":
+        out["mem_start_bytes"] = first.get("current")
+    if last.get("label") == "end":
+        out["mem_end_bytes"] = last.get("current")
+    inner = [b for b in boundaries if b.get("label") != "start"]
+    labels = [b.get("label") for b in boundaries]
+    for i, b in enumerate(boundaries):
+        segment = _MEMORY_SEGMENTS.get(b.get("label"))
+        if b.get("label") == "end" and i > 0 and labels[i - 1] == "diffusion_end":
+            segment = "tail"
+        if segment is not None and b.get("peak") is not None:
+            out[f"mem_peak_{segment}_bytes"] = int(b["peak"])
+    peaks = [int(b["peak"]) for b in inner if b.get("peak") is not None]
+    if peaks:
+        out["mem_peak_clip_bytes"] = max(peaks)
+    reserved = [int(b["reserved_peak"]) for b in inner if b.get("reserved_peak") is not None]
+    if reserved:
+        out["mem_reserved_peak_bytes"] = max(reserved)
+    if first.get("ooms") is not None and last.get("ooms") is not None:
+        out["n_ooms"] = max(int(last["ooms"]) - int(first["ooms"]), 0)
+    return out
 
 
 #: The segments main-thread CPU time is split into.
@@ -361,6 +415,8 @@ def resolve(
     hook_ms: float | None = None,
     host_ms: Mapping[str, float] | None = None,
     process: Mapping[str, Any] | None = None,
+    memory: list[Mapping[str, Any]] | None = None,
+    shapes: Mapping[str, Any] | None = None,
 ) -> TimingResult:
     """Attribute the marks of one pass.
 
@@ -391,6 +447,12 @@ def resolve(
         result.n_cuda_allocs = max(alloc_after[0] - alloc_before[0], 0)
         result.n_alloc_retries = max(alloc_after[1] - alloc_before[1], 0)
 
+    if memory:
+        result.memory = memory_segments(memory)
+    if process and process.get("host_mem_avail_min_bytes") is not None:
+        result.memory["host_mem_avail_min_bytes"] = process["host_mem_avail_min_bytes"]
+    if shapes:
+        result.shapes = dict(shapes)
     if process:
         result.proc_cpu_ms = process.get("proc_cpu_ms")
         result.ctx_vol = process.get("ctx_vol")
