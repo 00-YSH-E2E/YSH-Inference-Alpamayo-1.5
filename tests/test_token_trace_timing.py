@@ -332,6 +332,33 @@ def test_level_layer_marks_nothing_inside_a_capture_it_did_not_start(monkeypatch
 
 
 @needs_gpu
+def test_a_profiled_pass_attributes_its_kernels_to_the_spans(tmp_path):
+    """The tracer's spans as profiler ranges, read back by the parser: the whole
+    path a profile pass takes, on a real trace."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from alpamayo1_5.trace import profile_parse as PP
+
+    model = _Model()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        with trace_inference(model, ranges=True) as tracer:
+            model.run()
+    path = tmp_path / "trace.json"
+    prof.export_chrome_trace(str(path))
+    row, kernels = PP.analyze(PP.load_events(path))
+    # Every range the pass opened was closed.
+    assert tracer._ranges and all(not opened for opened in tracer._ranges.values())
+    # One matmul per module call: vision 1, prefill 1, two decode steps, four Euler steps.
+    assert row["prof_kernels_vision"] >= 1 and row["prof_kernels_prefill"] >= 1
+    assert row["prof_kernels_decode"] >= 2 and row["prof_kernels_expert"] >= 4
+    assert row["prof_kernels_per_expert_step"] >= 1.0
+    gemms = [k for k in kernels if k["segment"] == "expert" and k["category"] == "gemm"]
+    assert gemms and all(k["op"] is not None for k in gemms)
+    assert 0.0 <= row["prof_gpu_idle_ms"] <= row["prof_window_ms"]
+    assert row["prof_n_launches"] >= row["prof_n_kernels"] - row["prof_n_unlinked"] - 1
+
+
+@needs_gpu
 def test_level_step_audits_syncs_and_restores_what_it_changed():
     """The tracer's own logits pass brings logits to the host: at least one sync
     lands in the consume phase. Afterwards the sync debug mode and the warning

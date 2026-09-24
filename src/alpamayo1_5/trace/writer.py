@@ -23,6 +23,7 @@ Layout, one directory per run (see :func:`run_dir_name`)::
     ├── timing.parquet        one row per inference pass: where the time went
     ├── thermal.parquet       the board over the run: one row per sensor reading
     ├── layers.parquet        trace level layer only: one row per layer span of a main pass
+    ├── kernels.parquet       profile passes only: one row per kernel, memcpy or memset
     ├── run.json              run-level metadata and the constants needed to
     │                         recompute anything offline
     ├── gt.parquet            logged future -- local only, never uploaded
@@ -396,19 +397,46 @@ def write_layers(out_dir: Path, rows: list[dict]) -> Path | None:
     per phase in the timing row cannot answer it. ``(clip_id, row_kind,
     pass_index)`` joins a span to its timing row.
     """
+    return _write_long(Path(out_dir) / "layers.parquet", _LAYER_COLUMNS,
+                       TS.LAYERS_SCHEMA_VERSION, rows)
+
+
+_KERNEL_COLUMNS = (
+    ("kernels_schema_version", "i16"), ("run_id", "s"), ("clip_id", "s"), ("clip_index", "i32"),
+    ("row_kind", "s"), ("pass_index", "i16"), ("timing_schema_version", "i16"),
+    ("tracer_version", "i16"), ("kind", "s"), ("segment", "s"), ("step_index", "i16"),
+    ("name", "s"), ("op", "s"), ("category", "s"), ("stream", "i32"), ("start_us", "f64"),
+    ("dur_us", "f32"), ("launch_us", "f32"), ("lead_us", "f32"), ("grid_size", "i64"),
+    ("block_size", "i32"), ("regs_per_thread", "i16"), ("smem_bytes", "i32"),
+)
+
+
+def write_kernels(out_dir: Path, rows: list[dict]) -> Path | None:
+    """Every device event of the profile passes, long format.
+
+    ``start_us`` is from the call's start, so gaps can be recomputed; the
+    segment is where the launch happened and the category comes from the
+    launching op (profile_parse). ``(clip_id, row_kind, pass_index)`` joins a
+    kernel to its timing row.
+    """
+    return _write_long(Path(out_dir) / "kernels.parquet", _KERNEL_COLUMNS,
+                       TS.KERNELS_SCHEMA_VERSION, rows)
+
+
+def _write_long(path: Path, columns: tuple[tuple[str, str], ...], version: int,
+                rows: list[dict]) -> Path | None:
+    """A long table with an explicit schema; its first column is its version."""
     if not rows:
         return None
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    types = {"i16": pa.int16(), "i32": pa.int32(), "f32": pa.float32(), "s": pa.string()}
-    schema = pa.schema([(name, types[kind]) for name, kind in _LAYER_COLUMNS])
-    names = [name for name, _ in _LAYER_COLUMNS]
-    table = pa.Table.from_pylist(
-        [{"layers_schema_version": TS.LAYERS_SCHEMA_VERSION,
-          **{k: r.get(k) for k in names if k != "layers_schema_version"}} for r in rows],
-        schema=schema)
-    path = Path(out_dir) / "layers.parquet"
+    types = {"i16": pa.int16(), "i32": pa.int32(), "i64": pa.int64(), "f32": pa.float32(),
+             "f64": pa.float64(), "s": pa.string()}
+    schema = pa.schema([(name, types[kind]) for name, kind in columns])
+    first, rest = columns[0][0], [name for name, _ in columns[1:]]
+    table = pa.Table.from_pylist([{first: version, **{k: r.get(k) for k in rest}} for r in rows],
+                                 schema=schema)
     pq.write_table(table, path, compression="zstd")
     return path
 
@@ -423,6 +451,7 @@ def write_run(
     timing: list[dict] | None = None,
     thermal: Any = None,
     layers: list[dict] | None = None,
+    kernels: list[dict] | None = None,
 ) -> Path:
     """Write predictions/per_clip/timing parquet, run.json and (locally) gt.parquet.
 
@@ -445,6 +474,8 @@ def write_run(
         write_thermal(out_dir, thermal, config.get("run_id"))
     if layers:
         write_layers(out_dir, layers)
+    if kernels:
+        write_kernels(out_dir, kernels)
 
     payload = dict(meta)
     payload["schema_version"] = SCHEMA_VERSION
@@ -475,7 +506,7 @@ def upload_paths(out_dir: Path) -> list[Path]:
     out_dir = Path(out_dir)
     paths = [out_dir / "predictions.parquet", out_dir / "per_clip.parquet",
              out_dir / "timing.parquet", out_dir / "thermal.parquet",
-             out_dir / "layers.parquet", out_dir / "run.json"]
+             out_dir / "layers.parquet", out_dir / "kernels.parquet", out_dir / "run.json"]
     samples = out_dir / "samples"
     if samples.is_dir():
         paths.extend(sorted(samples.glob("*.png")))

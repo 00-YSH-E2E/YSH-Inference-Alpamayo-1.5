@@ -56,5 +56,13 @@ def test_repeats_follow_the_probe_on_the_first_clips():
     assert R.extra_passes_for(1, a) == []
 
 
+def test_the_profile_pass_comes_last_and_at_level_basic():
+    """Whatever the run's level, the profile pass's ranges come from the basic spans."""
+    a = args(overhead_probe=1, profile_clips=1, trace_level="layer")
+    assert R.extra_passes_for(0, a) == [("probe", "off"), ("probe", "layer"),
+                                        ("profile", "basic")]
+    assert R.extra_passes_for(1, a) == []
+
+
 def test_a_run_at_level_off_has_nothing_to_probe():
     assert R.extra_passes_for(0, args(overhead_probe=4, trace_level="off")) == []

@@ -314,9 +314,12 @@ class InferenceTracer:
     """
 
     def __init__(self, model: Any, special_token_ids: dict[str, int] | None = None,
-                 level: str = "basic") -> None:
+                 level: str = "basic", ranges: bool = False) -> None:
         if level not in TRACE_LEVELS:
             raise ValueError(f"trace level {level!r} is not one of {TRACE_LEVELS}")
+        #: Profile passes: every span is also a profiler range, ``trace::<bucket>``,
+        #: open ones by bucket -- how profile_parse knows what launched a kernel.
+        self._ranges: dict[str, list[Any]] | None = {} if ranges else None
         self.model = model
         self.level = level
         self.ids = dict(DEFAULT_SPECIAL_IDS)
@@ -387,6 +390,8 @@ class InferenceTracer:
         # busy host from one that was waiting or descheduled.
         stamp = time.perf_counter()
         self._marks.append((bucket, kind, event, stamp, time.thread_time()))
+        if self._ranges is not None:
+            self._range(bucket, kind)
         if self.level in _STEP_LEVELS:
             if bucket == "lm" and kind == "start":
                 self._phase_now = "prefill" if self._lm_calls == 0 else "decode"
@@ -396,6 +401,16 @@ class InferenceTracer:
         # instrument's own share of the wall clock -- a number the recording
         # rules require and that no end-to-end comparison can recover later.
         self._hook_s += stamp - entered
+
+    def _range(self, bucket: str, kind: str) -> None:
+        # record_function's own enter and exit, called by hand: a context
+        # manager cannot span a pre-hook and a hook.
+        if kind == "start":
+            opened = torch.profiler.record_function(f"trace::{bucket}")
+            opened.__enter__()
+            self._ranges.setdefault(bucket, []).append(opened)
+        elif self._ranges.get(bucket):
+            self._ranges[bucket].pop().__exit__(None, None, None)
 
     def _set_attr(self, obj: Any, name: str, value: Any) -> None:
         """Shadow ``obj.name`` on the instance, remembering how to undo it.
@@ -882,6 +897,11 @@ class InferenceTracer:
         if not self._enabled:
             return
         self._stop_sync_audit()
+        # A range left open by a pass that raised would swallow everything the
+        # profiler records after it.
+        for opened in (self._ranges or {}).values():
+            while opened:
+                opened.pop().__exit__(None, None, None)
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
@@ -1042,9 +1062,9 @@ class InferenceTracer:
 
 @contextlib.contextmanager
 def trace_inference(model: Any, special_token_ids: dict[str, int] | None = None,
-                    level: str = "basic"):
+                    level: str = "basic", ranges: bool = False):
     """Convenience wrapper: yields a tracer and resolves timings on exit."""
-    tracer = InferenceTracer(model, special_token_ids, level=level)
+    tracer = InferenceTracer(model, special_token_ids, level=level, ranges=ranges)
     with tracer:
         yield tracer
     tracer.finalize()

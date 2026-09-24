@@ -50,10 +50,12 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from alpamayo1_5.trace.profile_parse import CATEGORIES, SDPA_PHASES, SEGMENTS
+
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 10
+TIMING_SCHEMA_VERSION = 11
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
@@ -86,10 +88,16 @@ CHANGELOG = {
     "totals and bytes, postgen and vision parts, synchronizations by phase.",
     10: "Trace level layer: attention, MLP and whole-layer time per phase, and the span "
     "count; the spans themselves go to layers.parquet.",
+    11: "Profile passes: kernels, device time, true GPU idle, launch and sync calls per "
+    "host segment; device time by category; SDPA backend per phase. Kernels go to "
+    "kernels.parquet.",
 }
 
 #: Version of layers.parquet's columns.
 LAYERS_SCHEMA_VERSION = 1
+
+#: Version of kernels.parquet's columns.
+KERNELS_SCHEMA_VERSION = 1
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
 #: aggregates; the others are extra passes over the same clip whose purpose is
@@ -491,9 +499,89 @@ LAYER = _cols("layer", tuple(
     for part, label in (("attn", "Attention"), ("mlp", "MLP"), ("block", "Whole-layer"))
 ) + (("n_layer_spans", "i32", "", "N", "Layer spans recorded in the pass."),), since=10)
 
+#: What each host segment of a profile pass is.
+_SEGMENT_TEXT = {
+    "pre": "before generate",
+    "vision": "the vision tower",
+    "prefill": "the prefill's language model",
+    "decode": "the decode steps' language model",
+    "lm_head": "the language model's output head",
+    "gen_other": "generate outside the language model, its head and the vision tower "
+                 "(sampling, processors, the loop)",
+    "postgen": "between generate and the head",
+    "trace": "the tracer's own logits pass",
+    "expert": "the Euler steps",
+    "head_other": "the sampler outside the Euler steps",
+    "tail": "after the head, and after the call returned",
+}
+
+#: Profile passes only (row_kind "profile": trace level basic under
+#: torch.profiler), read off the pass's Chrome trace by profile_parse. A kernel
+#: counts where its launch happened; GPU idle counts where the host was while
+#: the GPU ran nothing. The profiler slows the pass, so none of these is a
+#: latency: they are counts, shares and idle.
+PROFILE = _cols("profile", (
+    ("prof_n_events", "i32", "", "N", "Events in the pass's profiler trace."),
+    ("prof_n_kernels", "i32", "", "L", "Kernels the pass launched."),
+    ("prof_n_memory_ops", "i32", "", "N", "Memcpy and memset operations on the device."),
+    ("prof_n_unlinked", "i32", "", "N",
+     "Device events with no launch call in the trace, placed by their own start."),
+    ("prof_kernel_ms", "f64", "ms", "L", "Sum of kernel durations."),
+    ("prof_window_ms", "f64", "ms", "N",
+     "From the call's start to the later of its end and its last device event's end."),
+    ("prof_gpu_busy_ms", "f64", "ms", "N", "Union of the device events' intervals in the window."),
+    ("prof_gpu_idle_ms", "f64", "ms", "L",
+     "The window less the busy time: the GPU running nothing at all."),
+    ("prof_n_launches", "i32", "", "L",
+     "Launch calls that produced a device event, less the blocking copies counted as syncs."),
+    ("prof_launch_api_ms", "f64", "ms", "L",
+     "Host time inside those launch calls -- including time blocked on a full launch "
+     "queue, which is the device being behind, not the launch being slow."),
+    ("prof_launch_us_p50", "f64", "us", "L",
+     "Median launch call: what one launch costs the host when the queue has room."),
+    ("prof_n_syncs", "i32", "", "L",
+     "Synchronizing CUDA calls: stream, device and event synchronize, blocking memcpy, "
+     "and copies to pageable host memory, which return only once the device catches up."),
+    ("prof_sync_api_ms", "f64", "ms", "N", "Host time blocked inside them."),
+    ("prof_n_graph_launches", "i32", "", "N", "CUDA graph launches."),
+    ("prof_lead_ms_p50", "f64", "ms", "N",
+     "Median time from a launch call's return to its kernel's start. Near zero, the GPU "
+     "was waiting on the host."),
+) + tuple(
+    spec for seg in SEGMENTS for spec in (
+        (f"prof_kernels_{seg}", "i32", "", "L", f"Kernels launched in {_SEGMENT_TEXT[seg]}."),
+        (f"prof_kernel_ms_{seg}", "f64", "ms", "L",
+         f"Device time of the kernels launched in {_SEGMENT_TEXT[seg]}."),
+        (f"prof_idle_ms_{seg}", "f64", "ms", "L",
+         f"GPU idle while the host was in {_SEGMENT_TEXT[seg]}."),
+        (f"prof_launch_api_ms_{seg}", "f64", "ms", "L",
+         f"Launch-call time in {_SEGMENT_TEXT[seg]}."),
+        (f"prof_sync_api_ms_{seg}", "f64", "ms", "N",
+         f"Host time blocked in synchronizations in {_SEGMENT_TEXT[seg]}."),
+        (f"prof_lead_ms_p50_{seg}", "f64", "ms", "N",
+         f"Median launch-to-start lead of the kernels launched in {_SEGMENT_TEXT[seg]}; "
+         "near zero, the GPU waited on the host there."),
+    )
+) + tuple(
+    (f"prof_cat_ms_{c}", "f64", "ms", "N", f"Device time of {c} work (see profile_parse).")
+    for c in CATEGORIES
+) + (
+    ("prof_kernels_per_decode_step", "f64", "", "L",
+     "Kernels the language model launched per decode step."),
+    ("prof_kernels_per_expert_step", "f64", "", "L", "Kernels launched per Euler step."),
+) + tuple(
+    (f"prof_sdpa_{p}", "s", "", "N",
+     f"The SDPA backend(s) the {p} phase dispatched to, '+'-joined; null without SDPA.")
+    for p in SDPA_PHASES
+) + (
+    ("prof_n_sdpa_calls", "i32", "", "N", "SDPA calls in the pass."),
+    ("prof_export_ms", "f64", "ms", "N", "Host time to export the trace."),
+    ("prof_parse_ms", "f64", "ms", "N", "Host time to read and attribute it."),
+), since=11)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
                             + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST + MEMORY + SHAPES
-                            + BOARD + ENERGY + BOARD_STATE + STEP + LAYER)
+                            + BOARD + ENERGY + BOARD_STATE + STEP + LAYER + PROFILE)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -644,6 +732,11 @@ AGGREGATE_KEYS = (
     "layer.attn_share_vision", "layer.attn_share_prefill", "layer.attn_share_decode",
     "layer.attn_share_expert", "layer.decode_attn_ms_per_step", "layer.decode_mlp_ms_per_step",
     "layer.expert_attn_ms_per_step", "layer.expert_mlp_ms_per_step",
+    "prof.n_passes", "prof.gpu_idle_pct", *(f"prof.idle_ms_{s}" for s in SEGMENTS),
+    "prof.kernels_per_decode_step", "prof.kernels_per_expert_step",
+    "prof.launch_us_p50", "prof.lead_ms_p50", "prof.lead_ms_p50_vision",
+    "prof.lead_ms_p50_decode", "prof.lead_ms_p50_expert", "prof.sync_api_ms",
+    *(f"prof.cat_share_{c}" for c in CATEGORIES), "prof.overhead_pct",
 )
 
 
@@ -920,6 +1013,49 @@ def _layer(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
     return out
 
 
+def _profile(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
+    """Profile passes: true idle, kernels per step, launch cost, device time by kind.
+
+    The profiler's own cost is the profile pass's wall time against the
+    basic-level passes of the same clip, median over clips -- how much slower
+    the pass these numbers come from ran.
+    """
+    prof = [r for r in rows if r.get("row_kind") == "profile"
+            and is_number(r.get("prof_window_ms")) and float(r["prof_window_ms"]) > 0.0]
+    if not prof:
+        return {}
+    out: dict[str, float | None] = {"prof.n_passes": float(len(prof))}
+    out["prof.gpu_idle_pct"] = _mean([100.0 * float(r["prof_gpu_idle_ms"])
+                                      / float(r["prof_window_ms"]) for r in prof])
+    for seg in SEGMENTS:
+        out[f"prof.idle_ms_{seg}"] = _mean([float(r[f"prof_idle_ms_{seg}"]) for r in prof
+                                            if is_number(r.get(f"prof_idle_ms_{seg}"))])
+    for key in ("kernels_per_decode_step", "kernels_per_expert_step", "launch_us_p50",
+                "lead_ms_p50", "lead_ms_p50_vision", "lead_ms_p50_decode",
+                "lead_ms_p50_expert"):
+        out[f"prof.{key}"] = _mean([float(r[f"prof_{key}"]) for r in prof
+                                    if is_number(r.get(f"prof_{key}"))])
+    out["prof.sync_api_ms"] = _mean([float(r["prof_sync_api_ms"]) for r in prof
+                                     if is_number(r.get("prof_sync_api_ms"))])
+    for c in CATEGORIES:
+        shares = []
+        for r in prof:
+            total = sum(float(r.get(f"prof_cat_ms_{k}") or 0.0) for k in CATEGORIES)
+            if total > 0.0 and is_number(r.get(f"prof_cat_ms_{c}")):
+                shares.append(float(r[f"prof_cat_ms_{c}"]) / total)
+        out[f"prof.cat_share_{c}"] = _mean(shares)
+    walls: dict[str, list[float]] = {}
+    for r in rows:
+        if (r.get("row_kind") in ("main", "repeat", "probe") and r.get("trace_level") == "basic"
+                and is_number(r.get("t_wall_ms"))):
+            walls.setdefault(str(r.get("clip_id")), []).append(float(r["t_wall_ms"]))
+    pcts = [100.0 * (float(r["t_wall_ms"]) - float(np.median(walls[str(r.get("clip_id"))])))
+            / float(np.median(walls[str(r.get("clip_id"))])) for r in prof
+            if is_number(r.get("t_wall_ms")) and walls.get(str(r.get("clip_id")))]
+    out["prof.overhead_pct"] = float(np.median(pcts)) if pcts else None
+    return out
+
+
 def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     """Run-level numbers for MLflow, from the main measured rows only.
 
@@ -927,10 +1063,11 @@ def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     replaces took the legacy spans off every row, and an unmeasured row carried
     0.0 -- so a run where timing failed on some clips reported them as having
     taken no time. The protocol numbers (tracer overhead, cold start, noise
-    band) are the exception: they exist only in the extra passes.
+    band) and the profile's are the exception: they exist only in the extra
+    passes.
     """
     rows = list(rows)
-    protocol = _protocol(rows)
+    protocol = {**_protocol(rows), **_profile(rows)}
     rows = main_rows(rows)
     out: dict[str, float | None] = {"timing.n_main_rows": float(len(rows)), **protocol}
     if not rows:

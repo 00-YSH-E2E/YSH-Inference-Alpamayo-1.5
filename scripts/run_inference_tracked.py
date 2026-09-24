@@ -70,6 +70,7 @@ from alpamayo1_5.load_physical_aiavdataset import load_physical_aiavdataset  # n
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5  # noqa: E402
 from alpamayo1_5.trace import host_stages as HS  # noqa: E402
 from alpamayo1_5.trace import metrics as M  # noqa: E402
+from alpamayo1_5.trace import profile_parse as PP  # noqa: E402
 from alpamayo1_5.trace import thermal as TH  # noqa: E402
 from alpamayo1_5.trace import timing_schema as TS  # noqa: E402
 from alpamayo1_5.trace import writer as W  # noqa: E402
@@ -101,6 +102,12 @@ _SYNC_SITES: dict[str, int] = {}
 # The key a main pass's layer spans travel under (trace level layer), popped the
 # same way.
 LAYERS = "__layers__"
+
+# The key a profile pass's kernels travel under, popped the same way.
+KERNELS = "__kernels__"
+
+# Chrome traces kept this run (local files; see --profile-trace).
+_PROFILE_TRACES: list[str] = []
 
 # The key a pass's host-clock windows travel under from run_clip to the loop.
 # Popped before the row is stored: windows are how energy is attributed, not a
@@ -252,6 +259,14 @@ def parse_args() -> argparse.Namespace:
                         "recorder, and write each snapshot next to the run (local only; open "
                         "it at pytorch.org/memory_viz). Shows every allocation the KV "
                         "concatenation makes.")
+    p.add_argument("--profile-clips", type=int, default=0,
+                   help="Give the first N clips an extra pass under torch.profiler, at trace "
+                        "level basic: every kernel to kernels.parquet, and the pass's true GPU "
+                        "idle, kernels per step, launch and sync time and SDPA backends to its "
+                        "timing row. The profiler slows the pass; its latency is never used.")
+    p.add_argument("--profile-trace", action="store_true",
+                   help="Also keep each profile pass's Chrome trace, gzipped, next to the run "
+                        "(local only; open it in Perfetto).")
     p.add_argument("--variant", default="Vanilla", help="Vanilla, Pruned-24L, INT8 ...")
     p.add_argument("--data-spec", default="Cam-4")
     p.add_argument("--machine", default=None,
@@ -421,7 +436,8 @@ def prepare_clip(processor, avdi, clip_id: str, args) -> tuple[dict, dict, dict]
     return data, model_inputs, diffusion_kwargs
 
 
-def infer(model, clip_id: str, model_inputs: dict, diffusion_kwargs: dict, args, level: str):
+def infer(model, clip_id: str, model_inputs: dict, diffusion_kwargs: dict, args, level: str,
+          ranges: bool = False):
     """One traced inference pass, re-seeded for the clip.
 
     Every pass over a clip starts the generator at the same point, so extra
@@ -430,7 +446,7 @@ def infer(model, clip_id: str, model_inputs: dict, diffusion_kwargs: dict, args,
     difference between passes that did different work is not noise.
     """
     torch.cuda.manual_seed_all(clip_seed(args.seed, clip_id))
-    with trace_inference(model, level=level) as tracer:
+    with trace_inference(model, level=level, ranges=ranges) as tracer:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=model_inputs,
@@ -458,7 +474,50 @@ def extra_passes_for(index: int, args) -> list[tuple[str, str]]:
         passes += [("repeat", args.trace_level)] * args.timing_repeats
     if index < getattr(args, "memory_snapshot", 0):
         passes.append(("memsnap", args.trace_level))
+    # Last: the profiler's buffers are the largest thing any pass leaves behind.
+    if index < getattr(args, "profile_clips", 0):
+        passes.append(("profile", "basic"))
     return passes
+
+
+def profiled_infer(model, clip_id: str, model_inputs: dict, diffusion_kwargs: dict, args,
+                   out_dir: Path):
+    """A profile pass: the inference under torch.profiler, the tracer's spans as ranges.
+
+    Returns the pass as ``infer`` does, then the profile's timing-row columns
+    and its device events. Reading the trace is instrumentation: if it fails
+    the pass keeps its tracer row and loses only the profile columns.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = infer(model, clip_id, model_inputs, diffusion_kwargs, args, "basic", ranges=True)
+    raw = out_dir / f".profile_{clip_id[:8]}.json"
+    row: dict = {}
+    kernels: list[dict] = []
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        started = time.perf_counter()
+        prof.export_chrome_trace(str(raw))
+        export_ms = (time.perf_counter() - started) * 1000.0
+        del prof
+        started = time.perf_counter()
+        row, kernels = PP.analyze(PP.load_events(raw))
+        row["prof_export_ms"] = export_ms
+        row["prof_parse_ms"] = (time.perf_counter() - started) * 1000.0
+        if args.profile_trace:
+            import gzip
+            import shutil
+
+            kept = out_dir / f"profile_{clip_id[:8]}.json.gz"
+            with open(raw, "rb") as src, gzip.open(kept, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            _PROFILE_TRACES.append(str(kept))
+    except Exception as exc:
+        print(f"[profile] {clip_id[:8]}: {exc}", file=sys.stderr)
+    finally:
+        raw.unlink(missing_ok=True)
+    return (*out, row, kernels)
 
 
 def _dump_memory_snapshot(path: Path) -> None:
@@ -587,14 +646,22 @@ def run_clip(
     for index, (kind, level) in enumerate(extra_passes, start=1):
         if kind == "memsnap":
             torch.cuda.memory._record_memory_history(max_entries=200_000)
+        profiled: dict = {}
         try:
-            xyz, _, _, other = infer(model, clip_id, model_inputs, diffusion_kwargs, args, level)
+            if kind == "profile":
+                xyz, _, _, other, prof_row, kernels = profiled_infer(
+                    model, clip_id, model_inputs, diffusion_kwargs, args, out_dir)
+                profiled = {**prof_row, KERNELS: kernels}
+            else:
+                xyz, _, _, other = infer(model, clip_id, model_inputs, diffusion_kwargs, args,
+                                         level)
         finally:
             if kind == "memsnap":
                 _dump_memory_snapshot(out_dir / f"memsnap_{clip_id[:8]}.pickle")
         timing_rows.append({
             **other.timing.row(), "row_kind": kind, "pass_index": index, "trace_level": level,
             "pass_output_match": bool(torch.equal(xyz, pred_xyz)), WINDOWS: other.timing.windows,
+            **profiled,
         })
     if extra_passes:
         HS.add_since("extra_passes_ms", started)
@@ -758,7 +825,7 @@ def main() -> None:
             "run_id": run_id, "variant": args.variant, "date": date,
             "machine": machine, "clips": clips, "params": params,
         }
-        rows, per_clip, gt_rows, timing_rows, layer_rows = [], [], [], [], []
+        rows, per_clip, gt_rows, timing_rows, layer_rows, kernel_rows = [], [], [], [], [], []
         # What the board is: release, driver, clock ranges. Into every timing
         # row (the two that decide comparability), the params and run.json.
         hw = TH.hw_inventory()
@@ -850,14 +917,15 @@ def main() -> None:
                 per_clip.append(extras)
                 for timing_row in clip_timing:
                     windows = timing_row.pop(WINDOWS, None)
-                    for span in timing_row.pop(LAYERS, None) or []:
-                        layer_rows.append({
-                            **span, "run_id": run_id, "clip_id": clip_id, "clip_index": i,
+                    join = {"run_id": run_id, "clip_id": clip_id, "clip_index": i,
                             "row_kind": timing_row.get("row_kind"),
                             "pass_index": timing_row.get("pass_index"),
                             "timing_schema_version": TS.TIMING_SCHEMA_VERSION,
-                            "tracer_version": TS.TRACER_VERSION,
-                        })
+                            "tracer_version": TS.TRACER_VERSION}
+                    for span in timing_row.pop(LAYERS, None) or []:
+                        layer_rows.append({**span, **join})
+                    for kernel in timing_row.pop(KERNELS, None) or []:
+                        kernel_rows.append({**kernel, **join})
                     timing_rows.append({**timing_base, **timing_row, "clip_id": clip_id,
                                         "t0_us": args.t0_us, "clip_index": i})
                     board.add(timing_rows[-1], windows)
@@ -885,7 +953,8 @@ def main() -> None:
                         W.write_run(out_dir, rows, config,
                                     {**identity, "partial": True, "n_clips_done": done},
                                     gt=gt_rows if args.include_gt else None, per_clip=per_clip,
-                                    timing=timing_rows, thermal=thermal, layers=layer_rows)
+                                    timing=timing_rows, thermal=thermal, layers=layer_rows,
+                                    kernels=kernel_rows)
                 main_row.update(clock.row(
                     clip_wall_ms=(time.perf_counter() - clock.started) * 1000.0))
                 HS.CURRENT.clock = None
@@ -951,6 +1020,18 @@ def main() -> None:
             meta["memory_snapshots"] = list(_MEMSNAPS)
         if _SYNC_SITES:
             meta["sync_sites"] = sorted(_SYNC_SITES.items(), key=lambda kv: -kv[1])[:30]
+        profiled = [r for r in timing_rows if r.get("row_kind") == "profile"]
+        if profiled:
+            meta["profile"] = {
+                "passes": len(profiled), "traces": list(_PROFILE_TRACES),
+                "kernels_schema_version": TS.KERNELS_SCHEMA_VERSION,
+                # The backend each phase dispatched to, over every profile pass:
+                # an attention implementation can be demoted inside one submodule
+                # and not another, and only the profile sees which.
+                "sdpa": {p: sorted({b for r in profiled if r.get(f"prof_sdpa_{p}")
+                                    for b in str(r[f"prof_sdpa_{p}"]).split("+")})
+                         for p in PP.SDPA_PHASES},
+            }
         # The recording rules want the tracer's cost in run.json as well as in
         # MLflow: it is what a reader needs to decide how far to trust any
         # latency here, and run.json is what survives without the tracker.
@@ -969,7 +1050,8 @@ def main() -> None:
         print(f"\n{thermal.verdict()}")
         W.write_run(out_dir, rows, config, meta,
                     gt=gt_rows if args.include_gt else None, per_clip=per_clip,
-                    timing=timing_rows, thermal=thermal, layers=layer_rows)
+                    timing=timing_rows, thermal=thermal, layers=layer_rows,
+                    kernels=kernel_rows)
         print(f"\nrun directory: {out_dir}")
 
         # Archive before the tracking short-circuit below. --no-track means "do
@@ -1109,6 +1191,8 @@ def main() -> None:
         if probe:
             late["trace.overhead_pct"] = round(probe["trace.overhead_pct"], 4)
             late["trace.overhead_n"] = int(probe["trace.overhead_n"])
+        for phase, backends in (meta.get("profile") or {}).get("sdpa", {}).items():
+            late[f"prof.sdpa_{phase}"] = "+".join(backends) or "none"
         try:
             run.params(late)
         except Exception as exc:

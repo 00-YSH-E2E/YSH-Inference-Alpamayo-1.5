@@ -426,6 +426,24 @@ def test_layer_spans_round_trip_and_are_uploaded(tmp_path):
     assert W.write_layers(tmp_path / "nothing", []) is None
 
 
+def test_kernels_round_trip_and_are_uploaded(tmp_path):
+    from alpamayo1_5.trace import timing_schema as TS
+
+    kernel = {"run_id": "r", "clip_id": "c1", "clip_index": 0, "row_kind": "profile",
+              "pass_index": 3, "kind": "kernel", "segment": "decode", "step_index": 7,
+              "name": "nvjet_sm110_tst_128x128", "op": "aten::mm", "category": "gemm",
+              "stream": 7, "start_us": 12_345_678.25, "dur_us": 41.5, "launch_us": 3.0,
+              "lead_us": 0.5, "grid_size": 8, "block_size": 256, "regs_per_thread": 128,
+              "smem_bytes": 52224}
+    frame = pd.read_parquet(W.write_kernels(tmp_path, [kernel, {**kernel, "op": None}]))
+    assert frame.loc[0, "kernels_schema_version"] == TS.KERNELS_SCHEMA_VERSION
+    # Microseconds from the call's start, kept to the quarter microsecond over seconds.
+    assert frame.loc[0, "start_us"] == 12_345_678.25
+    assert pd.isna(frame.loc[1, "op"]) and frame.loc[0, "step_index"] == 7
+    assert "kernels.parquet" in {p.name for p in W.upload_paths(tmp_path)}
+    assert W.write_kernels(tmp_path / "nothing", []) is None
+
+
 def test_thermal_series_round_trips(tmp_path):
     from alpamayo1_5.trace import thermal as TH
 

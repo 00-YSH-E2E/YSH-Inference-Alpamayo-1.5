@@ -313,6 +313,27 @@ def test_step_numbers_pool_steps_and_rate_the_concatenation():
     assert not any(k.startswith(("step.", "sync.")) for k in TS.aggregate([row(t_total_ms=1.0)]))
 
 
+def test_profile_numbers_come_from_profile_rows_and_rate_the_profiler():
+    measured = dict(prof_window_ms=100.0, prof_gpu_idle_ms=25.0, prof_idle_ms_decode=10.0,
+                    prof_kernels_per_decode_step=1800.0, prof_launch_us_p50=4.0,
+                    prof_n_launches=1000, prof_cat_ms_gemm=30.0, prof_cat_ms_attention=10.0,
+                    prof_lead_ms_p50=0.02, prof_sync_api_ms=5.0)
+    rows = [row(row_kind="profile", clip_id="a", trace_level="basic", t_wall_ms=1200.0,
+                **measured),
+            row(clip_id="a", trace_level="basic", t_wall_ms=1000.0),
+            row(row_kind="probe", clip_id="a", trace_level="off", t_wall_ms=900.0)]
+    out = TS.aggregate(rows)
+    assert out["prof.n_passes"] == 1.0
+    assert out["prof.gpu_idle_pct"] == pytest.approx(25.0)
+    assert out["prof.idle_ms_decode"] == pytest.approx(10.0)
+    assert out["prof.launch_us_p50"] == pytest.approx(4.0)
+    assert out["prof.cat_share_gemm"] == pytest.approx(0.75)
+    # Against the basic-level pass of the same clip; the off probe is not one.
+    assert out["prof.overhead_pct"] == pytest.approx(20.0)
+    assert set(out) <= set(TS.AGGREGATE_KEYS)
+    assert not any(k.startswith("prof.") for k in TS.aggregate(rows[1:]))
+
+
 def test_layer_numbers_are_the_attention_share_and_per_step_time():
     rows = [row(n_layer_spans=100, layer_attn_ms_decode=30.0, layer_block_ms_decode=100.0,
                 layer_mlp_ms_decode=60.0, n_decode_steps=10, layer_attn_ms_expert=40.0,
