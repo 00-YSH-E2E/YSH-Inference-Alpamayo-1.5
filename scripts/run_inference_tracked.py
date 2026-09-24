@@ -68,9 +68,11 @@ import physical_ai_av  # noqa: E402
 from alpamayo1_5 import helper  # noqa: E402
 from alpamayo1_5.load_physical_aiavdataset import load_physical_aiavdataset  # noqa: E402
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5  # noqa: E402
+from alpamayo1_5.trace import flop_count as FC  # noqa: E402
 from alpamayo1_5.trace import host_stages as HS  # noqa: E402
 from alpamayo1_5.trace import metrics as M  # noqa: E402
 from alpamayo1_5.trace import profile_parse as PP  # noqa: E402
+from alpamayo1_5.trace import roofline as RL  # noqa: E402
 from alpamayo1_5.trace import thermal as TH  # noqa: E402
 from alpamayo1_5.trace import timing_schema as TS  # noqa: E402
 from alpamayo1_5.trace import writer as W  # noqa: E402
@@ -264,6 +266,16 @@ def parse_args() -> argparse.Namespace:
                         "level basic: every kernel to kernels.parquet, and the pass's true GPU "
                         "idle, kernels per step, launch and sync time and SDPA backends to its "
                         "timing row. The profiler slows the pass; its latency is never used.")
+    p.add_argument("--flop-count", type=int, default=0,
+                   help="Give the first N clips an extra pass with every op's FLOPs and "
+                        "operand bytes counted by segment (FlopCounterMode and a dispatch "
+                        "mode; the expert's CUDA graph is set aside for it). It checks the "
+                        "analytic work model the efficiency numbers use. Never timed.")
+    p.add_argument("--roofline-probe", action="store_true",
+                   help="Before the first clip, measure this board's bf16 GEMM throughput and "
+                        "the bandwidth of a GEMV, a read, a copy and the KV concatenation "
+                        "(~10 s). The efficiency numbers then say how close each segment "
+                        "came to its roof.")
     p.add_argument("--profile-trace", action="store_true",
                    help="Also keep each profile pass's Chrome trace, gzipped, next to the run "
                         "(local only; open it in Perfetto).")
@@ -437,7 +449,7 @@ def prepare_clip(processor, avdi, clip_id: str, args) -> tuple[dict, dict, dict]
 
 
 def infer(model, clip_id: str, model_inputs: dict, diffusion_kwargs: dict, args, level: str,
-          ranges: bool = False):
+          ranges: bool = False, listener=None):
     """One traced inference pass, re-seeded for the clip.
 
     Every pass over a clip starts the generator at the same point, so extra
@@ -446,7 +458,7 @@ def infer(model, clip_id: str, model_inputs: dict, diffusion_kwargs: dict, args,
     difference between passes that did different work is not noise.
     """
     torch.cuda.manual_seed_all(clip_seed(args.seed, clip_id))
-    with trace_inference(model, level=level, ranges=ranges) as tracer:
+    with trace_inference(model, level=level, ranges=ranges, listener=listener) as tracer:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=model_inputs,
@@ -474,10 +486,28 @@ def extra_passes_for(index: int, args) -> list[tuple[str, str]]:
         passes += [("repeat", args.trace_level)] * args.timing_repeats
     if index < getattr(args, "memory_snapshot", 0):
         passes.append(("memsnap", args.trace_level))
+    if index < getattr(args, "flop_count", 0):
+        passes.append(("flops", "basic"))
     # Last: the profiler's buffers are the largest thing any pass leaves behind.
     if index < getattr(args, "profile_clips", 0):
         passes.append(("profile", "basic"))
     return passes
+
+
+def counted_infer(model, clip_id: str, model_inputs: dict, diffusion_kwargs: dict, args):
+    """A --flop-count pass: the inference with its FLOPs and operand bytes counted
+    by segment. The expert's CUDA graph is set aside for it -- a replay runs no
+    op the counters could see -- and put back however the pass ends."""
+    runner = getattr(model.expert, "_diffusion_expert_cuda_graph", None)
+    if runner is not None:
+        model.expert.forward = runner._original_forward
+    try:
+        out, row = FC.counted(lambda listener: infer(
+            model, clip_id, model_inputs, diffusion_kwargs, args, "basic", listener=listener))
+    finally:
+        if runner is not None:
+            model.expert.forward = runner.forward
+    return (*out, row)
 
 
 def profiled_infer(model, clip_id: str, model_inputs: dict, diffusion_kwargs: dict, args,
@@ -652,6 +682,9 @@ def run_clip(
                 xyz, _, _, other, prof_row, kernels = profiled_infer(
                     model, clip_id, model_inputs, diffusion_kwargs, args, out_dir)
                 profiled = {**prof_row, KERNELS: kernels}
+            elif kind == "flops":
+                xyz, _, _, other, profiled = counted_infer(
+                    model, clip_id, model_inputs, diffusion_kwargs, args)
             else:
                 xyz, _, _, other = infer(model, clip_id, model_inputs, diffusion_kwargs, args,
                                          level)
@@ -759,6 +792,15 @@ def main() -> None:
                 max_batch_size=args.num_traj_samples,
                 max_graphs=args.cuda_graph_max_graphs,
             )
+        # What this board delivers, measured before the first clip -- and before
+        # the peak-memory reset below, which the probe's buffers would set.
+        peaks = None
+        if args.roofline_probe:
+            peaks = FC.probe()
+            peaks["gpu_mhz_after"] = TH.read_fast().get("freq.gpu")
+            print("[roofline] " + "  ".join(f"{k} {v:.1f}" for k, v in peaks.items()
+                                             if isinstance(v, float)))
+        work = FC.work_model(model)
         args.x0_table = None
         if args.x0_from:
             import inspect
@@ -1020,6 +1062,21 @@ def main() -> None:
             meta["memory_snapshots"] = list(_MEMSNAPS)
         if _SYNC_SITES:
             meta["sync_sites"] = sorted(_SYNC_SITES.items(), key=lambda kv: -kv[1])[:30]
+        # What the efficiency numbers are computed from, so they can be again.
+        meta["work_model"] = work
+        if peaks:
+            meta["roofline"] = peaks
+        counted = [r for r in timing_rows if r.get("row_kind") == "flops"]
+        if counted:
+            meta["work_calibration"] = {}
+            for r in counted:
+                ratios = RL.calibration(r, work)
+                meta["work_calibration"][r["clip_id"]] = ratios
+                off = RL.outside_band(ratios)
+                if off:
+                    print(f"[flops] {r['clip_id'][:8]}: counted/analytic FLOPs outside "
+                          f"{RL.CALIBRATION_BAND}: {off} -- a formula in roofline.work is "
+                          "wrong, and so are the efficiency numbers that use it.")
         profiled = [r for r in timing_rows if r.get("row_kind") == "profile"]
         if profiled:
             meta["profile"] = {
@@ -1178,7 +1235,7 @@ def main() -> None:
         # the per-row averaging this replaces took 0.0 from any pass whose
         # timing failed, and reported it as a pass that took no time.
         try:
-            run.metrics(TS.aggregate(timing_rows))
+            run.metrics(TS.aggregate(timing_rows, model=work, peaks=peaks))
         except Exception as exc:  # a lost metric batch must not lose the run's link
             print(f"[timing] aggregate metrics not recorded: {exc}", file=sys.stderr)
         # Measured during the loop, so it could not be among the parameters

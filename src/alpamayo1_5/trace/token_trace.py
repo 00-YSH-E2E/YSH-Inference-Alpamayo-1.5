@@ -314,12 +314,16 @@ class InferenceTracer:
     """
 
     def __init__(self, model: Any, special_token_ids: dict[str, int] | None = None,
-                 level: str = "basic", ranges: bool = False) -> None:
+                 level: str = "basic", ranges: bool = False,
+                 listener: Any = None) -> None:
         if level not in TRACE_LEVELS:
             raise ValueError(f"trace level {level!r} is not one of {TRACE_LEVELS}")
         #: Profile passes: every span is also a profiler range, ``trace::<bucket>``,
         #: open ones by bucket -- how profile_parse knows what launched a kernel.
         self._ranges: dict[str, list[Any]] | None = {} if ranges else None
+        #: Counted passes: called with every mark, to move the segment the
+        #: counters credit (flop_count.counted).
+        self._listener = listener
         self.model = model
         self.level = level
         self.ids = dict(DEFAULT_SPECIAL_IDS)
@@ -392,6 +396,8 @@ class InferenceTracer:
         self._marks.append((bucket, kind, event, stamp, time.thread_time()))
         if self._ranges is not None:
             self._range(bucket, kind)
+        if self._listener is not None:
+            self._listener(bucket, kind)
         if self.level in _STEP_LEVELS:
             if bucket == "lm" and kind == "start":
                 self._phase_now = "prefill" if self._lm_calls == 0 else "decode"
@@ -1062,9 +1068,10 @@ class InferenceTracer:
 
 @contextlib.contextmanager
 def trace_inference(model: Any, special_token_ids: dict[str, int] | None = None,
-                    level: str = "basic", ranges: bool = False):
+                    level: str = "basic", ranges: bool = False, listener: Any = None):
     """Convenience wrapper: yields a tracer and resolves timings on exit."""
-    tracer = InferenceTracer(model, special_token_ids, level=level, ranges=ranges)
+    tracer = InferenceTracer(model, special_token_ids, level=level, ranges=ranges,
+                             listener=listener)
     with tracer:
         yield tracer
     tracer.finalize()

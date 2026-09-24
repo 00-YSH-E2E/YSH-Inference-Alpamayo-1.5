@@ -57,9 +57,11 @@ def test_aggregate_keys_are_safe_unique_and_bounded():
     keys = TS.AGGREGATE_KEYS
     assert len(keys) == len(set(keys))
     assert all(_MLFLOW_KEY.match(k) for k in keys)
-    # One run logs every key through one batch against a single-worker server;
-    # a namespace that grows without a bound would be felt there first.
-    assert len(keys) <= 250
+    # One run logs every key through one batch against a single-worker server:
+    # mlflow.log_metrics sends up to 1000 metrics a request, and the declared
+    # set grows only by a commit that declares a key. The bound keeps it well
+    # inside one request.
+    assert len(keys) <= 400
 
 
 def test_missing_columns_become_null_not_zero():

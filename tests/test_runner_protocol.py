@@ -64,5 +64,37 @@ def test_the_profile_pass_comes_last_and_at_level_basic():
     assert R.extra_passes_for(1, a) == []
 
 
+def test_the_counted_pass_comes_before_the_profile():
+    a = args(flop_count=1, profile_clips=1)
+    assert R.extra_passes_for(0, a) == [("flops", "basic"), ("profile", "basic")]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_a_counted_pass_sets_the_graph_aside_and_puts_it_back(monkeypatch, fails):
+    """A replayed graph runs no op the counters could see; and a pass that
+    raises must not leave the model without its graph."""
+    seen = []
+    runner = types.SimpleNamespace(_original_forward=lambda *a, **k: "eager")
+    runner.forward = lambda *a, **k: "graph"
+    model = types.SimpleNamespace(
+        expert=types.SimpleNamespace(_diffusion_expert_cuda_graph=runner, forward=runner.forward))
+
+    def fake_infer(model, *a, **k):
+        seen.append(model.expert.forward)
+        if fails:
+            raise RuntimeError("pass failed")
+        return ("xyz", "rot", {}, "tracer")
+
+    monkeypatch.setattr(R, "infer", fake_infer)
+    if fails:
+        with pytest.raises(RuntimeError):
+            R.counted_infer(model, "clip", {}, {}, args())
+    else:
+        out = R.counted_infer(model, "clip", {}, {}, args())
+        assert out[:4] == ("xyz", "rot", {}, "tracer") and "fc_n_ops" in out[4]
+    assert seen == [runner._original_forward]
+    assert model.expert.forward is runner.forward
+
+
 def test_a_run_at_level_off_has_nothing_to_probe():
     assert R.extra_passes_for(0, args(overhead_probe=4, trace_level="off")) == []

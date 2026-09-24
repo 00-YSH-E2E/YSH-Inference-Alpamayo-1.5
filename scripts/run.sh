@@ -119,6 +119,11 @@ MEMORY_SNAPSHOT=0
 # Chrome trace(gzip)도 run 디렉터리에 남긴다 (로컬 전용, Perfetto 로 연다)
 PROFILE_CLIPS=0
 PROFILE_TRACE=0
+# 앞에서 몇 클립에 FLOP·바이트 계수 패스를 더 돌릴까 (시간은 재지 않는다).  해석적 작업량 공식
+# (roofline.py)을 실측으로 검증한다.  ROOFLINE_PROBE=1 이면 첫 클립 전에 이 보드의 bf16 GEMM·
+# GEMV·read·copy·KV concat 피크를 재서 (~10 초) 구간별 효율을 루프라인 대비 비율로도 낸다
+FLOP_COUNT=0
+ROOFLINE_PROBE=0
 # 보드 샘플러 주기 (Hz).  전력·GPU 클럭·over-current 카운터가 이 주기로, 온도 등은 그 1/5 로 돈다.
 # 10 이면 클립 에너지가 몇 % 안으로 잡히고, 2초 넘는 구간(디코드·expert)은 구간별로도 잡힌다
 SAMPLE_HZ=10
@@ -211,6 +216,8 @@ REPEAT_CLIPS="${OVERRIDE_REPEAT_CLIPS:-$REPEAT_CLIPS}"
 MEMORY_SNAPSHOT="${OVERRIDE_MEMORY_SNAPSHOT:-$MEMORY_SNAPSHOT}"
 PROFILE_CLIPS="${OVERRIDE_PROFILE_CLIPS:-$PROFILE_CLIPS}"
 PROFILE_TRACE="${OVERRIDE_PROFILE_TRACE:-$PROFILE_TRACE}"
+FLOP_COUNT="${OVERRIDE_FLOP_COUNT:-$FLOP_COUNT}"
+ROOFLINE_PROBE="${OVERRIDE_ROOFLINE_PROBE:-$ROOFLINE_PROBE}"
 SAMPLE_HZ="${OVERRIDE_SAMPLE_HZ:-$SAMPLE_HZ}"
 CUDA_GRAPH_MAX_GRAPHS="${OVERRIDE_CUDA_GRAPH_MAX_GRAPHS:-$CUDA_GRAPH_MAX_GRAPHS}"
 SWEEP="${SWEEP:-}"
@@ -453,8 +460,9 @@ fi
 ARGS+=(--trace-level "$TRACE_LEVEL" --warmup "$WARMUP" --overhead-probe "$OVERHEAD_PROBE"
        --timing-repeats "$TIMING_REPEATS" --repeat-clips "$REPEAT_CLIPS"
        --memory-snapshot "$MEMORY_SNAPSHOT" --sample-hz "$SAMPLE_HZ"
-       --profile-clips "$PROFILE_CLIPS")
+       --profile-clips "$PROFILE_CLIPS" --flop-count "$FLOP_COUNT")
 [[ "$PROFILE_TRACE" == "1" ]] && ARGS+=(--profile-trace)
+[[ "$ROOFLINE_PROBE" == "1" ]] && ARGS+=(--roofline-probe)
 
 [[ "$FORCE_LOCAL_SRC" == "1" ]] && export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 

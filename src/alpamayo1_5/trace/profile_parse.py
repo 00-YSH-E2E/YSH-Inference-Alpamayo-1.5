@@ -194,6 +194,34 @@ def segment_of(is_open: Callable[[str], bool], lm_call: int | None,
     return "tail"
 
 
+class SegmentState:
+    """The segment the host is in, followed mark by mark -- for a pass that is
+    counted rather than traced, where there are no ranges to look back on."""
+
+    def __init__(self) -> None:
+        self._open: dict[str, int] = {}
+        self._started: set[str] = set()
+        self._ended: set[str] = set()
+        self._lm_calls = 0
+
+    def mark(self, bucket: str, kind: str) -> None:
+        if kind == "start":
+            self._open[bucket] = self._open.get(bucket, 0) + 1
+            self._started.add(bucket)
+            if bucket == "lm":
+                self._lm_calls += 1
+        elif self._open.get(bucket):
+            self._open[bucket] -= 1
+            self._ended.add(bucket)
+
+    @property
+    def segment(self) -> str:
+        return segment_of(lambda b: bool(self._open.get(b)),
+                          self._lm_calls - 1 if self._open.get("lm") else None,
+                          self._started.__contains__,
+                          lambda b: b in self._ended and not self._open.get(b))
+
+
 def _label(t: float, calls: Mapping[str, _Calls]) -> str:
     """The segment the host is in at ``t``, given the call's ranges."""
     return segment_of(

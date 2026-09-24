@@ -50,12 +50,13 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from alpamayo1_5.trace import roofline as RL
 from alpamayo1_5.trace.profile_parse import CATEGORIES, SDPA_PHASES, SEGMENTS
 
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 11
+TIMING_SCHEMA_VERSION = 12
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
@@ -91,6 +92,7 @@ CHANGELOG = {
     11: "Profile passes: kernels, device time, true GPU idle, launch and sync calls per "
     "host segment; device time by category; SDPA backend per phase. Kernels go to "
     "kernels.parquet.",
+    12: "Counted passes: FLOPs and operand bytes per host segment, and the ops counted.",
 }
 
 #: Version of layers.parquet's columns.
@@ -579,9 +581,24 @@ PROFILE = _cols("profile", (
     ("prof_parse_ms", "f64", "ms", "N", "Host time to read and attribute it."),
 ), since=11)
 
+#: Counted passes only (row_kind "flops", --flop-count): the pass run under
+#: FlopCounterMode and an operand-bytes dispatch mode, by the same host
+#: segments as a profile pass. They check roofline.work's formulas; the
+#: pass is slowed by the counting and its latency is never used.
+FLOPS = _cols("flops", tuple(
+    spec for seg in SEGMENTS for spec in (
+        (f"fc_flops_{seg}", "f64", "flop", "N",
+         f"FLOPs counted in {_SEGMENT_TEXT[seg]}: matmuls, convolutions and SDPA."),
+        (f"fc_bytes_{seg}", "f64", "B", "N",
+         f"Bytes the ops in {_SEGMENT_TEXT[seg]} read and wrote, as if nothing were "
+         "cached: an upper bound on its memory traffic."),
+    )
+) + (("fc_n_ops", "i32", "", "N", "Ops the counted pass dispatched, views left out."),),
+    since=12)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
                             + TRACE + GENERATE + PROTOCOL + HOST + PASS_HOST + MEMORY + SHAPES
-                            + BOARD + ENERGY + BOARD_STATE + STEP + LAYER + PROFILE)
+                            + BOARD + ENERGY + BOARD_STATE + STEP + LAYER + PROFILE + FLOPS)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -737,6 +754,7 @@ AGGREGATE_KEYS = (
     "prof.launch_us_p50", "prof.lead_ms_p50", "prof.lead_ms_p50_vision",
     "prof.lead_ms_p50_decode", "prof.lead_ms_p50_expert", "prof.sync_api_ms",
     *(f"prof.cat_share_{c}" for c in CATEGORIES), "prof.overhead_pct",
+    *RL.AGGREGATE_KEYS,
 )
 
 
@@ -1056,7 +1074,8 @@ def _profile(rows: list[Mapping[str, Any]]) -> dict[str, float | None]:
     return out
 
 
-def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
+def aggregate(rows: Iterable[Mapping[str, Any]], model: Mapping[str, Any] | None = None,
+              peaks: Mapping[str, float] | None = None) -> dict[str, float]:
     """Run-level numbers for MLflow, from the main measured rows only.
 
     Restricting to measured rows is a fix, not a nicety: the averaging this
@@ -1067,7 +1086,9 @@ def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     passes.
     """
     rows = list(rows)
-    protocol = {**_protocol(rows), **_profile(rows)}
+    # The work model's numbers read the counted passes as well as the main
+    # ones; ``model`` is run.json's work_model, ``peaks`` the board's probe.
+    protocol = {**_protocol(rows), **_profile(rows), **RL.aggregate(rows, model, peaks)}
     rows = main_rows(rows)
     out: dict[str, float | None] = {"timing.n_main_rows": float(len(rows)), **protocol}
     if not rows:
