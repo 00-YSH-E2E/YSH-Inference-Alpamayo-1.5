@@ -284,6 +284,26 @@ class InferenceTracer:
                 language.register_forward_hook(lambda *_: self._mark("lm", "end"))
             )
 
+        # The whole VLM forward, once per generate step, and the vocabulary
+        # projection inside it. lm_head runs after the language model returns,
+        # so the decode span never contained it; together these two split the
+        # generate remainder into preamble, lm_head, forward glue and the loop.
+        # generate calls the model through __call__ for prefill and decode alike,
+        # so module hooks fire on every step.
+        if isinstance(vlm, torch.nn.Module):
+            self._handles.append(
+                vlm.register_forward_pre_hook(lambda *_: self._mark("vlm", "start"))
+            )
+            self._handles.append(vlm.register_forward_hook(lambda *_: self._mark("vlm", "end")))
+        head = getattr(vlm, "lm_head", None)
+        if isinstance(head, torch.nn.Module):
+            self._handles.append(
+                head.register_forward_pre_hook(lambda *_: self._mark("lm_head", "start"))
+            )
+            self._handles.append(
+                head.register_forward_hook(lambda *_: self._mark("lm_head", "end"))
+            )
+
         # The flow head's initial condition. step_fn calls action_in_proj(x, t)
         # once per Euler step, and on the first call x is the noise the sampler
         # just drew. Captured here rather than by changing the sampler, so the

@@ -159,3 +159,42 @@ def test_without_a_consume_mark_the_model_share_is_absent_not_postgen():
     t = TM.resolve(one_pass())
     assert t.trace_consume_ms is None
     assert t.postgen_model_ms is None
+
+
+# -- generate's remainder, split (tracer 3) -------------------------------------
+def generate_pass():
+    """generate 0-100; three forwards 10-40 (with vision 12-20), 50-60, 70-80;
+    the language model and lm_head nested inside each forward."""
+    return marks(("generate", 0, 100),
+                 ("vlm", 10, 40), ("vision", 12, 20), ("lm", 21, 35), ("lm_head", 35, 38),
+                 ("vlm", 50, 60), ("lm", 51, 57), ("lm_head", 57, 59),
+                 ("vlm", 70, 80), ("lm", 71, 77), ("lm_head", 77, 79))
+
+
+def test_the_split_adds_back_up_to_other():
+    t = TM.resolve(generate_pass(), wall_start_s=-0.005, wall_end_s=0.2)
+    assert t.gen_preamble_ms == pytest.approx(10.0)
+    assert t.lm_head_ms == pytest.approx(3.0 + 2.0 + 2.0)
+    # forwards 50 ms - vision 8 - lm 26 - lm_head 7
+    assert t.vlm_glue_ms == pytest.approx(9.0)
+    # generate 100 - preamble 10 - forwards 50
+    assert t.gen_loop_ms == pytest.approx(40.0)
+    parts = t.gen_preamble_ms + t.lm_head_ms + t.vlm_glue_ms + t.gen_loop_ms
+    assert parts == pytest.approx(t.other_ms)
+    assert t.span_violations == 0
+
+
+def test_decode_gaps_and_the_first_token():
+    t = TM.resolve(generate_pass(), wall_start_s=-0.005)
+    assert t.decode_gap_ms == pytest.approx([10.0, 10.0])
+    assert t.lm_head_step_ms == pytest.approx([3.0, 2.0, 2.0])
+    assert t.n_vlm_forwards == 3
+    # Host stamp of forward #2 (50 ms) from the model call (-5 ms).
+    assert t.ttft_ms == pytest.approx(55.0)
+
+
+def test_a_forward_outside_generate_is_counted_not_hidden():
+    records = marks(("generate", 10, 20), ("vlm", 0, 5))
+    t = TM.resolve(records)
+    assert t.span_violations >= 1
+    assert t.gen_preamble_ms == 0.0

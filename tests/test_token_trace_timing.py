@@ -105,17 +105,25 @@ class _Lin(torch.nn.Module):
 
 
 class _Vlm(torch.nn.Module):
+    """Like the real VLM, generate calls the module itself once per step, and each
+    forward runs vision (prefill only), the language model, then lm_head."""
+
     def __init__(self) -> None:
         super().__init__()
         self.model = torch.nn.Module()
         self.model.visual = _Lin()
         self.model.language_model = _Lin()
+        self.lm_head = _Lin()
+
+    def forward(self, x, prefill=False):
+        if prefill:
+            self.model.visual(x)
+        return self.lm_head(self.model.language_model(x))
 
     def generate(self, input_ids=None, **kwargs):
         x = torch.randn(4, 256, device=input_ids.device)
-        self.model.visual(x)
-        for _ in range(3):  # one prefill, two decode steps
-            self.model.language_model(x)
+        for step in range(3):  # one prefill, two decode steps
+            self(x, prefill=step == 0)
         generated = torch.full((1, 3), 7, dtype=input_ids.dtype, device=input_ids.device)
         return types.SimpleNamespace(sequences=torch.cat([input_ids, generated], dim=1))
 
@@ -166,11 +174,19 @@ def test_a_traced_pass_fills_both_clocks_and_every_array():
     assert tracer.trace is not None and tracer.trace.x0 is not None
     assert tracer.trace.x0.shape == (4, 256)
     # Tracer 2 accounts for itself: its logits pass, its marks, their host cost.
-    # vision 2 + lm 6 + generate 2 + consume 2 + diffusion 2 + expert 8.
-    assert t.trace_n_marks == 22
+    # vision 2 + lm 6 + vlm 6 + lm_head 6 + generate 2 + consume 2 + diffusion 2
+    # + expert 8.
+    assert t.trace_n_marks == 34
     assert t.trace_consume_ms is not None and t.trace_consume_ms >= 0.0
     assert t.postgen_model_ms <= t.postgen_ms
     assert t.trace_hook_host_ms > 0.0
+    # Tracer 3 splits generate's remainder, and the split adds back up.
+    assert t.n_vlm_forwards == 3
+    assert len(t.lm_head_step_ms) == 3 and len(t.decode_gap_ms) == 2
+    assert t.span_violations == 0
+    parts = t.gen_preamble_ms + t.lm_head_ms + t.vlm_glue_ms + t.gen_loop_ms
+    assert parts == pytest.approx(t.other_ms, abs=1e-3)
+    assert 0.0 < t.ttft_ms <= t.wall_ms
 
 
 @needs_gpu
@@ -181,7 +197,8 @@ def test_removal_leaves_the_model_exactly_as_it_was():
         model.run()
     assert "generate" not in vars(model.vlm)       # a class method: the shadow is deleted
     assert model.diffusion.sample == sample        # an instance attribute: restored
-    for module in (model.vlm.model.visual, model.expert, model.action_in_proj):
+    for module in (model.vlm, model.vlm.lm_head, model.vlm.model.visual, model.expert,
+                   model.action_in_proj):
         assert not module._forward_hooks and not module._forward_pre_hooks
 
 

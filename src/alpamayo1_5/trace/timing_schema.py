@@ -53,18 +53,21 @@ import numpy as np
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 2
+TIMING_SCHEMA_VERSION = 3
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
 #: comparable on latency even when every other condition matches.
-TRACER_VERSION = 2
+TRACER_VERSION = 3
 
 CHANGELOG = {
     1: "Initial table: legacy spans, host wall clock, per-call arrays, allocator and "
     "CUDA-graph counters, run conditions.",
     2: "The tracer's own cost: t_trace_consume_ms and its host twin, t_postgen_model_ms, "
     "trace_n_marks, trace_hook_host_ms. Tracer 2 marks its logits pass.",
+    3: "generate split: t_gen_preamble_ms, t_lm_head_ms, t_vlm_glue_ms, t_gen_loop_ms, "
+    "t_ttft_ms, n_vlm_forwards, lm_head_step_ms, decode_gap_ms, trace_span_violations. "
+    "Tracer 3 hooks the VLM forward and lm_head.",
 }
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
@@ -221,8 +224,36 @@ TRACE = _cols("trace", (
      "Host time spent inside the tracer's marks. The instrument's own cost, per pass."),
 ), since=2)
 
+#: What t_other_ms was made of. By construction
+#: t_other_ms = t_gen_preamble_ms + t_lm_head_ms + t_vlm_glue_ms + t_gen_loop_ms,
+#: so the remainder that used to be one opaque number is now four checkable ones.
+GENERATE = _cols("generate", (
+    ("t_gen_preamble_ms", "f64", "ms", "L",
+     "generate's start to the first forward: K-fold input expansion, cache and processor "
+     "setup."),
+    ("t_lm_head_ms", "f64", "ms", "L",
+     "The vocabulary projection, every step. It runs after the language model returns, so "
+     "the decode span never included it -- 1.27 GB of weights read per step."),
+    ("t_vlm_glue_ms", "f64", "ms", "L",
+     "Inside each VLM forward but outside vision, the language model and lm_head: "
+     "embeddings, image-token scatter, rope index, deepstack."),
+    ("t_gen_loop_ms", "f64", "ms", "L",
+     "generate outside every forward: logits processors, sampling, stopping criteria and "
+     "the host syncs between steps."),
+    ("t_ttft_ms", "f64", "ms", "L",
+     "Host clock from the model call to the second forward -- the first reasoning token is "
+     "on the host by then, since the loop syncs on it."),
+    ("n_vlm_forwards", "i16", "", "N", "VLM forward calls: prefill plus decode steps."),
+    ("lm_head_step_ms", "lf32", "ms", "L", "Each lm_head call, device clock."),
+    ("decode_gap_ms", "lf32", "ms", "L",
+     "Device time between consecutive forwards: the host loop each decode step waits on."),
+    ("trace_span_violations", "i16", "", "L",
+     "Derived spans that came out negative and were floored. Nonzero means a nesting "
+     "assumption broke and the split is suspect."),
+), since=3)
+
 COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
-                            + TRACE)
+                            + TRACE + GENERATE)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -332,6 +363,9 @@ AGGREGATE_KEYS = (
     "graph.fallback_clip_frac", "graph.capture_ms_sum", "graph.t_expert_ms_replay_only",
     "timing.n_main_rows",
     "t_postgen_model_ms", "trace.consume_ms", "trace.hook_host_ms", "trace.n_marks",
+    "t_gen_preamble_ms", "t_lm_head_ms", "t_vlm_glue_ms", "t_gen_loop_ms",
+    "t_ttft_ms", "t_ttft_ms_p95", "decode_gap_ms", "decode_gap_ms_p95", "lm_head_step_ms",
+    "trace.span_violations_sum",
 )
 
 
@@ -445,5 +479,19 @@ def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     out["trace.consume_ms"] = _mean(_values(rows, "t_trace_consume_ms"))
     out["trace.hook_host_ms"] = _mean(_values(rows, "trace_hook_host_ms"))
     out["trace.n_marks"] = _mean(_values(rows, "trace_n_marks"))
+
+    for key in ("t_gen_preamble_ms", "t_lm_head_ms", "t_vlm_glue_ms", "t_gen_loop_ms",
+                "t_ttft_ms"):
+        out[key] = _mean(_values(rows, key))
+    ttft = _values(rows, "t_ttft_ms")
+    out["t_ttft_ms_p95"] = float(np.percentile(ttft, 95)) if ttft else None
+    # Per step, pooled over clips: a gap is a property of one step, and pooling
+    # weights each step equally however many steps its clip decoded.
+    gaps = [g for a in _arrays(rows, "decode_gap_ms") for g in a]
+    out["decode_gap_ms"] = _mean(gaps)
+    out["decode_gap_ms_p95"] = float(np.percentile(gaps, 95)) if gaps else None
+    out["lm_head_step_ms"] = _mean([h for a in _arrays(rows, "lm_head_step_ms") for h in a])
+    violations = _values(rows, "trace_span_violations")
+    out["trace.span_violations_sum"] = float(sum(violations)) if violations else None
 
     return {k: float(v) for k, v in out.items() if v is not None and math.isfinite(v)}

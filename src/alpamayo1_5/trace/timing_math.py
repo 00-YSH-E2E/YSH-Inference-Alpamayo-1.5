@@ -89,6 +89,16 @@ class TimingResult:
     trace_n_marks: int | None = None
     trace_hook_host_ms: float | None = None
 
+    gen_preamble_ms: float | None = None
+    lm_head_ms: float | None = None
+    vlm_glue_ms: float | None = None
+    gen_loop_ms: float | None = None
+    ttft_ms: float | None = None
+    n_vlm_forwards: int | None = None
+    lm_head_step_ms: list[float] = field(default_factory=list)
+    decode_gap_ms: list[float] = field(default_factory=list)
+    span_violations: int | None = None
+
     def legacy(self) -> dict[str, Any]:
         """The keys ``predictions.parquet`` carries, with their schema-3 meaning."""
         return {
@@ -132,6 +142,15 @@ class TimingResult:
             "t_postgen_model_ms": self.postgen_model_ms,
             "trace_n_marks": self.trace_n_marks,
             "trace_hook_host_ms": self.trace_hook_host_ms,
+            "t_gen_preamble_ms": self.gen_preamble_ms,
+            "t_lm_head_ms": self.lm_head_ms,
+            "t_vlm_glue_ms": self.vlm_glue_ms,
+            "t_gen_loop_ms": self.gen_loop_ms,
+            "t_ttft_ms": self.ttft_ms,
+            "n_vlm_forwards": self.n_vlm_forwards,
+            "lm_head_step_ms": list(self.lm_head_step_ms),
+            "decode_gap_ms": list(self.decode_gap_ms),
+            "trace_span_violations": self.span_violations,
         })
         return out
 
@@ -188,6 +207,49 @@ def _delta(after: Mapping[str, int] | None, before: Mapping[str, int] | None,
     if after is None or before is None:
         return None
     return max(int(after.get(key, 0)) - int(before.get(key, 0)), 0)
+
+
+def _split_generate(result: TimingResult, records: list[Record], generate: list[Span],
+                    wall_start_s: float | None) -> None:
+    """Break the generate span's remainder into the four things it was made of.
+
+    Every VLM forward contains the vision tower (prefill only), the language
+    model and lm_head, plus glue between them. Around the forwards, generate
+    spends time before the first (preamble) and between and after them (the
+    loop). With the legacy definitions this is exact:
+
+        t_other = gen - vision - lm = preamble + lm_head + glue + loop
+
+    A negative part means a nesting assumption broke (a forward outside the
+    generate span, a hook that fired twice); it is floored and counted rather
+    than allowed to push another part up by the same amount unnoticed.
+    """
+    vlm = span_pairs(records, "vlm")
+    head = span_pairs(records, "lm_head")
+    if not generate or not vlm:
+        return
+    gen_ms = float(sum(_device(generate)))
+    sum_vlm = float(sum(_device(vlm)))
+    lm_head = float(sum(_device(head)))
+    lm_total = (result.prefill_ms or 0.0) + (result.decode_ms or 0.0)
+    parts = {
+        "preamble": vlm[0][0] - generate[0][0],
+        "glue": sum_vlm - (result.vision_ms or 0.0) - lm_total - lm_head,
+        "loop": gen_ms - (vlm[0][0] - generate[0][0]) - sum_vlm,
+    }
+    result.span_violations = sum(1 for v in parts.values() if v < 0.0)
+    result.gen_preamble_ms = float(max(parts["preamble"], 0.0))
+    result.vlm_glue_ms = float(max(parts["glue"], 0.0))
+    result.gen_loop_ms = float(max(parts["loop"], 0.0))
+    result.lm_head_ms = lm_head
+    result.lm_head_step_ms = _device(head)
+    result.decode_gap_ms = [float(vlm[i + 1][0] - vlm[i][1]) for i in range(len(vlm) - 1)]
+    result.n_vlm_forwards = len(vlm)
+    if wall_start_s is not None:
+        # The loop syncs on each sampled token before it can enqueue the next
+        # forward, so the host stamp of forward #2 is when token #1 existed.
+        ready = vlm[1][2] if len(vlm) > 1 else generate[0][3]
+        result.ttft_ms = float((ready - wall_start_s) * 1000.0)
 
 
 def resolve(
@@ -285,6 +347,8 @@ def resolve(
         if generate and diffusion:
             result.postgen_model_ms = float(max(result.postgen_ms - result.trace_consume_ms,
                                                 0.0))
+
+    _split_generate(result, records, generate, wall_start_s)
 
     result.compute_span_ms = (result.vision_ms + result.prefill_ms
                               + result.decode_ms + result.expert_ms)
