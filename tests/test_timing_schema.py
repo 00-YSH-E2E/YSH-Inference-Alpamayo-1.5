@@ -165,3 +165,17 @@ def test_graph_keys_appear_only_with_a_runner():
 
 def test_aggregate_of_nothing_is_a_count_of_zero():
     assert TS.aggregate([]) == {"timing.n_main_rows": 0.0}
+
+
+def test_the_tracer_cost_is_aggregated():
+    out = TS.aggregate([row(t_postgen_model_ms=4.0, t_trace_consume_ms=6.0,
+                            trace_hook_host_ms=0.5, trace_n_marks=22)])
+    assert out["t_postgen_model_ms"] == 4.0
+    assert out["trace.consume_ms"] == 6.0
+    assert out["trace.hook_host_ms"] == 0.5
+    assert out["trace.n_marks"] == 22.0
+
+
+def test_columns_added_later_say_when():
+    assert TS.column("t_trace_consume_ms").since == 2
+    assert TS.column("t_total_ms").since == 1

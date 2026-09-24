@@ -83,6 +83,12 @@ class TimingResult:
     graph_capture_ms: float | None = None
     graph_mode: str | None = None
 
+    trace_consume_ms: float | None = None
+    trace_consume_host_ms: float | None = None
+    postgen_model_ms: float | None = None
+    trace_n_marks: int | None = None
+    trace_hook_host_ms: float | None = None
+
     def legacy(self) -> dict[str, Any]:
         """The keys ``predictions.parquet`` carries, with their schema-3 meaning."""
         return {
@@ -121,6 +127,11 @@ class TimingResult:
             "graph_n_graphs": self.graph_n_graphs,
             "graph_capture_ms": self.graph_capture_ms,
             "graph_mode": self.graph_mode,
+            "t_trace_consume_ms": self.trace_consume_ms,
+            "t_trace_consume_host_ms": self.trace_consume_host_ms,
+            "t_postgen_model_ms": self.postgen_model_ms,
+            "trace_n_marks": self.trace_n_marks,
+            "trace_hook_host_ms": self.trace_hook_host_ms,
         })
         return out
 
@@ -190,6 +201,7 @@ def resolve(
     graph_before: Mapping[str, int] | None = None,
     graph_after: Mapping[str, int] | None = None,
     capture_ms: float | None = None,
+    hook_ms: float | None = None,
 ) -> TimingResult:
     """Attribute the marks of one pass.
 
@@ -222,6 +234,8 @@ def resolve(
 
     if not records:
         return result
+    result.trace_n_marks = len(records)
+    result.trace_hook_host_ms = hook_ms
 
     vision = span_pairs(records, "vision")
     lm = span_pairs(records, "lm")
@@ -259,6 +273,18 @@ def resolve(
     else:
         result.total_ms = None
         result.other_ms = None
+
+    # The tracer's own logits pass sits inside the postgen window: the generate
+    # wrapper marks generate's end, then runs it, then returns to the model. It
+    # stays in t_postgen_ms so that column keeps its schema-3 meaning, and is
+    # taken out here to show what the model's code alone cost.
+    consume = span_pairs(records, "consume")
+    if consume:
+        result.trace_consume_ms = float(sum(_device(consume)))
+        result.trace_consume_host_ms = float(sum(_host(consume)))
+        if generate and diffusion:
+            result.postgen_model_ms = float(max(result.postgen_ms - result.trace_consume_ms,
+                                                0.0))
 
     result.compute_span_ms = (result.vision_ms + result.prefill_ms
                               + result.decode_ms + result.expert_ms)

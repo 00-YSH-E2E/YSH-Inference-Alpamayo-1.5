@@ -165,6 +165,12 @@ def test_a_traced_pass_fills_both_clocks_and_every_array():
     # The x0 capture still rides on the trace that the generate wrapper built.
     assert tracer.trace is not None and tracer.trace.x0 is not None
     assert tracer.trace.x0.shape == (4, 256)
+    # Tracer 2 accounts for itself: its logits pass, its marks, their host cost.
+    # vision 2 + lm 6 + generate 2 + consume 2 + diffusion 2 + expert 8.
+    assert t.trace_n_marks == 22
+    assert t.trace_consume_ms is not None and t.trace_consume_ms >= 0.0
+    assert t.postgen_model_ms <= t.postgen_ms
+    assert t.trace_hook_host_ms > 0.0
 
 
 @needs_gpu

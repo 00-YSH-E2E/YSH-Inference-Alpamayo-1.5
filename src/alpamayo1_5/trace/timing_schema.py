@@ -53,16 +53,18 @@ import numpy as np
 #: Bump in every change that adds, removes or redefines a column. Tables with
 #: different versions refuse to concatenate: a column that exists in one run
 #: and not another would come back as a silent NaN in a comparison.
-TIMING_SCHEMA_VERSION = 1
+TIMING_SCHEMA_VERSION = 2
 
 #: Bump when the hooks that produce the basic-level numbers change. Instrument
 #: cost moves with them, so two runs measured by different tracers are not
 #: comparable on latency even when every other condition matches.
-TRACER_VERSION = 1
+TRACER_VERSION = 2
 
 CHANGELOG = {
     1: "Initial table: legacy spans, host wall clock, per-call arrays, allocator and "
     "CUDA-graph counters, run conditions.",
+    2: "The tracer's own cost: t_trace_consume_ms and its host twin, t_postgen_model_ms, "
+    "trace_n_marks, trace_hook_host_ms. Tracer 2 marks its logits pass.",
 }
 
 #: What a row can be. Only ``main`` rows feed predictions and latency
@@ -92,8 +94,9 @@ class Col:
     since: int = 1
 
 
-def _cols(group: str, specs: Iterable[tuple[str, str, str, str, str]]) -> tuple[Col, ...]:
-    return tuple(Col(name, dtype, unit, direction, group, text)
+def _cols(group: str, specs: Iterable[tuple[str, str, str, str, str]],
+          since: int = 1) -> tuple[Col, ...]:
+    return tuple(Col(name, dtype, unit, direction, group, text, since)
                  for name, dtype, unit, direction, text in specs)
 
 
@@ -205,7 +208,21 @@ GRAPH = _cols("graph", (
      "none | replay | capture | fallback | mixed: which path the pass's expert steps took."),
 ))
 
-COLUMNS: tuple[Col, ...] = IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
+TRACE = _cols("trace", (
+    ("t_trace_consume_ms", "f64", "ms", "L",
+     "Device time of the tracer's own logits pass. It runs inside the postgen window, so "
+     "t_postgen_ms includes it -- kept there so the legacy column keeps its meaning."),
+    ("t_trace_consume_host_ms", "f64", "ms", "L", "The same pass, host clock."),
+    ("t_postgen_model_ms", "f64", "ms", "L",
+     "postgen minus the tracer's logits pass: what the model's own code between generate "
+     "and the trajectory head cost."),
+    ("trace_n_marks", "i32", "", "N", "Marks recorded in the pass."),
+    ("trace_hook_host_ms", "f64", "ms", "L",
+     "Host time spent inside the tracer's marks. The instrument's own cost, per pass."),
+), since=2)
+
+COLUMNS: tuple[Col, ...] = (IDENTITY + CONDITIONS + LEGACY + CLOCKS + PER_CALL + ALLOC + GRAPH
+                            + TRACE)
 
 #: The keys ``predictions.parquet`` reads off a pass, unchanged since schema 3.
 LEGACY_KEYS = tuple(c.name for c in LEGACY)
@@ -314,6 +331,7 @@ AGGREGATE_KEYS = (
     "graph.captures_sum", "graph.replays_sum", "graph.fallbacks_sum",
     "graph.fallback_clip_frac", "graph.capture_ms_sum", "graph.t_expert_ms_replay_only",
     "timing.n_main_rows",
+    "t_postgen_model_ms", "trace.consume_ms", "trace.hook_host_ms", "trace.n_marks",
 )
 
 
@@ -422,5 +440,10 @@ def aggregate(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
         out["graph.capture_ms_sum"] = float(sum(_values(graphed, "graph_capture_ms")))
         replay_only = [r for r in graphed if r.get("graph_mode") == "replay"]
         out["graph.t_expert_ms_replay_only"] = _mean(_values(replay_only, "t_expert_ms"))
+
+    out["t_postgen_model_ms"] = _mean(_values(rows, "t_postgen_model_ms"))
+    out["trace.consume_ms"] = _mean(_values(rows, "t_trace_consume_ms"))
+    out["trace.hook_host_ms"] = _mean(_values(rows, "trace_hook_host_ms"))
+    out["trace.n_marks"] = _mean(_values(rows, "trace_n_marks"))
 
     return {k: float(v) for k, v in out.items() if v is not None and math.isfinite(v)}

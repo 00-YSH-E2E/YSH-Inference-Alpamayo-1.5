@@ -198,6 +198,8 @@ class InferenceTracer:
         self._runner: Any = None
         self._capture_ms = 0.0
         self._in_capture = False
+        #: Host seconds spent inside _mark over the pass: the instrument's own cost.
+        self._hook_s = 0.0
 
     # -- installation ------------------------------------------------------
     def __enter__(self) -> "InferenceTracer":
@@ -213,12 +215,16 @@ class InferenceTracer:
         # a span of this pass.
         if self._in_capture or not torch.cuda.is_available():
             return
+        entered = time.perf_counter()
         event = _POOL.take()
         event.record()
         # Stamped after record() so both clocks bracket the same instant.
-        # About 50ns, which is why it can sit on the decode path without
-        # becoming the thing it is measuring.
-        self._marks.append((bucket, kind, event, time.perf_counter()))
+        stamp = time.perf_counter()
+        self._marks.append((bucket, kind, event, stamp))
+        # What the mark itself cost the host. Summed per pass, it is the
+        # instrument's own share of the wall clock -- a number the recording
+        # rules require and that no end-to-end comparison can recover later.
+        self._hook_s += stamp - entered
 
     def _set_attr(self, obj: Any, name: str, value: Any) -> None:
         """Shadow ``obj.name`` on the instance, remembering how to undo it.
@@ -236,6 +242,7 @@ class InferenceTracer:
             return
         self._enabled = True
         self._marks.clear()
+        self._hook_s = 0.0
         self.timing = TimingResult()
         if torch.cuda.is_available():
             _POOL.acquire(self)
@@ -395,10 +402,15 @@ class InferenceTracer:
             input_ids = kwargs.get("input_ids")
             if input_ids is None and args:
                 input_ids = args[0]
+            # Marked because it runs inside the postgen window and would
+            # otherwise be counted as the model's own time.
+            self._mark("consume", "start")
             try:
                 self._consume(out, int(input_ids.shape[1]))
             except Exception as exc:  # instrumentation must not break the run
                 print(f"[token_trace] could not read logits: {exc}")
+            finally:
+                self._mark("consume", "end")
             # These are large (roughly 0.6MB per row-step) and this method never
             # frees them; dropping them here is a memory win, not just cleanup.
             if hasattr(out, "logits"):
@@ -509,6 +521,7 @@ class InferenceTracer:
             graph_before=self._graph0,
             graph_after=graph1,
             capture_ms=self._capture_ms,
+            hook_ms=self._hook_s * 1000.0,
         )
         _POOL.release(self)
         return self.timing

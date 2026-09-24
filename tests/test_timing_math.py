@@ -141,3 +141,21 @@ def test_allocator_counters_are_deltas_and_absent_when_unreadable():
     assert TM.resolve([]).n_cuda_allocs is None
     t = TM.resolve([], alloc_before=(100, 1), alloc_after=(844, 1))
     assert (t.n_cuda_allocs, t.n_alloc_retries) == (744, 0)
+
+
+# -- the tracer's own cost (tracer 2) -------------------------------------------
+def test_the_tracer_logits_pass_is_taken_out_of_postgen_but_left_in_it():
+    """t_postgen_ms keeps its schema-3 meaning; t_postgen_model_ms is the model's part."""
+    records = marks(("generate", 0, 100), ("consume", 101, 107), ("diffusion", 110, 170))
+    t = TM.resolve(records, hook_ms=0.4)
+    assert t.postgen_ms == pytest.approx(10.0)
+    assert t.trace_consume_ms == pytest.approx(6.0)
+    assert t.postgen_model_ms == pytest.approx(4.0)
+    assert t.trace_n_marks == len(records)
+    assert t.trace_hook_host_ms == 0.4
+
+
+def test_without_a_consume_mark_the_model_share_is_absent_not_postgen():
+    t = TM.resolve(one_pass())
+    assert t.trace_consume_ms is None
+    assert t.postgen_model_ms is None
